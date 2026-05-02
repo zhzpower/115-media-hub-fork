@@ -1,12 +1,12 @@
 {
-  "version": "0.3.8",
-  "buildDate": "2026-05-02T13:50:00+08:00",
+  "version": "0.3.9",
+  "buildDate": "2026-05-02T15:00:00+08:00",
   "notes": [
+    "订阅日志二层分离：前端SSE精简展示，文件保留完整日志",
+    "合并冗长日志：任务信息/搜索参数/召回统计各合并为1条",
     "SSE 增量推送：日常推送体积减少60-80%",
     "降级轮询合并：SSE断开后单请求替代5请求",
-    "SSE 重连指数退避：1s→2s→4s→...→30s",
-    "静态资源版本化强缓存：二次访问秒开",
-    "请求优先级：用户操作期间暂停后台轮询"
+    "SSE 重连指数退避 + 请求优先级 + 静态资源强缓存"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"
