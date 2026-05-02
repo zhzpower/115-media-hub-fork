@@ -231,6 +231,16 @@
                 persist: true,
                 trail: resourceFolderTrail,
             });
+            // 直接写一次 localStorage 保证常用目录选择必被记录
+            try {
+                var memProvider = getCurrentResourceProvider() === 'quark' ? 'quark' : '115';
+                localStorage.setItem('resource-folder-selection-v2:' + memProvider, JSON.stringify({
+                    provider: memProvider,
+                    folder_id: '0',
+                    display_path: path,
+                    trail: [{ id: '0', name: '根目录' }]
+                }));
+            } catch (e) {}
             renderResourceFavoriteDirs();
             showToast(`已选择常用目录：${path}`, { tone: 'success', duration: 2200, placement: 'top-center' });
         }
