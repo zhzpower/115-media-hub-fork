@@ -59,6 +59,108 @@ def _format_subscription_share_scan_log_tail(stats: Dict[str, Any], *, include_c
     return "，".join(parts)
 
 
+def _build_subscription_episode_batch_decision(
+    task: Dict[str, Any],
+    *,
+    trigger: str,
+    existing_episode_scan_ready: bool,
+    existing_episode_scan_reliable: bool,
+    existing_folder_episodes: Set[int],
+    single_season_episode_upper_bound: int,
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if str((task or {}).get("media_type", "movie") or "movie").strip().lower() != "tv":
+        return {"enabled": False, "reason": "not_tv", "candidate_missing_episodes": []}
+
+    trigger_mode = str(trigger or "").strip().lower()
+    upper_bound = max(0, int(single_season_episode_upper_bound or 0))
+    normalized_existing = _clamp_episode_values(
+        existing_folder_episodes or set(),
+        episode_upper_bound=upper_bound,
+    )
+    candidate_missing: Set[int] = set()
+
+    if trigger_mode == "manual":
+        return {
+            "enabled": True,
+            "reason": "manual",
+            "candidate_missing_episodes": [],
+            "target_missing_count": 0,
+        }
+
+    if upper_bound <= 0:
+        return {"enabled": False, "reason": "unknown_total", "candidate_missing_episodes": []}
+    if not existing_episode_scan_ready:
+        return {"enabled": False, "reason": "scan_not_ready", "candidate_missing_episodes": []}
+    if not existing_episode_scan_reliable:
+        return {"enabled": False, "reason": "scan_unreliable", "candidate_missing_episodes": []}
+
+    target_episodes = set(range(1, upper_bound + 1))
+    target_missing = target_episodes.difference(normalized_existing)
+    if not target_missing:
+        return {
+            "enabled": False,
+            "reason": "target_complete",
+            "candidate_missing_episodes": [],
+            "target_missing_count": 0,
+        }
+
+    if not normalized_existing:
+        return {
+            "enabled": True,
+            "reason": "initial_empty_target",
+            "candidate_missing_episodes": [],
+            "target_missing_count": len(target_missing),
+        }
+
+    candidate_count = 0
+    for candidate in (candidates if isinstance(candidates, list) else []):
+        candidate_count += 1
+        candidate_missing.update(
+            _candidate_missing_episode_values(
+                candidate,
+                normalized_existing,
+                episode_upper_bound=upper_bound,
+            )
+        )
+    if candidate_missing:
+        return {
+            "enabled": True,
+            "reason": "candidate_missing_episodes",
+            "candidate_missing_episodes": sorted(candidate_missing)[:120],
+            "target_missing_count": len(target_missing),
+            "candidate_count": candidate_count,
+        }
+
+    existing_max = max(normalized_existing) if normalized_existing else 0
+    backfill_missing = {episode_no for episode_no in target_missing if existing_max > 0 and episode_no <= existing_max}
+    if backfill_missing:
+        return {
+            "enabled": True,
+            "reason": "backfill_gap",
+            "candidate_missing_episodes": sorted(backfill_missing)[:120],
+            "target_missing_count": len(target_missing),
+            "candidate_count": candidate_count,
+        }
+
+    if candidate_count > 0:
+        return {
+            "enabled": True,
+            "reason": "manifest_pending_missing_check",
+            "candidate_missing_episodes": [],
+            "target_missing_count": len(target_missing),
+            "candidate_count": candidate_count,
+        }
+
+    return {
+        "enabled": False,
+        "reason": "no_candidates",
+        "candidate_missing_episodes": sorted(candidate_missing)[:120],
+        "target_missing_count": len(target_missing),
+        "candidate_count": candidate_count,
+    }
+
+
 def _build_subscription_candidate_manifest_cache_key(provider: str, candidate: Dict[str, Any]) -> str:
     payload = candidate if isinstance(candidate, dict) else {}
     item = payload.get("item", {}) if isinstance(payload.get("item"), dict) else {}
@@ -2548,10 +2650,6 @@ async def run_subscription_task(
                     )
 
         trigger_is_manual = str(trigger or "").strip().lower() == "manual"
-        batch_episode_import = (
-            task["media_type"] == "tv"
-            and trigger_is_manual
-        )
         attempt_candidates = ranked_candidates
         if task["media_type"] == "tv" and existing_episode_scan_ready:
             attempt_candidates = _prioritize_tv_candidates_by_missing_episodes(
@@ -2591,6 +2689,55 @@ async def run_subscription_task(
                 ),
                 "info",
             )
+        batch_episode_decision = _build_subscription_episode_batch_decision(
+            task,
+            trigger=trigger,
+            existing_episode_scan_ready=existing_episode_scan_ready,
+            existing_episode_scan_reliable=existing_episode_scan_reliable,
+            existing_folder_episodes=existing_folder_episodes,
+            single_season_episode_upper_bound=single_season_episode_upper_bound,
+            candidates=attempt_candidates,
+        )
+        batch_episode_import = bool(batch_episode_decision.get("enabled", False))
+        batch_episode_import_reason = str(batch_episode_decision.get("reason", "") or "").strip()
+        if batch_episode_import and task["media_type"] == "tv" and existing_episode_scan_ready and not trigger_is_manual:
+            attempt_candidates = _prioritize_tv_candidates_by_missing_episodes(
+                attempt_candidates,
+                existing_folder_episodes,
+                last_episode,
+                prefer_backfill=True,
+                episode_upper_bound=single_season_episode_upper_bound,
+            )
+            target_missing_count = max(0, int(batch_episode_decision.get("target_missing_count", 0) or 0))
+            candidate_missing_values = {
+                max(0, int(value or 0))
+                for value in (
+                    batch_episode_decision.get("candidate_missing_episodes", [])
+                    if isinstance(batch_episode_decision.get("candidate_missing_episodes", []), list)
+                    else []
+                )
+                if max(0, int(value or 0)) > 0
+            }
+            reason_labels = {
+                "initial_empty_target": "目标目录为空，需补齐首轮已发布剧集",
+                "candidate_missing_episodes": "候选集数命中本地缺失集",
+                "backfill_gap": "目标目录存在中间缺集",
+                "manifest_pending_missing_check": "候选标题未稳定给出集数，需逐个按分享清单精查",
+            }
+            reason_label = reason_labels.get(batch_episode_import_reason, batch_episode_import_reason or "缺集补齐")
+            candidate_tail = (
+                f"，候选缺失 {_format_episode_preview(candidate_missing_values)}"
+                if candidate_missing_values
+                else ""
+            )
+            await write_subscription_log(
+                (
+                    f"自动缺集补齐模式已启用：{reason_label}"
+                    f"{'，目标缺失 ' + str(target_missing_count) + ' 集' if target_missing_count > 0 else ''}"
+                    f"{candidate_tail}"
+                ),
+                "info",
+            )
         if batch_episode_import:
             deduped_candidates: List[Dict[str, Any]] = []
             bucket_limit_per_episode = 3
@@ -2620,8 +2767,9 @@ async def run_subscription_task(
                 attempt_candidates = with_episode_candidates + fallback_without_episode
             else:
                 attempt_candidates = without_episode_candidates
+            batch_mode_label = "手动追更批量模式" if trigger_is_manual else "自动缺集补齐模式"
             await write_subscription_log(
-                f"手动追更批量模式：同集/同范围最多保留 {bucket_limit_per_episode} 条，候选 {len(attempt_candidates)} 条，本次最多尝试 {min(20, len(attempt_candidates))} 条",
+                f"{batch_mode_label}：同集/同范围最多保留 {bucket_limit_per_episode} 条，补齐候选 {len(attempt_candidates)} 条，本轮全部纳入尝试队列",
                 "info",
             )
 
@@ -2643,7 +2791,7 @@ async def run_subscription_task(
                 "info",
             )
 
-        max_attempts = max(1, min(20 if batch_episode_import else 8, len(attempt_candidates)))
+        max_attempts = max(1, len(attempt_candidates) if batch_episode_import else min(8, len(attempt_candidates)))
         attempt_interval_seconds = max(0.0, float(SUBSCRIPTION_ATTEMPT_INTERVAL_SECONDS or 0))
         import_timeout_seconds = max(10, int(SUBSCRIPTION_IMPORT_TIMEOUT_SECONDS or 90))
         attempted_candidates = 0
@@ -4332,6 +4480,9 @@ async def run_subscription_task(
                     "batch_triggered_groups": int(batch_refresh_result.get("triggered_groups", 0) or 0),
                     "batch_triggered_jobs": int(batch_refresh_result.get("triggered_jobs", 0) or 0),
                     "batch_missing_monitor_task_jobs": int(batch_refresh_result.get("missing_monitor_task_jobs", 0) or 0),
+                    "batch_episode_import": batch_episode_import,
+                    "batch_episode_import_reason": batch_episode_import_reason,
+                    "batch_episode_decision": batch_episode_decision,
                     "last_episode": last_episode,
                     "total_episodes": known_total,
                     "attempted_candidates": attempted_candidates,
@@ -4475,6 +4626,8 @@ async def run_subscription_task(
                 "imported_episode_count": len(imported_episode_list),
                 "imported_episodes": imported_episode_list[:80],
                 "batch_episode_import": batch_episode_import,
+                "batch_episode_import_reason": batch_episode_import_reason,
+                "batch_episode_decision": batch_episode_decision,
                 "attempted_candidates": attempted_candidates,
                 "failed_attempts": failed_attempts,
                 "timed_out_attempts": timed_out_attempts,
