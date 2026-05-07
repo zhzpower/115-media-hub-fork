@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         115-media-hub助手
 // @namespace    http://tampermonkey.net/
-// @version      2.4.0
+// @version      2.4.2
 // @description  检测网页 magnet / torrent / 115 / 夸克分享链接并生成快捷按钮
 // @author       仙儿
 // @license      MIT
@@ -12,6 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @run-at       document-end
+// @connect      hub.shuxian.fun
 // ==/UserScript==
 
 (function () {
@@ -105,6 +106,18 @@
 
     function isHttpUrl(url) {
         return /^https?:\/\//i.test(String(url || '').trim());
+    }
+
+    function normalizeWebhookUrl(url) {
+        const text = String(url || '').trim();
+        if (!text) return '';
+        try {
+            const parsed = new URL(text);
+            if (!/^https?:$/i.test(parsed.protocol)) return text;
+            return parsed.href;
+        } catch (err) {
+            return text.replace(/[^\x00-\x7F]/g, (ch) => encodeURIComponent(ch));
+        }
     }
 
     function normalizeSourceLink(link) {
@@ -288,7 +301,7 @@
         return {
             id: String(payload.id || '').trim() || makeTaskId(),
             name: String(payload.name || '').trim(),
-            webhookUrl: String(payload.webhookUrl || '').trim(),
+            webhookUrl: normalizeWebhookUrl(payload.webhookUrl || ''),
             savepath: normalizeSavePath(payload.savepath || ''),
             delaySeconds: Math.max(0, parseInt(payload.delaySeconds, 10) || 0),
             enabled: typeof payload.enabled === 'boolean' ? payload.enabled : true
@@ -726,11 +739,11 @@
         };
     }
 
-    function postJson(url, headers, bodyText) {
+    function postJsonByGM(requestUrl, headers, bodyText) {
         return new Promise((resolve) => {
             GM_xmlhttpRequest({
                 method: 'POST',
-                url,
+                url: requestUrl,
                 headers,
                 data: bodyText,
                 timeout: 18000,
@@ -739,10 +752,52 @@
                     status: res.status,
                     body: String(res.responseText || '')
                 }),
-                onerror: () => resolve({ ok: false, status: 0, body: '网络错误' }),
-                ontimeout: () => resolve({ ok: false, status: 0, body: '请求超时' })
+                onerror: (err) => {
+                    const detail = err && (err.error || err.message || err.type)
+                        ? `: ${String(err.error || err.message || err.type)}`
+                        : '';
+                    resolve({ ok: false, status: 0, body: `网络错误${detail}` });
+                },
+                ontimeout: () => resolve({ ok: false, status: 0, body: `请求超时: ${requestUrl}` })
             });
         });
+    }
+
+    async function postJsonByFetch(requestUrl, headers, bodyText) {
+        try {
+            const res = await fetch(requestUrl, {
+                method: 'POST',
+                headers,
+                body: bodyText,
+                mode: 'cors',
+                credentials: 'omit',
+                cache: 'no-store'
+            });
+            return {
+                ok: res.ok,
+                status: res.status,
+                body: await res.text()
+            };
+        } catch (err) {
+            return {
+                ok: false,
+                status: 0,
+                body: `fetch 备用请求失败: ${err && err.message ? err.message : '网络错误'}`
+            };
+        }
+    }
+
+    async function postJson(url, headers, bodyText) {
+        const requestUrl = normalizeWebhookUrl(url);
+        const gmResult = await postJsonByGM(requestUrl, headers, bodyText);
+        if (gmResult.ok || gmResult.status > 0) return gmResult;
+        const fetchResult = await postJsonByFetch(requestUrl, headers, bodyText);
+        if (fetchResult.ok || fetchResult.status > 0) return fetchResult;
+        return {
+            ok: false,
+            status: 0,
+            body: `${gmResult.body || 'GM 请求失败'}；${fetchResult.body || 'fetch 备用请求失败'}`
+        };
     }
 
     function activeTasks() {

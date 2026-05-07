@@ -157,10 +157,19 @@ POST /webhook/{任务名}
 油猴脚本任务和文件夹监控任务的关系：
 
 - 脚本“请求地址”必须指向已开启 Webhook 的监控任务：`http://IP:端口/webhook/{任务名}`，后台用 `{任务名}` 找到要触发的文件夹监控任务
+- 如果通过域名和 HTTPS 暴露服务，脚本和网页前端应使用反代入口：`https://域名/webhook/{任务名}`，不要把容器 HTTP 端口写成 `https://IP:端口`
 - 脚本“保存路径 savepath”是磁力离线下载到 115 的目标目录；它会拼到 115 挂载前缀后和监控任务“扫描路径”匹配
 - 只有 `savepath` 落在该监控任务的扫描路径内，导入成功后才会自动触发刷新并生成 `.strm`
 - 脚本“延迟”是导入成功后等待几秒再刷新；填 0 或不填时使用监控任务默认延迟
 - 脚本“名称”只用于 Tampermonkey 任务列表显示，不参与后台匹配
+
+跨域调用：
+
+- 后端默认允许跨域预检请求，普通网页前端可以用 `fetch` 调用 Webhook
+- 默认允许来源为 `*`，不允许携带浏览器 Cookie
+- 如需收窄来源，设置环境变量 `CORS_ALLOW_ORIGINS=https://example.com,https://app.example.com`
+- 如需跨域携带 Cookie，必须设置具体来源，并设置 `CORS_ALLOW_CREDENTIALS=1`；不要和通配来源 `*` 混用
+- Webhook 如果暴露到公网，建议始终配置 `webhook_secret`
 
 安全校验：
 

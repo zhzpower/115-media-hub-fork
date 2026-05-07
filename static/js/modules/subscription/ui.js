@@ -357,21 +357,13 @@
             }
         }
 
-        function renderSubscriptionLogHistoryHint() {
-            const hint = document.getElementById('subscription-log-history-hint');
-            if (!hint) return;
-            if (subscriptionLogLoading) {
-                hint.className = 'mb-2 text-center text-xs text-slate-400';
-                hint.innerHTML = '正在加载历史日志...';
-                return;
-            }
-            if (subscriptionLogHasMoreBefore) {
-                hint.className = 'mb-2 text-center';
-                hint.innerHTML = '<button type="button" class="text-xs px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300" data-subscription-log-load-before>加载更早 3 条</button>';
-                return;
-            }
-            hint.className = 'hidden mb-2 text-center';
-            hint.innerHTML = '';
+        function updateSubscriptionLogLoadControl() {
+            const loadMoreBtn = document.getElementById('subscription-log-load-more');
+            if (!loadMoreBtn) return;
+            const hasMore = !!subscriptionLogHasMoreBefore;
+            loadMoreBtn.classList.toggle('hidden', !hasMore);
+            loadMoreBtn.disabled = !hasMore || subscriptionLogLoading;
+            loadMoreBtn.innerText = subscriptionLogLoading ? '加载中...' : '加载更早 3 条';
         }
 
         function renderSubscriptionLogLoadSummary() {
@@ -385,9 +377,6 @@
         function renderSubscriptionLogRows({ keepScroll = false } = {}) {
             const box = document.getElementById('subscription-log-box');
             if (!box) return;
-            if (!subscriptionLogRows.length) {
-                renderSubscriptionLogHistoryHint();
-            }
             const previousScrollHeight = box.scrollHeight;
             const previousScrollTop = box.scrollTop;
             const wasAtBottom = (previousScrollHeight - previousScrollTop - box.clientHeight) < 24;
@@ -402,7 +391,7 @@
                 }).join('');
                 lastSubscriptionLogSignature = logSignature;
             }
-            renderSubscriptionLogHistoryHint();
+            updateSubscriptionLogLoadControl();
             renderSubscriptionLogLoadSummary();
             if (keepScroll) {
                 box.scrollTop = previousScrollTop + Math.max(0, box.scrollHeight - previousScrollHeight);
@@ -416,7 +405,7 @@
         async function fetchSubscriptionLogs({ after = 0, before = 0, limit = SUBSCRIPTION_LOG_PAGE_TASK_LIMIT, prepend = false } = {}) {
             if (subscriptionLogLoading) return;
             subscriptionLogLoading = true;
-            renderSubscriptionLogHistoryHint();
+            updateSubscriptionLogLoadControl();
             try {
                 const params = new URLSearchParams();
                 if (after > 0) params.set('after', String(after));
@@ -438,11 +427,11 @@
                 if (!prepend) trimSubscriptionLogWindow();
                 renderSubscriptionLogRows({ keepScroll: prepend });
             } catch (e) {
-                renderSubscriptionLogHistoryHint();
+                updateSubscriptionLogLoadControl();
                 renderSubscriptionLogLoadSummary();
             } finally {
                 subscriptionLogLoading = false;
-                renderSubscriptionLogHistoryHint();
+                updateSubscriptionLogLoadControl();
                 renderSubscriptionLogLoadSummary();
             }
         }

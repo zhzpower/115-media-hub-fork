@@ -366,6 +366,7 @@ async def run_monitor_task(
                 trigger=trigger,
                 stats=stats,
                 generated_strm_paths=generated_strm_paths,
+                source_context=payload if isinstance(payload, dict) else {},
             )
             if notify_result.get("pushed"):
                 await write_monitor_log(
@@ -375,6 +376,14 @@ async def run_monitor_task(
                         unmatched=max(0, int(notify_result.get("unmatched", 0) or 0)),
                     ),
                     "success",
+                )
+            elif str(notify_result.get("reason", "") or "").strip() == "merged_with_subscription":
+                await write_monitor_log(
+                    (
+                        "通知已合并到订阅任务更新通知"
+                        f" | run_id={str(notify_result.get('subscription_run_id', '') or '').strip() or '--'}"
+                    ),
+                    "info",
                 )
         except Exception as notify_exc:
             await write_monitor_log(f"通知推送失败: {notify_exc}", "warn")
@@ -449,7 +458,48 @@ def _normalize_monitor_queue_payload(payload: Optional[Dict[str, Any]]) -> Dict[
     if delay_seconds > 0:
         normalized["delayTime"] = delay_seconds
 
+    subscription_run_id = str(raw_payload.get("subscription_run_id", "") or "").strip()
+    if subscription_run_id:
+        normalized["source"] = "subscription"
+        normalized["subscription_run_id"] = subscription_run_id[:160]
+        subscription_task_name = str(raw_payload.get("subscription_task_name", "") or "").strip()
+        if subscription_task_name:
+            normalized["subscription_task_name"] = subscription_task_name[:200]
+
     return normalized
+
+
+def _extract_monitor_subscription_context(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized_payload = _normalize_monitor_queue_payload(payload)
+    subscription_run_id = str(normalized_payload.get("subscription_run_id", "") or "").strip()
+    if not subscription_run_id:
+        return {}
+    context = {
+        "source": "subscription",
+        "subscription_run_id": subscription_run_id,
+    }
+    subscription_task_name = str(normalized_payload.get("subscription_task_name", "") or "").strip()
+    if subscription_task_name:
+        context["subscription_task_name"] = subscription_task_name
+    return context
+
+
+def _merge_monitor_subscription_context(
+    existing: Optional[Dict[str, Any]],
+    incoming: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    existing_context = _extract_monitor_subscription_context(existing)
+    incoming_context = _extract_monitor_subscription_context(incoming)
+    existing_run_id = str(existing_context.get("subscription_run_id", "") or "").strip()
+    incoming_run_id = str(incoming_context.get("subscription_run_id", "") or "").strip()
+    if not existing_run_id and not incoming_run_id:
+        return {}
+    if existing_run_id and incoming_run_id and existing_run_id == incoming_run_id:
+        return {
+            **existing_context,
+            **{key: value for key, value in incoming_context.items() if str(value or "").strip()},
+        }
+    return {}
 
 
 def _monitor_queue_scope(payload: Optional[Dict[str, Any]]) -> str:
@@ -463,10 +513,6 @@ def _monitor_queue_scope(payload: Optional[Dict[str, Any]]) -> str:
 def _merge_monitor_queue_payload(existing: Optional[Dict[str, Any]], incoming: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     existing_payload = _normalize_monitor_queue_payload(existing)
     incoming_payload = _normalize_monitor_queue_payload(incoming)
-    if not existing_payload:
-        return incoming_payload
-    if not incoming_payload:
-        return existing_payload
 
     existing_scope = _monitor_queue_scope(existing_payload)
     incoming_scope = _monitor_queue_scope(incoming_payload)
@@ -491,6 +537,7 @@ def _merge_monitor_queue_payload(existing: Optional[Dict[str, Any]], incoming: O
 
     if merged_delay > 0:
         merged_payload["delayTime"] = merged_delay
+    merged_payload.update(_merge_monitor_subscription_context(existing_payload, incoming_payload))
     return merged_payload
 
 

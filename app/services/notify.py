@@ -390,6 +390,7 @@ def _build_subscription_success_markdown(
     successful_count: int,
     notify_episodes: List[int],
     next_episode: int,
+    monitor_context: Dict[str, Any] = None,
 ) -> str:
     media_type = str(task.get("media_type", "movie") or "movie").strip().lower()
     media_label = "电视剧" if media_type == "tv" else "电影"
@@ -434,6 +435,20 @@ def _build_subscription_success_markdown(
         lines.append(f"> - 导入任务：#{int(job_id)}")
     if int(successful_count or 0) > 1:
         lines.append(f"> - 本轮批量成功：{int(successful_count)} 条")
+
+    monitor_payload = monitor_context if isinstance(monitor_context, dict) else {}
+    monitor_triggered_groups = max(0, int(monitor_payload.get("triggered_groups", 0) or 0))
+    monitor_triggered_jobs = max(0, int(monitor_payload.get("triggered_jobs", 0) or 0))
+    if monitor_triggered_groups > 0:
+        monitor_parts = [f"已统一触发 {monitor_triggered_groups} 组文件夹监控"]
+        if monitor_triggered_jobs > 0:
+            monitor_parts.append(f"覆盖 {monitor_triggered_jobs} 个导入任务")
+        lines.extend(
+            [
+                ">",
+                f"> 文件夹监控：{'，'.join(monitor_parts)}；本次监控生成通知并入订阅通知",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -518,6 +533,7 @@ async def push_subscription_success_notification(
     imported_episode_list: List[int],
     baseline_last_episode: int,
     next_episode: int,
+    monitor_context: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     runtime_cfg = build_notify_runtime_config(cfg)
     if not bool(runtime_cfg.get("enabled", False)):
@@ -575,6 +591,7 @@ async def push_subscription_success_notification(
         successful_count=successful_count,
         notify_episodes=fresh_episode_values if media_type == "tv" else [],
         next_episode=next_episode,
+        monitor_context=monitor_context if isinstance(monitor_context, dict) else {},
     )
     await asyncio.to_thread(_send_notify_content, runtime_cfg, content, 20)
     await asyncio.to_thread(
@@ -593,6 +610,18 @@ async def push_subscription_success_notification(
         "provider_label": provider_label,
         "link_type": link_type,
         "link_type_label": link_type_label,
+        "monitor_merged": bool(
+            isinstance(monitor_context, dict)
+            and max(0, int(monitor_context.get("triggered_groups", 0) or 0)) > 0
+        ),
+        "monitor_triggered_groups": max(
+            0,
+            int((monitor_context if isinstance(monitor_context, dict) else {}).get("triggered_groups", 0) or 0),
+        ),
+        "monitor_triggered_jobs": max(
+            0,
+            int((monitor_context if isinstance(monitor_context, dict) else {}).get("triggered_jobs", 0) or 0),
+        ),
     }
 
 
@@ -852,9 +881,21 @@ async def push_monitor_success_notification(
     trigger: str,
     stats: Dict[str, Any],
     generated_strm_paths: List[str],
+    source_context: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     if not bool(cfg.get("notify_monitor_enabled", False)):
         return {"pushed": False, "reason": "monitor_disabled"}
+
+    context_payload = source_context if isinstance(source_context, dict) else {}
+    subscription_run_id = str(context_payload.get("subscription_run_id", "") or "").strip()
+    if subscription_run_id and bool(cfg.get("notify_push_enabled", False)):
+        return {
+            "pushed": False,
+            "reason": "merged_with_subscription",
+            "scene": NOTIFY_SCENE_MONITOR_SUCCESS,
+            "subscription_run_id": subscription_run_id,
+            "subscription_task_name": str(context_payload.get("subscription_task_name", "") or "").strip(),
+        }
 
     generated_count = max(0, int((stats or {}).get("generated", 0) or 0))
     normalized_paths = unique_preserve_order(

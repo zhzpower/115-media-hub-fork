@@ -11,6 +11,48 @@ globals().update(
 )
 
 
+def _format_subscription_matched_episode_summary(episodes: Any) -> str:
+    normalized: List[int] = []
+    seen: Set[int] = set()
+    for raw_value in episodes or []:
+        try:
+            episode_no = max(0, int(raw_value or 0))
+        except (TypeError, ValueError):
+            continue
+        if episode_no <= 0 or episode_no in seen:
+            continue
+        seen.add(episode_no)
+        normalized.append(episode_no)
+    ordered = sorted(normalized)
+    if not ordered:
+        return ""
+
+    ranges: List[Tuple[int, int]] = []
+    range_start = ordered[0]
+    previous = ordered[0]
+    for episode_no in ordered[1:]:
+        if episode_no == previous + 1:
+            previous = episode_no
+            continue
+        ranges.append((range_start, previous))
+        range_start = episode_no
+        previous = episode_no
+    ranges.append((range_start, previous))
+
+    parts = [
+        f"第{start}集" if start == end else f"第{start}到{end}集"
+        for start, end in ranges
+    ]
+    return "、".join(parts)
+
+
+def _build_subscription_matched_episode_log_tail(task: Dict[str, Any], episodes: Any) -> str:
+    if str((task or {}).get("media_type", "movie") or "movie").strip().lower() != "tv":
+        return ""
+    episode_summary = _format_subscription_matched_episode_summary(episodes)
+    return f"；命中集数：{episode_summary}" if episode_summary else ""
+
+
 def _format_subscription_share_scan_truncated_reason(reason: Any) -> str:
     labels = {
         "max_dirs": "目录数达到上限",
@@ -727,6 +769,15 @@ async def _write_subscription_notify_result_log(
     else:
         await write_subscription_log(
             f"更新通知已推送到{channel_label} | 网盘: {provider_label} | 方式: {link_type_label}",
+            "info",
+        )
+    if bool(notify_result.get("monitor_merged", False)):
+        await write_subscription_log(
+            (
+                "文件夹监控通知已并入本次订阅通知"
+                f" | 触发 {max(0, int(notify_result.get('monitor_triggered_groups', 0) or 0))} 组"
+                f" / 覆盖 {max(0, int(notify_result.get('monitor_triggered_jobs', 0) or 0))} 个导入任务"
+            ),
             "info",
         )
 
@@ -1935,6 +1986,7 @@ async def _run_subscription_task_quark(
         job_id = normalized_successful_job_ids[0]
     successful_count = len(normalized_successful_job_ids) if normalized_successful_job_ids else (1 if job_id > 0 else 0)
     imported_episode_list = sorted(imported_episodes)
+    episode_log_tail = _build_subscription_matched_episode_log_tail(task, imported_episode_list)
     matched_display_title = pick_subscription_display_title(task, item, fallback=f"资源#{resource_id}")
     import_type_label = format_resource_link_type_label(item.get("link_type", ""), item.get("link_url", ""))
 
@@ -1950,12 +2002,12 @@ async def _run_subscription_task_quark(
     if successful_count > 1:
         detail = (
             f"命中「{matched_display_title}」（评分 {score}，方式 {import_type_label}），本轮已执行 {successful_count} 个夸克导入任务"
-            f"（首个 #{job_id}），保存到 {selected_job_savepath}；夸克链路不触发监控刷新"
+            f"（首个 #{job_id}），保存到 {selected_job_savepath}；夸克链路不触发监控刷新{episode_log_tail}"
         )
     else:
         detail = (
             f"命中「{matched_display_title}」（评分 {score}，方式 {import_type_label}），已创建并执行夸克导入任务 #{job_id}，"
-            f"保存到 {selected_job_savepath}；夸克链路不触发监控刷新"
+            f"保存到 {selected_job_savepath}；夸克链路不触发监控刷新{episode_log_tail}"
         )
     upsert_subscription_task_state(
         task_name,
@@ -4521,6 +4573,7 @@ async def run_subscription_task(
         batch_triggered_groups = int(batch_refresh_result.get("triggered_groups", 0) or 0)
         auto_refresh = bool(selected_auto_refresh or (batch_refresh_enabled and batch_triggered_groups > 0))
         imported_episode_list = sorted(imported_episodes)
+        episode_log_tail = _build_subscription_matched_episode_log_tail(task, imported_episode_list)
         matched_display_title = pick_subscription_display_title(task, item, fallback=f"资源#{resource_id}")
         import_type_label = format_resource_link_type_label(item.get("link_type", ""), item.get("link_url", ""))
 
@@ -4542,11 +4595,7 @@ async def run_subscription_task(
             action_text = "已创建并执行导入任务"
         if task["media_type"] == "tv" and (successful_count > 1 or successful_job_count > 1):
             if imported_episode_list:
-                if len(imported_episode_list) <= 8:
-                    episode_summary = "、".join([f"E{episode_no}" for episode_no in imported_episode_list])
-                else:
-                    episode_summary = f"E{imported_episode_list[0]}-E{imported_episode_list[-1]}"
-                batch_tail = f"（新增 {len(imported_episode_list)} 集：{episode_summary}）"
+                batch_tail = f"（命中 {len(imported_episode_list)} 集）"
             else:
                 batch_tail = ""
             batch_prefix = (
@@ -4557,12 +4606,12 @@ async def run_subscription_task(
             detail = (
                 f"{batch_prefix}{batch_tail}；"
                 f"最新命中「{matched_display_title}」"
-                f"（评分 {score}，方式 {import_type_label}），{action_text} #{job_id}，保存到 {selected_job_savepath}"
+                f"（评分 {score}，方式 {import_type_label}），{action_text} #{job_id}，保存到 {selected_job_savepath}{episode_log_tail}"
             )
         else:
             detail = (
                 f"命中「{matched_display_title}」"
-                f"（评分 {score}，方式 {import_type_label}），{action_text} #{job_id}，保存到 {selected_job_savepath}"
+                f"（评分 {score}，方式 {import_type_label}），{action_text} #{job_id}，保存到 {selected_job_savepath}{episode_log_tail}"
             )
         if batch_refresh_enabled:
             successful_jobs = int(batch_refresh_result.get("successful_jobs", 0) or 0)
@@ -4662,6 +4711,7 @@ async def run_subscription_task(
                 imported_episode_list=imported_episode_list,
                 baseline_last_episode=baseline_last_episode,
                 next_episode=next_episode,
+                monitor_context=batch_refresh_result if batch_refresh_enabled else {},
             )
             if bool(notify_result.get("pushed", False)):
                 await _write_subscription_notify_result_log(notify_result, task, item)

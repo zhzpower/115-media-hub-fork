@@ -129,6 +129,17 @@ async def trigger_resource_job_refresh(job_id: int, reason: str = "manual") -> D
         "sharetitle": job.get("sharetitle", ""),
         "title": job.get("title", ""),
     }
+    job_extra = job.get("extra") if isinstance(job.get("extra"), dict) else safe_json_loads(job.get("extra_json"), {})
+    if (
+        str(reason or "").strip().lower() == "auto"
+        and str(job.get("job_source", "") or job_extra.get("job_source", "") or "").strip() == "subscription_auto"
+    ):
+        subscription_run_id = str(job_extra.get("subscription_run_id", "") or "").strip()
+        if subscription_run_id:
+            payload["subscription_run_id"] = subscription_run_id
+            subscription_task_name = str(job_extra.get("subscription_task_name", "") or "").strip()
+            if subscription_task_name:
+                payload["subscription_task_name"] = subscription_task_name
     refresh_target_type = str(job.get("refresh_target_type", "") or "").strip()
     if refresh_target_type:
         payload["refresh_target_type"] = refresh_target_type

@@ -19,9 +19,10 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config_store import JsonConfigStore
 from .db import (
@@ -230,6 +231,44 @@ app.add_middleware(
 app.add_middleware(
     GZipMiddleware,
     minimum_size=1024,
+)
+
+
+def _split_env_list(value: str) -> List[str]:
+    return [item.strip() for item in re.split(r"[\s,]+", value or "") if item.strip()]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enable", "enabled"}
+
+
+cors_allow_origins = _split_env_list(os.environ.get("CORS_ALLOW_ORIGINS", "*")) or ["*"]
+cors_allow_origin_regex = str(os.environ.get("CORS_ALLOW_ORIGIN_REGEX", "") or "").strip() or None
+cors_allow_credentials = _env_flag("CORS_ALLOW_CREDENTIALS", False)
+if cors_allow_credentials and "*" in cors_allow_origins:
+    cors_allow_origins = [origin for origin in cors_allow_origins if origin != "*"]
+    if not cors_allow_origins and not cors_allow_origin_regex:
+        cors_allow_credentials = False
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=cors_allow_credentials,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Accept",
+        "Authorization",
+        "Content-Type",
+        "X-Requested-With",
+        "X-Webhook-Token",
+        "X-Webhook-Ts",
+        "X-Webhook-Nonce",
+        "X-Webhook-Sign",
+    ],
+    expose_headers=["Server-Timing", "X-Server-Time-Ms"],
+    max_age=600,
 )
 
 

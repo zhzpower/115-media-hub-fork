@@ -456,6 +456,8 @@ def _finalize_subscription_batch_refresh(
             {
                 "savepath": savepath,
                 "title": f"订阅批次收口：{task_name}",
+                "subscription_task_name": task_name,
+                "subscription_run_id": result["run_id"],
             },
         )
         result["triggered_groups"] += 1

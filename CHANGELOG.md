@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.14] - 2026-05-07
+- 后端新增可配置 CORS 支持，默认允许普通网页前端跨域调用 Webhook，并可通过 `CORS_ALLOW_ORIGINS`、`CORS_ALLOW_ORIGIN_REGEX`、`CORS_ALLOW_CREDENTIALS` 收窄来源或开启凭据。
+- 油猴脚本 Webhook 地址会统一规范化，并在 GM 请求失败时尝试 `fetch` 备用发送，提升域名和 HTTPS 反代场景下的调用成功率。
+- 订阅自动导入触发文件夹监控时会携带订阅运行上下文，并把本轮监控结果合并进订阅成功通知，避免同一轮重复推送。
+- 订阅运行日志补充电视剧命中集数摘要，订阅日志“加载更早 3 条”入口固定到标题操作区，减少空日志提示区状态跳动。
+- README 补充 HTTPS 反代 Webhook 地址写法、跨域配置说明，以及公网暴露 Webhook 时建议配置 `webhook_secret`。
+
 ## [0.3.13] - 2026-05-06
 - 115 电视剧订阅自动运行时改为按“候选集数符合订阅范围且本地未保存”构建补齐队列，符合条件的缺失集会在同一轮纳入尝试。
 - 标题无法稳定识别集数的候选会进入分享清单精查，由文件级集数识别决定是否转存，减少自动任务多跑几次才补齐的问题。

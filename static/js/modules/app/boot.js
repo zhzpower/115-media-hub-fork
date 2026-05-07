@@ -521,11 +521,6 @@
         document.getElementById('subscription-log-box')?.addEventListener('scroll', () => {
             if (typeof handleSubscriptionLogScroll === 'function') handleSubscriptionLogScroll();
         });
-        document.getElementById('subscription-log-history-hint')?.addEventListener('click', (e) => {
-            const btn = e.target.closest('[data-subscription-log-load-before]');
-            if (!btn) return;
-            if (typeof loadEarlierSubscriptionLogs === 'function') loadEarlierSubscriptionLogs();
-        });
         document.getElementById('monitor-task-list')?.addEventListener('click', async (e) => {
             const introBtn = e.target.closest('[data-monitor-toggle-intro]');
             if (introBtn) {
