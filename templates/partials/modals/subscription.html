@@ -99,12 +99,12 @@
                                 <input id="subscription_share_receive_code" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm font-mono uppercase tracking-[0.08em]" placeholder="可选：提取码（1-16 位字母数字）">
                                 <button type="button" onclick="openSubscriptionShareFolderModal(true)" class="px-4 py-3 rounded-xl bg-slate-700 hover:bg-slate-600 text-white text-sm font-bold whitespace-nowrap">应用并浏览</button>
                             </div>
-                            <div class="text-[11px] text-slate-500 leading-5">填写后将优先使用这个固定分享链接，不再依赖频道搜索；适合长期更新的合集链接。</div>
+                            <div class="text-[11px] text-slate-500 leading-5">资源搜索会优先执行（TG 频道搜索，及启用时的 PanSou 搜索）；下方开关开启后，这个固定 115 分享链接会作为备选候选排在资源搜索候选之后。</div>
                             <label class="flex items-center gap-3 cursor-pointer text-sm">
                                 <input type="checkbox" id="subscription_fixed_link_channel_search" class="ui-checkbox">
-                                固定链接后再补搜一次频道（兜底）
+                                启用固定分享链接兜底
                             </label>
-                            <div class="text-[11px] text-slate-500 leading-5">开启后会先尝试固定链接候选，再执行一次频道搜索并追加候选；固定链接候选仍保持优先。</div>
+                            <div class="text-[11px] text-slate-500 leading-5">开启后会先做资源搜索，再把固定链接追加为兜底候选；关闭时即使填写固定链接，也只按资源搜索执行。</div>
                         </div>
                         <label class="block">
                             <span class="text-xs text-slate-500">115 分享子目录（可选）</span>
@@ -114,7 +114,7 @@
                         </label>
                     </div>
                     <div id="subscription-quark-provider-hint" class="hidden text-[11px] text-cyan-300/90 leading-5 rounded-xl border border-cyan-400/20 bg-cyan-500/10 px-3 py-2">
-                        Quark 模式仅使用频道自动匹配，不支持固定分享链接模式；评分采用独立规则（强标题命中 + 集数匹配）。
+                        Quark 模式使用资源搜索自动匹配，不支持固定分享链接兜底；也可以手动扫描单个分享链接。
                     </div>
                     <div class="rounded-2xl border border-slate-700 bg-slate-900/60 p-4 space-y-3">
                         <div class="flex flex-wrap items-center justify-between gap-2">
@@ -214,7 +214,7 @@
                         启用任务（关闭后不参与定时，但仍可手动运行）
                     </label>
                     <div id="subscription-provider-strategy-hint" class="text-xs text-slate-500 leading-6">
-                        匹配策略：若填写了固定 115 分享链接，默认只在该链接内扫描；可开启“固定链接后再补搜一次频道”作为兜底。未填写固定链接时，会在已启用频道按标题/别名主动搜索并评分命中。
+                        匹配策略：默认先执行资源搜索（TG 频道搜索，及启用时的 PanSou 搜索）；可开启固定 115 分享链接兜底，把固定链接候选排在资源搜索候选之后。
                     </div>
                 </div>
                 <div class="subscription-modal-actions-inline subscription-modal-footer-shell grid grid-cols-1 md:grid-cols-2 gap-3 pt-2">
@@ -280,20 +280,20 @@
             <div class="subscription-link-scan-shell group-card modal-card">
                 <div class="subscription-link-scan-header">
                     <div class="min-w-0">
-                        <div class="subscription-link-scan-eyebrow">Quark Link Scan</div>
-                        <h3 class="subscription-link-scan-title">指定夸克链接扫描</h3>
+                        <div id="subscription-link-scan-eyebrow" class="subscription-link-scan-eyebrow">Link Scan</div>
+                        <h3 id="subscription-link-scan-title" class="subscription-link-scan-title">扫描链接</h3>
                         <div id="subscription-link-scan-task-label" class="subscription-link-scan-subtitle">选择一个夸克订阅任务后粘贴分享链接。</div>
                     </div>
-                    <button type="button" onclick="closeSubscriptionLinkScanModal()" class="subscription-link-scan-close" aria-label="关闭指定夸克链接扫描弹窗">关闭</button>
+                    <button type="button" onclick="closeSubscriptionLinkScanModal()" class="subscription-link-scan-close" aria-label="关闭扫描链接弹窗">关闭</button>
                 </div>
                 <div class="subscription-link-scan-body">
                     <input id="subscription-link-scan-task-name" type="hidden" value="">
                     <label class="block">
-                        <span class="subscription-link-scan-label">夸克分享链接或完整分享文本</span>
-                        <textarea id="subscription-link-scan-text" class="subscription-link-scan-input" rows="6" placeholder="粘贴 https://pan.quark.cn/s/xxxxxx，或包含链接与提取码的整段分享文本"></textarea>
+                        <span id="subscription-link-scan-input-label" class="subscription-link-scan-label">分享链接或完整分享文本</span>
+                        <textarea id="subscription-link-scan-text" class="subscription-link-scan-input" rows="6" placeholder="粘贴分享链接，或包含链接与提取码的整段分享文本"></textarea>
                     </label>
                     <div id="subscription-link-scan-error" class="subscription-link-scan-error hidden"></div>
-                    <div class="subscription-link-scan-note">提交后会跳过频道搜索，把这个链接当作已命中标题的候选资源，继续走订阅的集数识别、缺失判断和导入流程。</div>
+                    <div id="subscription-link-scan-note" class="subscription-link-scan-note">提交后会跳过资源搜索，把这个链接当作已命中标题的候选资源，继续走订阅的集数识别、缺失判断和导入流程。</div>
                 </div>
                 <div class="subscription-link-scan-footer">
                     <button type="button" onclick="closeSubscriptionLinkScanModal()" class="subscription-link-scan-btn subscription-link-scan-btn-secondary">取消</button>

@@ -165,7 +165,7 @@
             const latestText = latestMatched ? `最近命中：${latestMatched}` : '最近尚未命中资源';
             const modeText = isTv ? (multiSeasonMode ? '多季合一追更' : '单季追更') : '命中资源后即执行';
             const fixedShareText = provider === '115' && fixedShareLink
-                ? `，固定分享链接模式${fixedLinkChannelSearch ? '（频道补搜兜底）' : ''}`
+                ? (fixedLinkChannelSearch ? '，固定分享链接兜底' : '，固定分享链接已填写（未启用兜底）')
                 : '';
             const shareScopeText = provider === '115' && shareSubdir
                 ? `，分享子目录 ${shareSubdir}${shareSubdirCid ? `（CID ${shareSubdirCid}）` : ''}`
@@ -1235,8 +1235,8 @@
             if (minScoreInputEl) minScoreInputEl.disabled = isQuark;
             if (strategyHintEl) {
                 strategyHintEl.textContent = isQuark
-                    ? '匹配策略：Quark 仅使用频道自动匹配，采用独立评分（强标题命中 + 集数命中）；仅集数命中会被拦截。'
-                    : '匹配策略：若填写了固定 115 分享链接，默认只在该链接内扫描；可开启“固定链接后再补搜一次频道”作为兜底。未填写固定链接时，会在已启用频道按标题/别名主动搜索并评分命中。';
+                    ? '匹配策略：Quark 默认使用资源搜索自动匹配，采用独立评分（强标题命中 + 集数命中）；也可手动扫描单个分享链接。'
+                    : '匹配策略：默认先执行资源搜索（TG 频道搜索，及启用时的 PanSou 搜索）；可开启固定 115 分享链接兜底，把固定链接候选排在资源搜索候选之后。';
             }
             syncSubscriptionScanTuningHint(provider);
 
@@ -1670,6 +1670,18 @@
             return '';
         }
 
+        function extractFirstSubscriptionShareUrl(text = '', provider = 'quark') {
+            const raw = String(text || '').trim();
+            if (!raw) return '';
+            const normalizedProvider = normalizeSubscriptionProvider(provider, '115');
+            const pattern = normalizedProvider === '115'
+                ? /(?:https?:\/\/)?(?:115cdn|115|anxia)\.com\/s\/[A-Za-z0-9]+(?:\?[^\s<>'"#]*)?(?:#[A-Za-z0-9]{1,16})?/i
+                : /(?:https?:\/\/)?(?:pan|www)\.quark\.cn\/s\/[A-Za-z0-9]+(?:\?[^\s<>'"]*)?/i;
+            const matched = raw.match(pattern);
+            if (matched) return String(matched[0] || '').replace(/[，。；、]+$/g, '');
+            return extractFirstHttpUrl(raw);
+        }
+
         function setSubscriptionLinkScanError(message = '') {
             const errorEl = document.getElementById('subscription-link-scan-error');
             if (!errorEl) return;
@@ -1684,17 +1696,31 @@
                 showToast('任务不存在或已被删除', { tone: 'warn', duration: 2600, placement: 'top-center' });
                 return;
             }
-            if (normalizeSubscriptionProvider(task.provider || '115', '115') !== 'quark') {
-                showToast('指定链接扫描仅支持夸克订阅任务', { tone: 'warn', duration: 2600, placement: 'top-center' });
+            const provider = normalizeSubscriptionProvider(task.provider || '115', '115');
+            if (!['115', 'quark'].includes(provider)) {
+                showToast('当前订阅任务不支持扫描链接', { tone: 'warn', duration: 2600, placement: 'top-center' });
                 return;
             }
+            const providerLabel = provider === 'quark' ? '夸克' : '115';
+            const example = provider === 'quark' ? 'https://pan.quark.cn/s/xxxxxx' : 'https://115.com/s/xxxxxxx?password=abcd';
+            const titleEl = document.getElementById('subscription-link-scan-title');
+            const eyebrowEl = document.getElementById('subscription-link-scan-eyebrow');
             const taskNameEl = document.getElementById('subscription-link-scan-task-name');
             const taskLabelEl = document.getElementById('subscription-link-scan-task-label');
+            const inputLabelEl = document.getElementById('subscription-link-scan-input-label');
             const textEl = document.getElementById('subscription-link-scan-text');
+            const noteEl = document.getElementById('subscription-link-scan-note');
             const submitBtn = document.getElementById('subscription-link-scan-submit-btn');
+            if (titleEl) titleEl.textContent = '扫描链接';
+            if (eyebrowEl) eyebrowEl.textContent = `${providerLabel} Link Scan`;
             if (taskNameEl) taskNameEl.value = name;
-            if (taskLabelEl) taskLabelEl.textContent = `任务：${String(task.title || name || '').trim() || name}`;
-            if (textEl) textEl.value = '';
+            if (taskLabelEl) taskLabelEl.textContent = `任务：${providerLabel} · ${String(task.title || name || '').trim() || name}`;
+            if (inputLabelEl) inputLabelEl.textContent = `${providerLabel} 分享链接或完整分享文本`;
+            if (textEl) {
+                textEl.value = '';
+                textEl.placeholder = `粘贴 ${example}，或包含链接与提取码的整段分享文本`;
+            }
+            if (noteEl) noteEl.textContent = '提交后会跳过资源搜索，把这个链接当作已命中标题的候选资源，继续走订阅的集数识别、缺失判断和导入流程。';
             if (submitBtn) submitBtn.disabled = false;
             setSubscriptionLinkScanError('');
             showLockedModal('subscription-link-scan-modal');
@@ -1715,9 +1741,16 @@
                 return;
             }
             const normalizedRaw = String(rawText || '').trim();
-            const linkUrl = extractFirstHttpUrl(normalizedRaw);
-            if (!linkUrl || !/quark\.cn\/s\//i.test(linkUrl)) {
-                setSubscriptionLinkScanError('请粘贴有效的夸克分享链接，例如 https://pan.quark.cn/s/xxxxxx');
+            const task = getSubscriptionTaskByName(name);
+            const provider = normalizeSubscriptionProvider(task?.provider || '115', '115');
+            const linkUrl = extractFirstSubscriptionShareUrl(normalizedRaw, provider);
+            const validLink = provider === '115'
+                ? /(?:https?:\/\/)?(?:115cdn|115|anxia)\.com\/s\/[a-z0-9]+/i.test(linkUrl)
+                : /(?:https?:\/\/)?(?:pan|www)\.quark\.cn\/s\/[a-z0-9]+/i.test(linkUrl);
+            if (!linkUrl || !validLink) {
+                const example = provider === '115' ? 'https://115.com/s/xxxxxxx?password=abcd' : 'https://pan.quark.cn/s/xxxxxx';
+                const providerText = provider === '115' ? '115 分享链接' : '夸克分享链接';
+                setSubscriptionLinkScanError(`请粘贴有效的${providerText}，例如 ${example}`);
                 return;
             }
             let data = {};
@@ -1730,7 +1763,7 @@
                     raw_text: normalizedRaw,
                 });
             } catch (error) {
-                setSubscriptionLinkScanError(error?.message || '启动指定链接扫描失败');
+                setSubscriptionLinkScanError(error?.message || '启动扫描链接失败');
                 if (submitBtn) submitBtn.disabled = false;
                 return;
             }
@@ -1747,7 +1780,7 @@
                     summary: { step: '准备执行', detail: `${name} (manual_link)` }
                 }, { forceRender: true });
             }
-            showToast('已提交指定夸克链接扫描', { tone: 'success', duration: 2600, placement: 'top-center' });
+            showToast('已提交扫描链接', { tone: 'success', duration: 2600, placement: 'top-center' });
             await refreshSubscriptionState();
         }
 
@@ -1848,6 +1881,52 @@
             showToast(`已跳转资源搜索：${keyword}`, { tone: 'info', duration: 2400, placement: 'top-center' });
         }
 
+        function buildSubscriptionTaskActionIcon(icon) {
+            const icons = {
+                run: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 5.75V18.25L17.5 12L8 5.75Z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>',
+                stop: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7.25 7.25H16.75V16.75H7.25V7.25Z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>',
+                queued: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 19.25A7.25 7.25 0 1 0 12 4.75A7.25 7.25 0 0 0 12 19.25Z" stroke="currentColor" stroke-width="1.8"/><path d="M12 8.25V12.25L14.75 14.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                search: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M10.75 17.25A6.5 6.5 0 1 0 10.75 4.25A6.5 6.5 0 0 0 10.75 17.25Z" stroke="currentColor" stroke-width="1.85"/><path d="M15.5 15.5L20 20" stroke="currentColor" stroke-width="1.85" stroke-linecap="round"/></svg>',
+                scan: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8.5 12.75L7.25 14A3 3 0 0 0 11.5 18.25L13 16.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M15.5 11.25L16.75 10A3 3 0 0 0 12.5 5.75L11 7.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M9.75 14.25L14.25 9.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+                edit: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5.25 18.75L9.1 17.9L18.45 8.55A2.05 2.05 0 0 0 15.55 5.65L6.2 15L5.25 18.75Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M14.35 6.85L17.15 9.65" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+                delete: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 7.5H19" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M9.25 7.5V5.75H14.75V7.5" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 10V18.25H16V10" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M10.5 11.5V16.5M13.5 11.5V16.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+                rebuild: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M18.6 11.75A6.6 6.6 0 1 1 16.65 7.05" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M19.25 5.25V9.35H15.15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                episodes: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5.25 6.25H10V11H5.25V6.25ZM14 6.25H18.75V11H14V6.25ZM5.25 14H10V18.75H5.25V14ZM14 14H18.75V18.75H14V14Z" stroke="currentColor" stroke-width="1.65" stroke-linejoin="round"/></svg>',
+                collapse: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 14L12 9L17 14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                expand: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 10L12 15L17 10" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+            };
+            return icons[icon] || icons.edit;
+        }
+
+        function buildSubscriptionTaskIconButton({
+            action,
+            taskName,
+            label,
+            icon,
+            tone = 'neutral',
+            disabled = false,
+            extraAttrs = '',
+        } = {}) {
+            const normalizedAction = String(action || '').trim();
+            const normalizedLabel = String(label || '').trim();
+            if (!normalizedAction || !normalizedLabel) return '';
+            const attrText = String(extraAttrs || '').trim();
+            const disabledAttrs = disabled ? ' disabled aria-disabled="true"' : '';
+            return `
+                <button
+                    type="button"
+                    data-subscription-action="${escapeHtml(normalizedAction)}"
+                    data-task-name="${encodeURIComponent(taskName)}"
+                    class="subscription-task-icon-btn subscription-task-icon-btn-${escapeHtml(tone)} ${disabled ? 'btn-disabled' : ''}"
+                    title="${escapeHtml(normalizedLabel)}"
+                    aria-label="${escapeHtml(normalizedLabel)}"
+                    ${attrText ? `${attrText} ` : ''}${disabledAttrs}
+                >
+                    ${buildSubscriptionTaskActionIcon(icon)}
+                </button>
+            `;
+        }
+
         function renderSubscriptionTasks() {
             const container = document.getElementById('subscription-task-list');
             if (!container) return;
@@ -1882,24 +1961,71 @@
                 const toggleRunLabel = running ? '中断' : (queued ? '排队中' : '运行');
                 const toggleRunAction = running ? 'stop' : 'start';
                 const toggleRunDisabled = queued || (subscriptionState.running && !running);
-                const toggleRunClass = running
-                    ? 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300'
-                    : (queued
-                        ? 'bg-slate-700/80 text-slate-300'
-                        : 'bg-emerald-600 hover:bg-emerald-500 text-white');
+                const toggleRunTone = running ? 'stop' : (queued ? 'queued' : 'run');
+                const toggleRunIcon = running ? 'stop' : (queued ? 'queued' : 'run');
                 const rebuildDisabled = running;
-                const actionGridClass = isTv
-                    ? 'subscription-task-actions subscription-task-actions-tv grid grid-cols-3 sm:grid-cols-6 gap-2 shrink-0 w-full lg:w-auto'
-                    : 'subscription-task-actions subscription-task-actions-movie grid grid-cols-2 sm:grid-cols-4 gap-2 shrink-0 w-full lg:w-auto';
+                const actionBarClass = isTv
+                    ? 'subscription-task-actions subscription-task-actions-tv subscription-task-actionbar'
+                    : 'subscription-task-actions subscription-task-actions-movie subscription-task-actionbar';
+                const toggleRunButton = buildSubscriptionTaskIconButton({
+                    action: 'toggle-run',
+                    taskName,
+                    label: toggleRunLabel,
+                    icon: toggleRunIcon,
+                    tone: toggleRunTone,
+                    disabled: toggleRunDisabled,
+                    extraAttrs: `data-subscription-run-action="${escapeHtml(toggleRunAction)}"`,
+                });
+                const searchButton = buildSubscriptionTaskIconButton({
+                    action: 'search',
+                    taskName,
+                    label: '搜索',
+                    icon: 'search',
+                    tone: 'search',
+                });
                 const rebuildButton = isTv
-                    ? `<button type="button" data-subscription-action="rebuild" data-task-name="${encodeURIComponent(taskName)}" class="px-4 py-2 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 text-sky-200 text-sm font-bold ${rebuildDisabled ? 'btn-disabled' : ''}" ${rebuildDisabled ? 'disabled' : ''}>校准</button>`
+                    ? buildSubscriptionTaskIconButton({
+                        action: 'rebuild',
+                        taskName,
+                        label: '校准',
+                        icon: 'rebuild',
+                        tone: 'rebuild',
+                        disabled: rebuildDisabled,
+                    })
                     : '';
                 const episodeViewButton = isTv
-                    ? `<button type="button" data-subscription-action="episodes" data-task-name="${encodeURIComponent(taskName)}" class="px-4 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 text-white text-sm font-bold">集数视图</button>`
+                    ? buildSubscriptionTaskIconButton({
+                        action: 'episodes',
+                        taskName,
+                        label: '集数视图',
+                        icon: 'episodes',
+                        tone: 'episodes',
+                    })
                     : '';
-                const linkScanButton = provider === 'quark'
-                    ? `<button type="button" data-subscription-action="scan-link" data-task-name="${encodeURIComponent(taskName)}" class="px-4 py-2 rounded-xl bg-violet-700 hover:bg-violet-600 text-white text-sm font-bold shadow-sm shadow-violet-950/20 ${toggleRunDisabled ? 'btn-disabled' : ''}" ${toggleRunDisabled ? 'disabled' : ''}>扫链接</button>`
+                const linkScanButton = ['115', 'quark'].includes(provider)
+                    ? buildSubscriptionTaskIconButton({
+                        action: 'scan-link',
+                        taskName,
+                        label: '扫描链接',
+                        icon: 'scan',
+                        tone: 'scan',
+                        disabled: toggleRunDisabled,
+                    })
                     : '';
+                const editButton = buildSubscriptionTaskIconButton({
+                    action: 'edit',
+                    taskName,
+                    label: '编辑',
+                    icon: 'edit',
+                    tone: 'edit',
+                });
+                const deleteButton = buildSubscriptionTaskIconButton({
+                    action: 'delete',
+                    taskName,
+                    label: '删除',
+                    icon: 'delete',
+                    tone: 'delete',
+                });
                 const introText = buildSubscriptionTaskIntro(task, { status, queued, nextRun, progress, isTv, episodeText, multiSeasonMode });
                 return `
                     <div class="rounded-2xl border border-slate-700 bg-slate-900/60 p-3 sm:p-4">
@@ -1920,15 +2046,17 @@
                                     type="button"
                                     data-subscription-toggle-intro="${encodeURIComponent(taskName)}"
                                     aria-expanded="${introExpanded ? 'true' : 'false'}"
-                                    class="shrink-0 text-[11px] sm:text-xs font-bold text-sky-300 hover:text-sky-200 hover:underline underline-offset-2 rounded-lg px-1.5 py-1 focus:outline-none focus:ring-2 focus:ring-sky-500/45"
-                                >${introExpanded ? '收起简介' : '展开简介'}</button>
+                                    class="subscription-intro-toggle-btn"
+                                    title="${introExpanded ? '收起简介' : '展开简介'}"
+                                    aria-label="${introExpanded ? '收起简介' : '展开简介'}"
+                                >${buildSubscriptionTaskActionIcon(introExpanded ? 'collapse' : 'expand')}</button>
                             </div>
-                            <div class="${actionGridClass}">
-                                <button type="button" data-subscription-action="toggle-run" data-subscription-run-action="${toggleRunAction}" data-task-name="${encodeURIComponent(taskName)}" class="px-4 py-2 rounded-xl text-sm font-bold ${toggleRunClass} ${toggleRunDisabled ? 'btn-disabled' : ''}" ${toggleRunDisabled ? 'disabled' : ''}>${toggleRunLabel}</button>
-                                <button type="button" data-subscription-action="search" data-task-name="${encodeURIComponent(taskName)}" class="subscription-task-search-btn px-4 py-2 rounded-xl text-sm font-bold">搜索</button>
+                            <div class="${actionBarClass}" aria-label="订阅任务操作">
+                                ${toggleRunButton}
+                                ${searchButton}
                                 ${linkScanButton}
-                                <button type="button" data-subscription-action="edit" data-task-name="${encodeURIComponent(taskName)}" class="px-4 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 text-white text-sm font-bold">编辑</button>
-                                <button type="button" data-subscription-action="delete" data-task-name="${encodeURIComponent(taskName)}" class="px-4 py-2 rounded-xl bg-red-500/15 hover:bg-red-500/25 text-red-300 text-sm font-bold">删除</button>
+                                ${editButton}
+                                ${deleteButton}
                                 ${rebuildButton}
                                 ${episodeViewButton}
                             </div>

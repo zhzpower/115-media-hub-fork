@@ -1,11 +1,11 @@
 {
-  "version": "0.3.17",
-  "buildDate": "2026-05-09T11:38:31+08:00",
+  "version": "0.3.18",
+  "buildDate": "2026-05-09T16:39:11+08:00",
   "notes": [
-    "刮削识别关键词过滤通用分类目录",
-    "刮削标题清洗减少发布组和技术标签噪声",
-    "统一媒体标签解析并保留音频声道信息",
-    "GitHub Actions 自动发布 Docker 镜像"
+    "订阅扫描链接支持 115 与夸克任务",
+    "115 固定分享链接改为资源搜索后的兜底候选",
+    "订阅匹配日志统一资源搜索与来源口径",
+    "订阅任务操作区改为紧凑图标按钮"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

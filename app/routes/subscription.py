@@ -110,13 +110,7 @@ async def start_subscription_task_with_link(request: Request) -> Dict[str, Any]:
     if not task_name:
         return JSONResponse(status_code=400, content={"ok": False, "msg": "任务名称不能为空"})
     if not raw_text and not link_url:
-        return JSONResponse(status_code=400, content={"ok": False, "msg": "请填写夸克分享链接"})
-    link_match = RESOURCE_QUARK_SHARE_URL_REGEX.search(link_url or raw_text)
-    normalized_link = str(link_match.group(0) if link_match else link_url).strip()
-    if normalized_link and not normalized_link.lower().startswith(("http://", "https://")):
-        normalized_link = f"https://{normalized_link.lstrip('/')}"
-    if resolve_resource_link_type("", normalized_link) != "quark":
-        return JSONResponse(status_code=400, content={"ok": False, "msg": "指定链接仅支持夸克分享链接"})
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "请填写分享链接"})
 
     cfg = get_config()
     task = None
@@ -127,19 +121,40 @@ async def start_subscription_task_with_link(request: Request) -> Dict[str, Any]:
             break
     if not task:
         return JSONResponse(status_code=404, content={"ok": False, "msg": "任务不存在"})
-    if normalize_subscription_provider(task.get("provider", "115"), fallback="115") != "quark":
-        return JSONResponse(status_code=400, content={"ok": False, "msg": "只有夸克订阅任务支持指定夸克链接扫描"})
+    provider = normalize_subscription_provider(task.get("provider", "115"), fallback="115")
+    source_text = link_url or raw_text
+    if provider == "quark":
+        link_match = RESOURCE_QUARK_SHARE_URL_REGEX.search(source_text)
+        normalized_link = str(link_match.group(0) if link_match else link_url).strip()
+        if normalized_link and not normalized_link.lower().startswith(("http://", "https://")):
+            normalized_link = f"https://{normalized_link.lstrip('/')}"
+        if resolve_resource_link_type("", normalized_link) != "quark":
+            return JSONResponse(status_code=400, content={"ok": False, "msg": "请填写夸克分享链接"})
 
-    payload = parse_quark_share_payload(normalized_link, raw_text, receive_code)
-    if not str(payload.get("pwd_id", "") or "").strip():
-        return JSONResponse(status_code=400, content={"ok": False, "msg": "未能识别夸克分享链接"})
+        payload = parse_quark_share_payload(normalized_link, raw_text, receive_code)
+        if not str(payload.get("pwd_id", "") or "").strip():
+            return JSONResponse(status_code=400, content={"ok": False, "msg": "未能识别夸克分享链接"})
+        payload_link = str(payload.get("url", "") or normalized_link).strip()
+        payload_receive_code = normalize_receive_code(payload.get("receive_code", ""))
+    elif provider == "115":
+        link_match = RESOURCE_115_SHARE_URL_REGEX.search(source_text)
+        normalized_link = str(link_match.group(0) if link_match else link_url).strip()
+        payload = parse_115_share_payload(normalized_link, raw_text, receive_code)
+        if not str(payload.get("share_code", "") or "").strip():
+            return JSONResponse(status_code=400, content={"ok": False, "msg": "请填写 115 分享链接"})
+        payload_link = str(payload.get("url", "") or normalized_link).strip()
+        payload_receive_code = normalize_receive_code(payload.get("receive_code", ""))
+    else:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "当前订阅任务不支持扫描链接"})
+
     status = queue_subscription_job(
         task_name,
         "manual_link",
         manual_candidate={
-            "link_url": str(payload.get("url", "") or normalized_link).strip(),
-            "raw_text": raw_text or normalized_link,
-            "receive_code": normalize_receive_code(payload.get("receive_code", "")),
+            "provider": provider,
+            "link_url": payload_link,
+            "raw_text": raw_text or payload_link,
+            "receive_code": payload_receive_code,
         },
     )
     return {"ok": True, "status": status}

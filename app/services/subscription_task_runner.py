@@ -538,24 +538,29 @@ async def _prewarm_subscription_candidate_share_manifests(
     }
 
 
-def _build_manual_quark_subscription_search_result(
+def _build_manual_subscription_search_result(
     task: Dict[str, Any],
     task_name: str,
     manual_candidate: Dict[str, Any],
+    provider: str,
 ) -> Dict[str, Any]:
+    normalized_provider = normalize_subscription_provider(provider, fallback="115")
+    link_type = "quark" if normalized_provider == "quark" else "115share"
+    provider_label = "夸克" if normalized_provider == "quark" else "115"
+    keyword_label = "manual-quark-link" if normalized_provider == "quark" else "manual-115-link"
     link_url = str(manual_candidate.get("link_url", "") or "").strip()
     raw_text = str(manual_candidate.get("raw_text", "") or link_url).strip()
     receive_code = normalize_receive_code(manual_candidate.get("receive_code", ""))
-    title = str(task.get("title", "") or task_name or "指定夸克链接").strip() or "指定夸克链接"
+    title = str(task.get("title", "") or task_name or "扫描链接").strip() or "扫描链接"
     resource_item = {
         "source_type": "subscription_manual_link",
-        "source_name": "订阅指定链接",
+        "source_name": f"订阅扫描链接({provider_label})",
         "channel_name": "",
         "title": title,
         "normalized_title": title.lower(),
         "raw_text": raw_text or link_url,
         "link_url": link_url,
-        "link_type": "quark",
+        "link_type": link_type,
         "message_url": "",
         "quality": "",
         "year": str(task.get("year", "") or "").strip(),
@@ -565,6 +570,7 @@ def _build_manual_quark_subscription_search_result(
             "receive_code": receive_code,
             "subscription_task_name": task_name,
             "manual_subscription_link": True,
+            "manual_link_provider": normalized_provider,
         },
     }
     blocked_keyword = match_subscription_exclude_keyword(task, resource_item)
@@ -572,7 +578,7 @@ def _build_manual_quark_subscription_search_result(
         return {
             "candidate": {},
             "candidates": [],
-            "keywords": ["manual-quark-link"],
+            "keywords": [keyword_label],
             "errors": [],
             "stats": {
                 "search_keywords": 0,
@@ -594,7 +600,7 @@ def _build_manual_quark_subscription_search_result(
                 "relaxed_candidates": 0,
                 "search_errors": 0,
                 "best_score": 0,
-                "provider": "quark",
+                "provider": normalized_provider,
             },
         }
     ensure_db()
@@ -620,7 +626,7 @@ def _build_manual_quark_subscription_search_result(
     return {
         "candidate": fixed_candidate,
         "candidates": [fixed_candidate],
-        "keywords": ["manual-quark-link"],
+        "keywords": [keyword_label],
         "errors": [],
         "stats": {
             "search_keywords": 0,
@@ -642,7 +648,77 @@ def _build_manual_quark_subscription_search_result(
             "relaxed_candidates": 0,
             "search_errors": 0,
             "best_score": 100,
-            "provider": "quark",
+            "provider": normalized_provider,
+        },
+    }
+
+
+def _build_fixed_115_subscription_search_result(
+    task: Dict[str, Any],
+    task_name: str,
+    link_url: str,
+    receive_code: str = "",
+) -> Dict[str, Any]:
+    normalized_link = str(link_url or "").strip()
+    normalized_receive_code = normalize_receive_code(receive_code)
+    fixed_item = {
+        "id": 0,
+        "source_type": "subscription_fixed_link_fallback",
+        "source_name": "固定分享链接兜底",
+        "channel_name": "",
+        "title": str(task.get("title", "") or task_name or "固定分享链接").strip() or "固定分享链接",
+        "link_url": normalized_link,
+        "link_type": "115share",
+        "message_url": "",
+        "source_post_id": "",
+        "raw_text": normalized_link,
+        "receive_code": normalized_receive_code,
+        "extra": {
+            "receive_code": normalized_receive_code,
+            "subscription_task_name": task_name,
+            "subscription_fixed_link_fallback": True,
+        },
+    }
+    fixed_candidate = {
+        "item": fixed_item,
+        "score": 100,
+        "episode": 0,
+        "season": 0,
+        "total": 0,
+        "range_start": 0,
+        "range_end": 0,
+        "resolution": 0,
+        "token_hits": 0,
+    }
+    return {
+        "candidate": fixed_candidate,
+        "candidates": [fixed_candidate],
+        "keywords": ["fixed-share-link"],
+        "errors": [],
+        "stats": {
+            "search_keywords": 0,
+            "searched_sources": 0,
+            "matched_channels": 0,
+            "pages_scanned": 0,
+            "raw_items": 0,
+            "deduped_items": 1,
+            "persisted_items": 0,
+            "supported_items": 1,
+            "unsupported_items": 0,
+            "exclude_keyword_filtered": 0,
+            "exclude_keyword_hits": {},
+            "exclude_keywords": normalize_subscription_exclude_keywords(task.get("exclude_keywords", [])),
+            "media_guard_filtered": 0,
+            "media_guard_reasons": {},
+            "season_guard_filtered": 0,
+            "target_season": 0,
+            "scored_items": 1,
+            "scored_candidates": 1,
+            "relaxed_score_mode": False,
+            "relaxed_candidates": 0,
+            "search_errors": 0,
+            "best_score": 100,
+            "provider": "115",
         },
     }
 
@@ -955,14 +1031,14 @@ async def _run_subscription_task_quark(
         task_name,
         status="running",
         progress=15,
-        detail="正在准备指定夸克链接候选" if manual_link_enabled else "正在主动搜索夸克资源",
+        detail="正在准备扫描链接候选" if manual_link_enabled else "正在主动搜索夸克资源",
     )
     check_subscription_cancelled()
     _subscription_stage_timer_enter(stage_timer, "search")
     search_started_at = time.perf_counter()
     if manual_link_enabled:
-        search_result = _build_manual_quark_subscription_search_result(task, task_name, manual_candidate or {})
-        await write_subscription_log("指定夸克链接模式已启用：跳过频道搜索，直接作为高优先级候选进入订阅扫描", "info")
+        search_result = _build_manual_subscription_search_result(task, task_name, manual_candidate or {}, "quark")
+        await write_subscription_log("扫描链接模式已启用：跳过资源搜索，直接作为高优先级候选进入订阅扫描", "info")
     else:
         search_result = await find_subscription_task_match_candidate_by_search(
             task,
@@ -987,7 +1063,7 @@ async def _run_subscription_task_quark(
     )
     await write_subscription_log(
         (
-            f"夸克搜索完成：频道检索 {searched_sources} 次，命中频道 {matched_channels} 个，"
+            f"夸克搜索完成：资源检索 {searched_sources} 次，命中来源 {matched_channels} 个，"
             f"扫描页面 {pages_scanned} 页，候选资源 {deduped_items} 条，可导入资源 {supported_items} 条"
         ),
         "info",
@@ -1051,7 +1127,7 @@ async def _run_subscription_task_quark(
         )
     if search_errors:
         await write_subscription_log(
-            f"有 {len(search_errors)} 个频道搜索异常（不影响其余频道）："
+            f"有 {len(search_errors)} 个资源搜索异常（不影响其余来源）："
             + "；".join(
                 [
                     (
@@ -2258,37 +2334,48 @@ async def run_subscription_task(
             )
             return
         await write_subscription_section("执行链路")
-        await write_subscription_log("网盘链路: 115（频道搜索与导入链路）", "info")
+        await write_subscription_log("网盘链路: 115（资源搜索与导入链路）", "info")
         task_share_subdir = normalize_relative_path(str(task.get("share_subdir", "") or "").strip())
         task_share_subdir_cid = _normalize_subscription_share_subdir_cid(task.get("share_subdir_cid", ""))
         task_share_link_url = str(task.get("share_link_url", "") or "").strip()
         task_share_link_receive_code = normalize_receive_code(task.get("share_link_receive_code", ""))
         task_share_link_type = resolve_resource_link_type("", task_share_link_url)
         use_fixed_share_link = bool(task_share_link_url) and task_share_link_type == "115share"
-        fixed_link_channel_search_enabled = use_fixed_share_link and bool(task.get("fixed_link_channel_search", False))
-        if task_share_subdir_cid and (not use_fixed_share_link):
-            # CID 仅对固定分享链接稳定有效，频道搜索模式下忽略。
+        manual_link_enabled = isinstance(manual_candidate, dict) and bool(str(manual_candidate.get("link_url", "") or "").strip())
+        fixed_link_fallback_enabled = (
+            (not manual_link_enabled)
+            and use_fixed_share_link
+            and bool(task.get("fixed_link_channel_search", False))
+        )
+        fixed_link_channel_search_enabled = fixed_link_fallback_enabled
+        if task_share_subdir_cid and (not fixed_link_fallback_enabled):
+            # CID 仅对固定分享链接兜底候选稳定有效，资源搜索候选不套用该锚点。
             task_share_subdir_cid = ""
-        task_share_scope_enabled = bool(task_share_subdir or task_share_subdir_cid)
+        task_share_scope_enabled = fixed_link_fallback_enabled and bool(task_share_subdir or task_share_subdir_cid)
         task_share_scope_label = _format_subscription_share_scope_label(task_share_subdir, task_share_subdir_cid)
         if task_share_link_url and (not use_fixed_share_link):
             await write_subscription_log(
-                "固定链接已配置但不是 115 分享链接，已自动忽略并回退频道搜索",
+                "固定链接已配置但不是 115 分享链接，已自动忽略并继续资源搜索",
                 "warn",
             )
-        if use_fixed_share_link:
+        if manual_link_enabled:
             await write_subscription_log(
-                "固定链接模式已启用：将直接使用配置的 115 分享链接，不再依赖频道搜索",
+                "扫描链接模式已启用：跳过资源搜索，直接作为高优先级候选进入订阅扫描",
                 "info",
             )
-            if fixed_link_channel_search_enabled:
-                await write_subscription_log(
-                    "固定链接补搜已启用：固定链接候选后会再执行一次频道搜索作为兜底",
-                    "info",
-                )
+        elif fixed_link_fallback_enabled:
+            await write_subscription_log(
+                "固定链接兜底已启用：将先执行资源搜索，再把固定 115 分享链接追加为备选候选",
+                "info",
+            )
+        elif use_fixed_share_link:
+            await write_subscription_log(
+                "固定链接已填写但未启用兜底，本次仍以资源搜索为主",
+                "info",
+            )
         if task_share_scope_enabled:
             await write_subscription_log(
-                f"115 分享子目录已启用：{task_share_scope_label}（仅在该目录内扫描和转存）",
+                f"固定链接兜底子目录已启用：{task_share_scope_label}（仅对固定链接候选生效）",
                 "info",
             )
         check_subscription_cancelled()
@@ -2328,108 +2415,70 @@ async def run_subscription_task(
             status="running",
             progress=15,
             detail=(
-                "正在校验固定分享链接并准备频道补搜"
-                if (use_fixed_share_link and fixed_link_channel_search_enabled)
-                else ("正在校验固定分享链接" if use_fixed_share_link else "正在主动搜索启用频道资源")
+                "正在准备扫描链接候选"
+                if manual_link_enabled
+                else (
+                    "正在执行资源搜索，固定链接将作为备选"
+                    if fixed_link_fallback_enabled
+                    else "正在主动搜索资源"
+                )
             ),
         )
         check_subscription_cancelled()
         _subscription_stage_timer_enter(stage_timer, "search")
         search_started_at = time.perf_counter()
         search_result: Dict[str, Any] = {}
-        if use_fixed_share_link:
-            fixed_link_url = apply_share_receive_code_to_url(task_share_link_url, task_share_link_receive_code)
-            fixed_item = {
-                "id": 0,
-                "title": str(task.get("title", "") or task_name or "固定分享链接").strip() or "固定分享链接",
-                "link_url": fixed_link_url,
-                "link_type": "115share",
-                "message_url": "",
-                "source_post_id": "",
-                "raw_text": fixed_link_url,
-                "receive_code": task_share_link_receive_code,
-                "extra": {
-                    "receive_code": task_share_link_receive_code,
-                },
-            }
-            fixed_candidate = {
-                "item": fixed_item,
-                "score": 100,
-                "episode": 0,
-                "season": 0,
-                "total": 0,
-                "range_start": 0,
-                "range_end": 0,
-                "resolution": 0,
-                "token_hits": 0,
-            }
-            search_result = {
-                "candidate": fixed_candidate,
-                "candidates": [fixed_candidate],
-                "keywords": ["fixed-share-link"],
-                "errors": [],
-                "stats": {
-                    "search_keywords": 0,
-                    "searched_sources": 0,
-                    "matched_channels": 0,
-                    "pages_scanned": 0,
-                    "raw_items": 0,
-                    "deduped_items": 1,
-                    "persisted_items": 0,
-                    "supported_items": 1,
-                    "unsupported_items": 0,
-                    "exclude_keyword_filtered": 0,
-                    "exclude_keyword_hits": {},
-                    "exclude_keywords": normalize_subscription_exclude_keywords(task.get("exclude_keywords", [])),
-                    "media_guard_filtered": 0,
-                    "media_guard_reasons": {},
-                    "season_guard_filtered": 0,
-                    "target_season": 0,
-                    "scored_items": 1,
-                    "scored_candidates": 1,
-                    "relaxed_score_mode": False,
-                    "relaxed_candidates": 0,
-                    "search_errors": 0,
-                    "best_score": 100,
-                },
-            }
-            if fixed_link_channel_search_enabled:
-                await write_subscription_log(
-                    "固定链接候选已生成，正在执行频道补搜",
-                    "info",
-                )
-                channel_search_result = await find_subscription_task_match_candidate_by_search(
-                    task,
-                    last_episode=last_episode,
-                    trigger=trigger,
-                    total_episodes=known_total,
-                )
-                search_result = merge_subscription_search_results(search_result, channel_search_result)
+        resource_search_result: Dict[str, Any] = {}
+        if manual_link_enabled:
+            search_result = _build_manual_subscription_search_result(task, task_name, manual_candidate or {}, "115")
         else:
-            search_result = await find_subscription_task_match_candidate_by_search(
+            resource_search_result = await find_subscription_task_match_candidate_by_search(
                 task,
                 last_episode=last_episode,
                 trigger=trigger,
                 total_episodes=known_total,
             )
+            search_result = resource_search_result
+            if fixed_link_fallback_enabled:
+                fixed_link_url = apply_share_receive_code_to_url(task_share_link_url, task_share_link_receive_code)
+                fixed_search_result = _build_fixed_115_subscription_search_result(
+                    task,
+                    task_name,
+                    fixed_link_url,
+                    task_share_link_receive_code,
+                )
+                await write_subscription_log(
+                    "固定链接兜底候选已生成，将排在资源搜索候选之后",
+                    "info",
+                )
+                search_result = merge_subscription_search_results(
+                    fixed_search_result,
+                    resource_search_result,
+                    fixed_candidates_last=True,
+                )
         search_duration_seconds = max(0.0, time.perf_counter() - search_started_at)
         search_stats = search_result.get("stats", {}) if isinstance(search_result.get("stats"), dict) else {}
         search_errors = search_result.get("errors", []) if isinstance(search_result.get("errors"), list) else []
         search_keywords = search_result.get("keywords", []) if isinstance(search_result.get("keywords"), list) else []
-        if use_fixed_share_link:
+        if fixed_link_fallback_enabled:
             await write_subscription_log(
-                f"固定链接候选已就绪：{task_share_link_url}",
+                f"固定链接兜底候选已就绪：{task_share_link_url}",
                 "info",
             )
             if task_share_link_receive_code:
                 await write_subscription_log("固定链接提取码已生效", "info")
-        if (not use_fixed_share_link) or fixed_link_channel_search_enabled:
-            search_label = "频道补搜" if (use_fixed_share_link and fixed_link_channel_search_enabled) else "主动搜索"
+        if not manual_link_enabled:
+            search_label = "资源搜索"
+            resource_log_keywords = (
+                resource_search_result.get("keywords", [])
+                if isinstance(resource_search_result.get("keywords", []), list)
+                else search_keywords
+            )
             await write_subscription_section("搜索结果")
             searched_sources = int(
                 (
                     search_stats.get("channel_searched_sources", search_stats.get("searched_sources", 0))
-                    if (use_fixed_share_link and fixed_link_channel_search_enabled)
+                    if fixed_link_fallback_enabled
                     else search_stats.get("searched_sources", 0)
                 )
                 or 0
@@ -2437,7 +2486,7 @@ async def run_subscription_task(
             matched_channels = int(
                 (
                     search_stats.get("channel_matched_channels", search_stats.get("matched_channels", 0))
-                    if (use_fixed_share_link and fixed_link_channel_search_enabled)
+                    if fixed_link_fallback_enabled
                     else search_stats.get("matched_channels", 0)
                 )
                 or 0
@@ -2445,7 +2494,7 @@ async def run_subscription_task(
             pages_scanned = int(
                 (
                     search_stats.get("channel_pages_scanned", search_stats.get("pages_scanned", 0))
-                    if (use_fixed_share_link and fixed_link_channel_search_enabled)
+                    if fixed_link_fallback_enabled
                     else search_stats.get("pages_scanned", 0)
                 )
                 or 0
@@ -2453,7 +2502,7 @@ async def run_subscription_task(
             deduped_items = int(
                 (
                     search_stats.get("channel_deduped_items", search_stats.get("deduped_items", 0))
-                    if (use_fixed_share_link and fixed_link_channel_search_enabled)
+                    if fixed_link_fallback_enabled
                     else search_stats.get("deduped_items", 0)
                 )
                 or 0
@@ -2461,7 +2510,7 @@ async def run_subscription_task(
             supported_items = int(
                 (
                     search_stats.get("channel_supported_items", search_stats.get("supported_items", 0))
-                    if (use_fixed_share_link and fixed_link_channel_search_enabled)
+                    if fixed_link_fallback_enabled
                     else search_stats.get("supported_items", 0)
                 )
                 or 0
@@ -2469,19 +2518,19 @@ async def run_subscription_task(
             unsupported_items = int(
                 (
                     search_stats.get("channel_unsupported_items", search_stats.get("unsupported_items", 0))
-                    if (use_fixed_share_link and fixed_link_channel_search_enabled)
+                    if fixed_link_fallback_enabled
                     else search_stats.get("unsupported_items", 0)
                 )
                 or 0
             )
             await write_subscription_log(
-                f"{search_label}关键词: " + " / ".join(search_keywords or [str(task.get("title", "")).strip() or "--"]),
+                f"{search_label}关键词: " + " / ".join(resource_log_keywords or [str(task.get("title", "")).strip() or "--"]),
                 "info",
             )
             await write_subscription_log(
                 (
-                    f"{search_label}完成：频道检索 {searched_sources} 次，"
-                    f"命中频道 {matched_channels} 个，"
+                    f"{search_label}完成：资源检索 {searched_sources} 次，"
+                    f"命中来源 {matched_channels} 个，"
                     f"扫描页面 {pages_scanned} 页，"
                     f"候选资源 {deduped_items} 条，"
                     f"可导入资源 {supported_items} 条"
@@ -2581,7 +2630,7 @@ async def run_subscription_task(
                 )
             if search_errors:
                 await write_subscription_log(
-                    f"有 {len(search_errors)} 个频道搜索异常（不影响其余频道，{search_label}阶段）："
+                    f"有 {len(search_errors)} 个资源搜索异常（不影响其余来源，{search_label}阶段）："
                     + "；".join(
                         [
                             (
@@ -2606,11 +2655,11 @@ async def run_subscription_task(
             if completed_locked:
                 detail = f"已完结（{last_episode}/{known_total}），未发现可更新资源"
                 status = "completed"
-            elif use_fixed_share_link and fixed_link_channel_search_enabled:
-                detail = "固定分享链接当前不可用，且频道补搜也未命中可导入资源，请检查固定链接/提取码或频道配置后重试"
+            elif fixed_link_fallback_enabled:
+                detail = "资源搜索与固定分享链接兜底均未命中可导入资源，请检查固定链接/提取码或资源搜索配置后重试"
                 status = "waiting"
-            elif use_fixed_share_link:
-                detail = "固定分享链接当前不可用，请检查链接/提取码或稍后重试"
+            elif manual_link_enabled:
+                detail = "扫描链接当前不可用，请检查链接/提取码或稍后重试"
                 status = "waiting"
             elif int(search_stats.get("searched_sources", 0) or 0) <= 0:
                 detail = "未启用任何 TG 订阅源，请先在参数配置里启用频道后重试"
@@ -2905,7 +2954,7 @@ async def run_subscription_task(
 
         invalid_link_cache = (
             {}
-            if (use_fixed_share_link and (not fixed_link_channel_search_enabled))
+            if manual_link_enabled
             else _load_subscription_invalid_link_cache(
                 [
                     _normalize_subscription_candidate_link(
@@ -3028,8 +3077,8 @@ async def run_subscription_task(
                 provider="115",
                 manifest_cache=share_manifest_cache,
                 label="115",
-                share_subdir=task_share_subdir if not use_fixed_share_link else "",
-                share_subdir_cid=task_share_subdir_cid if not use_fixed_share_link else "",
+                share_subdir="",
+                share_subdir_cid="",
                 subdir_selection_cache=share_subdir_selection_cache,
                 subdir_selection_stats_cache=share_subdir_selection_stats_cache,
                 max_candidates=min(len(attempt_candidates), max_scan_candidates),
@@ -3043,8 +3092,6 @@ async def run_subscription_task(
             check_subscription_cancelled()
             item = candidate.get("item", {}) if isinstance(candidate.get("item"), dict) else {}
             resource_id = int(item.get("id", 0) or 0)
-            if resource_id <= 0 and (not use_fixed_share_link):
-                continue
             score = int(candidate.get("score", 0) or 0)
             episode = max(0, int(candidate.get("episode", 0) or 0))
             total_detected = max(0, int(candidate.get("total", 0) or 0))
@@ -3064,11 +3111,13 @@ async def run_subscription_task(
             candidate_manifest_cache_key = _build_subscription_candidate_manifest_cache_key("115", candidate)
             candidate_manifest_payload = share_manifest_cache.get(candidate_manifest_cache_key)
             fixed_share_seed_candidate = (
-                use_fixed_share_link
+                fixed_link_fallback_enabled
                 and resource_id <= 0
                 and candidate_link_type == "115share"
             )
-            candidate_share_subdir = task_share_subdir if ((not use_fixed_share_link) or fixed_share_seed_candidate) else ""
+            if resource_id <= 0 and not fixed_share_seed_candidate:
+                continue
+            candidate_share_subdir = task_share_subdir if fixed_share_seed_candidate else ""
             candidate_share_subdir_cid = task_share_subdir_cid if fixed_share_seed_candidate else ""
             candidate_share_scope_enabled = bool(candidate_share_subdir or candidate_share_subdir_cid)
             candidate_share_scope_label = _format_subscription_share_scope_label(
@@ -3076,11 +3125,13 @@ async def run_subscription_task(
                 candidate_share_subdir_cid,
             )
             candidate_share_task = task
-            if task_share_scope_enabled and use_fixed_share_link and not fixed_share_seed_candidate:
+            if not fixed_share_seed_candidate:
                 candidate_share_task = {
                     **task,
                     "share_subdir": "",
                     "share_subdir_cid": "",
+                    "share_link_url": "",
+                    "share_link_receive_code": "",
                 }
             candidate_savepath = effective_savepath
             if task["media_type"] == "tv":
@@ -3336,7 +3387,7 @@ async def run_subscription_task(
                     selected_ids
                     and candidate_link_type == "115share"
                     and task.get("media_type") == "tv"
-                    and not (use_fixed_share_link and fixed_share_runtime_initialized)
+                    and not (fixed_share_seed_candidate and fixed_share_runtime_initialized)
                 ):
                     refined_selection, refine_stats = await _refine_subscription_share_selection_for_task(
                         cookie_115,
@@ -3412,7 +3463,7 @@ async def run_subscription_task(
             if existing and fixed_share_seed_candidate:
                 existing = {}
                 await write_subscription_log(
-                    f"候选资源 #{index} 为固定分享链接模式，本次强制重新导入以捕捉目录更新",
+                    f"候选资源 #{index} 为固定分享链接兜底候选，本次强制重新导入以捕捉目录更新",
                     "info",
                 )
             if existing and candidate_link_type == "115share" and candidate_share_scope_enabled:
@@ -3596,7 +3647,7 @@ async def run_subscription_task(
                             scan_tail = _format_subscription_share_scan_log_tail(precise_stats)
                             await write_subscription_log(
                                 (
-                                    f"候选资源 #{index} 固定链接模式已启用文件级筛选"
+                                    f"候选资源 #{index} 固定链接兜底已启用文件级筛选"
                                     f"{'（运行期缓存）' if bool((precise_stats or {}).get('from_runtime_cache', False)) else ''}，"
                                     f"自动命中 {len(precise_ids)} 个剧集文件后再转存（{scan_tail}，避免整包导入）{dedupe_tail}"
                                 ),
@@ -3610,7 +3661,7 @@ async def run_subscription_task(
                             covered_preview = _format_episode_preview(precise_missing_episode_values)
                             await write_subscription_log(
                                 (
-                                    f"候选资源 #{index} 固定链接模式未能在订阅子目录中识别目标剧集文件，"
+                                    f"候选资源 #{index} 固定链接兜底未能在订阅子目录中识别目标剧集文件，"
                                     f"已跳过避免整包导入（目标 {covered_preview}，原因 {selection_reason_label}，"
                                     f"{scan_tail}）"
                                 ),
@@ -4626,9 +4677,9 @@ async def run_subscription_task(
                     "skipped_precise_mismatch_candidates": skipped_precise_mismatch_candidates,
                     "scanned_candidates": scanned_candidates,
                     "max_scan_candidates": max_scan_candidates,
-                    "use_fixed_share_link": use_fixed_share_link,
-                    "fixed_link_channel_search": fixed_link_channel_search_enabled,
-                    "share_link_url": task_share_link_url if use_fixed_share_link else "",
+                    "use_fixed_share_link": fixed_link_fallback_enabled,
+                    "fixed_link_channel_search": fixed_link_fallback_enabled,
+                    "share_link_url": task_share_link_url if fixed_link_fallback_enabled else "",
                     "share_subdir": task_share_subdir,
                     "share_subdir_cid": task_share_subdir_cid,
                     "candidate_scan_prewarm": candidate_scan_prewarm_stats,
@@ -4767,9 +4818,9 @@ async def run_subscription_task(
                 "scanned_candidates": scanned_candidates,
                 "max_scan_candidates": max_scan_candidates,
                 "existing_episode_count": existing_episode_count,
-                "use_fixed_share_link": use_fixed_share_link,
-                "fixed_link_channel_search": fixed_link_channel_search_enabled,
-                "share_link_url": task_share_link_url if use_fixed_share_link else "",
+                "use_fixed_share_link": fixed_link_fallback_enabled,
+                "fixed_link_channel_search": fixed_link_fallback_enabled,
+                "share_link_url": task_share_link_url if fixed_link_fallback_enabled else "",
                 "share_subdir": task_share_subdir,
                 "share_subdir_cid": task_share_subdir_cid,
                 "candidate_scan_prewarm": candidate_scan_prewarm_stats,

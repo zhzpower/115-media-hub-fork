@@ -1632,6 +1632,8 @@ async def find_subscription_task_match_candidate_by_search(
 def merge_subscription_search_results(
     fixed_result: Dict[str, Any],
     channel_result: Dict[str, Any],
+    *,
+    fixed_candidates_last: bool = False,
 ) -> Dict[str, Any]:
     fixed_payload = fixed_result if isinstance(fixed_result, dict) else {}
     channel_payload = channel_result if isinstance(channel_result, dict) else {}
@@ -1711,7 +1713,12 @@ def merge_subscription_search_results(
     channel_candidates = collect_candidates(channel_payload)
     merged_candidates: List[Dict[str, Any]] = []
     seen_candidate_keys: Set[str] = set()
-    for candidate in fixed_candidates + channel_candidates:
+    ordered_candidates = (
+        channel_candidates + fixed_candidates
+        if fixed_candidates_last
+        else fixed_candidates + channel_candidates
+    )
+    for candidate in ordered_candidates:
         key = build_candidate_key(candidate)
         if not key or key in seen_candidate_keys:
             continue
@@ -1880,7 +1887,11 @@ def merge_subscription_search_results(
     return {
         "candidate": merged_candidates[0] if merged_candidates else {},
         "candidates": merged_candidates,
-        "keywords": merge_keywords(fixed_payload, channel_payload),
+        "keywords": (
+            merge_keywords(channel_payload, fixed_payload)
+            if fixed_candidates_last
+            else merge_keywords(fixed_payload, channel_payload)
+        ),
         "errors": merged_errors,
         "stats": merged_stats,
     }
