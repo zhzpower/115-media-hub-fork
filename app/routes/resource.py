@@ -441,6 +441,7 @@ def _save_resource_sources_payload(incoming: Any) -> List[Dict[str, Any]]:
         normalized.append(source)
     cfg["resource_sources"] = normalized
     save_config(cfg)
+    prune_resource_channel_runtime_state(cfg)
     invalidate_resource_state_snapshot("resource-sources-save")
     return normalized
 
@@ -1215,6 +1216,41 @@ def _drop_cached_resource_image_locked(image_url: str) -> None:
         resource_image_cache_bytes = max(0, resource_image_cache_bytes - _resource_image_entry_size(removed))
 
 
+def _prune_resource_image_cache_locked(now_ts: Optional[float] = None) -> Dict[str, int]:
+    now_value = time.monotonic() if now_ts is None else float(now_ts or 0.0)
+    removed_expired = 0
+    removed_overflow = 0
+    for image_url, entry in list(resource_image_cache.items()):
+        if float((entry or {}).get("expires_at", 0) or 0) <= now_value:
+            _drop_cached_resource_image_locked(image_url)
+            removed_expired += 1
+
+    max_entries = max(1, int(RESOURCE_IMAGE_PROXY_CACHE_MAX_ENTRIES or 512))
+    ordered_items = sorted(
+        resource_image_cache.items(),
+        key=lambda item: float((item[1] or {}).get("cached_at", 0) or 0),
+    )
+    while len(resource_image_cache) > max_entries and ordered_items:
+        oldest_url, _ = ordered_items.pop(0)
+        if oldest_url not in resource_image_cache:
+            continue
+        _drop_cached_resource_image_locked(oldest_url)
+        removed_overflow += 1
+    if RESOURCE_IMAGE_PROXY_CACHE_MAX_BYTES:
+        while resource_image_cache_bytes > RESOURCE_IMAGE_PROXY_CACHE_MAX_BYTES and ordered_items:
+            oldest_url, _ = ordered_items.pop(0)
+            if oldest_url not in resource_image_cache:
+                continue
+            _drop_cached_resource_image_locked(oldest_url)
+            removed_overflow += 1
+    return {"expired": removed_expired, "overflow": removed_overflow}
+
+
+def prune_resource_image_cache() -> Dict[str, int]:
+    with resource_image_cache_lock:
+        return _prune_resource_image_cache_locked()
+
+
 def _get_cached_resource_image(image_url: str) -> Optional[Dict[str, Any]]:
     now_ts = time.monotonic()
     with resource_image_cache_lock:
@@ -1237,23 +1273,7 @@ def _store_cached_resource_image(image_url: str, entry: Dict[str, Any]) -> None:
             resource_image_cache_bytes = max(0, resource_image_cache_bytes - _resource_image_entry_size(previous))
         resource_image_cache[image_url] = entry
         resource_image_cache_bytes += _resource_image_entry_size(entry)
-        if len(resource_image_cache) <= RESOURCE_IMAGE_PROXY_CACHE_MAX_ENTRIES:
-            if not RESOURCE_IMAGE_PROXY_CACHE_MAX_BYTES or resource_image_cache_bytes <= RESOURCE_IMAGE_PROXY_CACHE_MAX_BYTES:
-                return
-        ordered_items = sorted(
-            resource_image_cache.items(),
-            key=lambda item: float(item[1].get("cached_at", 0) or 0),
-        )
-        while len(resource_image_cache) > RESOURCE_IMAGE_PROXY_CACHE_MAX_ENTRIES and ordered_items:
-            oldest_url, _ = ordered_items.pop(0)
-            if oldest_url != image_url:
-                _drop_cached_resource_image_locked(oldest_url)
-        if RESOURCE_IMAGE_PROXY_CACHE_MAX_BYTES:
-            while resource_image_cache_bytes > RESOURCE_IMAGE_PROXY_CACHE_MAX_BYTES and ordered_items:
-                oldest_url, _ = ordered_items.pop(0)
-                if oldest_url == image_url:
-                    continue
-                _drop_cached_resource_image_locked(oldest_url)
+        _prune_resource_image_cache_locked(time.monotonic())
 
 
 def _build_resource_image_response(cached: Dict[str, Any], *, cache_state: str) -> Response:

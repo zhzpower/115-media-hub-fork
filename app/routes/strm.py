@@ -26,6 +26,18 @@ _FOLDER_CID_PATH_CACHE_TTL_SECONDS = max(
     60,
     min(24 * 60 * 60, int(os.environ.get("API_115_FOLDER_CID_CACHE_TTL_SECONDS", 2 * 60 * 60) or (2 * 60 * 60))),
 )
+_DOWNLOAD_URL_CACHE_MAX_ENTRIES = max(
+    100,
+    min(10000, int(os.environ.get("API_115_DOWNLOAD_URL_CACHE_MAX_ENTRIES", 1000) or 1000)),
+)
+_RELAY_TOKEN_CACHE_MAX_ENTRIES = max(
+    100,
+    min(10000, int(os.environ.get("STRM_RELAY_TOKEN_CACHE_MAX_ENTRIES", 2000) or 2000)),
+)
+_STRM_PATH_CACHE_MAX_ENTRIES = max(
+    100,
+    min(50000, int(os.environ.get("STRM_PATH_CACHE_MAX_ENTRIES", 10000) or 10000)),
+)
 _RELAY_STREAM_CHUNK_SIZE = max(
     32 * 1024,
     min(1024 * 1024, int(os.environ.get("STRM_RELAY_CHUNK_SIZE", 256 * 1024) or (256 * 1024))),
@@ -193,6 +205,54 @@ _DEFAULT_115_USER_AGENT = "Mozilla/5.0 115-media-hub"
 def _normalize_115_user_agent(value: Any) -> str:
     ua = str(value or "").strip()
     return ua or _DEFAULT_115_USER_AGENT
+
+
+def _prune_ttl_cache_locked(cache: Dict[str, Dict[str, Any]], now_ts: float, max_entries: int) -> int:
+    removed = 0
+    for key, payload in list(cache.items()):
+        if now_ts >= float((payload or {}).get("expires_at", 0.0) or 0.0):
+            cache.pop(key, None)
+            removed += 1
+    overflow = len(cache) - max(1, int(max_entries or 1))
+    if overflow > 0:
+        ordered = sorted(
+            cache.items(),
+            key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
+        )
+        for key, _payload in ordered[:overflow]:
+            cache.pop(key, None)
+            removed += 1
+    return removed
+
+
+def prune_strm_runtime_caches() -> Dict[str, int]:
+    now_ts = time.time()
+    detail: Dict[str, int] = {}
+    with _download_url_cache_lock:
+        detail["download_url"] = _prune_ttl_cache_locked(
+            _download_url_cache,
+            now_ts,
+            _DOWNLOAD_URL_CACHE_MAX_ENTRIES,
+        )
+    with _relay_token_cache_lock:
+        detail["relay_token"] = _prune_ttl_cache_locked(
+            _relay_token_cache,
+            now_ts,
+            _RELAY_TOKEN_CACHE_MAX_ENTRIES,
+        )
+    with _pick_code_path_cache_lock:
+        detail["pick_code_path"] = _prune_ttl_cache_locked(
+            _pick_code_path_cache,
+            now_ts,
+            _STRM_PATH_CACHE_MAX_ENTRIES,
+        )
+    with _folder_cid_path_cache_lock:
+        detail["folder_cid_path"] = _prune_ttl_cache_locked(
+            _folder_cid_path_cache,
+            now_ts,
+            _STRM_PATH_CACHE_MAX_ENTRIES,
+        )
+    return detail
 
 
 def _collect_set_cookie_pairs(response_set_cookies: List[str]) -> str:
@@ -423,20 +483,7 @@ def _set_cached_pick_code(cache_key: str, pick_code: str, ttl_seconds: int = _PI
             "expires_at": now_ts + normalized_ttl,
             "updated_at": now_ts,
         }
-        expired_keys = [
-            key
-            for key, payload in _pick_code_path_cache.items()
-            if now_ts >= float((payload or {}).get("expires_at", 0.0) or 0.0)
-        ]
-        for key in expired_keys:
-            _pick_code_path_cache.pop(key, None)
-        if len(_pick_code_path_cache) > 10000:
-            ordered = sorted(
-                _pick_code_path_cache.items(),
-                key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
-            )
-            for key, _ in ordered[: len(_pick_code_path_cache) - 10000]:
-                _pick_code_path_cache.pop(key, None)
+        _prune_ttl_cache_locked(_pick_code_path_cache, now_ts, _STRM_PATH_CACHE_MAX_ENTRIES)
 
 
 def _build_folder_cid_cache_key(relative_path: str) -> str:
@@ -492,20 +539,7 @@ def _set_cached_folder_cid(
             "expires_at": now_ts + normalized_ttl,
             "updated_at": now_ts,
         }
-        expired_keys = [
-            key
-            for key, payload in _folder_cid_path_cache.items()
-            if now_ts >= float((payload or {}).get("expires_at", 0.0) or 0.0)
-        ]
-        for key in expired_keys:
-            _folder_cid_path_cache.pop(key, None)
-        if len(_folder_cid_path_cache) > 10000:
-            ordered = sorted(
-                _folder_cid_path_cache.items(),
-                key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
-            )
-            for key, _ in ordered[: len(_folder_cid_path_cache) - 10000]:
-                _folder_cid_path_cache.pop(key, None)
+        _prune_ttl_cache_locked(_folder_cid_path_cache, now_ts, _STRM_PATH_CACHE_MAX_ENTRIES)
 
 
 def _delete_cached_folder_cid(cache_key: str) -> None:
@@ -731,6 +765,39 @@ def _collect_115_download_urls(payload: Any) -> List[str]:
     return urls
 
 
+def _get_cached_download_payload(cache_key: str) -> Tuple[str, str]:
+    normalized_key = str(cache_key or "").strip()
+    if not normalized_key:
+        return "", ""
+    now_ts = time.time()
+    with _download_url_cache_lock:
+        _prune_ttl_cache_locked(_download_url_cache, now_ts, _DOWNLOAD_URL_CACHE_MAX_ENTRIES)
+        cached = _download_url_cache.get(normalized_key)
+        if cached and now_ts < float(cached.get("expires_at", 0.0) or 0.0):
+            cached_url = str(cached.get("url", "")).strip()
+            cached_cookie = str(cached.get("download_cookie", "")).strip()
+            if cached_url:
+                return cached_url, cached_cookie
+    return "", ""
+
+
+def _store_cached_download_payload(cache_key: str, download_url: str, download_cookie: str, ttl_seconds: int) -> None:
+    normalized_key = str(cache_key or "").strip()
+    normalized_url = str(download_url or "").strip()
+    normalized_ttl = max(0, int(ttl_seconds or 0))
+    if (not normalized_key) or (not normalized_url) or normalized_ttl <= 0:
+        return
+    now_ts = time.time()
+    with _download_url_cache_lock:
+        _download_url_cache[normalized_key] = {
+            "url": normalized_url,
+            "download_cookie": str(download_cookie or "").strip(),
+            "expires_at": now_ts + normalized_ttl,
+            "updated_at": now_ts,
+        }
+        _prune_ttl_cache_locked(_download_url_cache, now_ts, _DOWNLOAD_URL_CACHE_MAX_ENTRIES)
+
+
 def _resolve_115_download_payload(cookie: str, pick_code: str, user_agent: str = "") -> Tuple[str, str]:
     normalized_user_agent = _normalize_115_user_agent(user_agent)
     cache_key = f"{pick_code}::ua::{normalized_user_agent}"
@@ -740,14 +807,9 @@ def _resolve_115_download_payload(cookie: str, pick_code: str, user_agent: str =
         int(runtime_tuning.get("download_url_cache_ttl_seconds", API_115_DOWNLOAD_URL_CACHE_TTL_SECONDS) or 0),
     )
     if cache_ttl_seconds > 0:
-        now_ts = time.time()
-        with _download_url_cache_lock:
-            cached = _download_url_cache.get(cache_key)
-            if cached and now_ts < float(cached.get("expires_at", 0.0) or 0.0):
-                cached_url = str(cached.get("url", "")).strip()
-                cached_cookie = str(cached.get("download_cookie", "")).strip()
-                if cached_url:
-                    return cached_url, cached_cookie
+        cached_url, cached_cookie = _get_cached_download_payload(cache_key)
+        if cached_url:
+            return cached_url, cached_cookie
 
     try:
         throttle_115_api_requests()
@@ -779,22 +841,7 @@ def _resolve_115_download_payload(cookie: str, pick_code: str, user_agent: str =
                 except Exception as exc:
                     raise RuntimeError(f"{detail}；downurl 回退失败: {exc}") from exc
                 if download_url:
-                    if cache_ttl_seconds > 0:
-                        now_ts = time.time()
-                        with _download_url_cache_lock:
-                            _download_url_cache[cache_key] = {
-                                "url": download_url,
-                                "download_cookie": download_cookie,
-                                "expires_at": now_ts + cache_ttl_seconds,
-                                "updated_at": now_ts,
-                            }
-                            if len(_download_url_cache) > 1000:
-                                ordered = sorted(
-                                    _download_url_cache.items(),
-                                    key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
-                                )
-                                for key, _ in ordered[: len(_download_url_cache) - 1000]:
-                                    _download_url_cache.pop(key, None)
+                    _store_cached_download_payload(cache_key, download_url, download_cookie, cache_ttl_seconds)
                     mark_cookie_health_success("115", trigger="runtime:strm_resolve_download")
                     return download_url, download_cookie
             raise RuntimeError(detail)
@@ -811,44 +858,14 @@ def _resolve_115_download_payload(cookie: str, pick_code: str, user_agent: str =
             except Exception as exc:
                 raise RuntimeError(f"115 返回成功，但未解析到下载链接；downurl 回退失败: {exc}") from exc
             if download_url:
-                if cache_ttl_seconds > 0:
-                    now_ts = time.time()
-                    with _download_url_cache_lock:
-                        _download_url_cache[cache_key] = {
-                            "url": download_url,
-                            "download_cookie": download_cookie,
-                            "expires_at": now_ts + cache_ttl_seconds,
-                            "updated_at": now_ts,
-                        }
-                        if len(_download_url_cache) > 1000:
-                            ordered = sorted(
-                                _download_url_cache.items(),
-                                key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
-                            )
-                            for key, _ in ordered[: len(_download_url_cache) - 1000]:
-                                _download_url_cache.pop(key, None)
+                _store_cached_download_payload(cache_key, download_url, download_cookie, cache_ttl_seconds)
                 mark_cookie_health_success("115", trigger="runtime:strm_resolve_download")
                 return download_url, download_cookie
             raise RuntimeError("115 返回成功，但未解析到下载链接")
 
         download_cookie = _collect_set_cookie_pairs(response_set_cookies)
 
-        if cache_ttl_seconds > 0:
-            now_ts = time.time()
-            with _download_url_cache_lock:
-                _download_url_cache[cache_key] = {
-                    "url": download_url,
-                    "download_cookie": download_cookie,
-                    "expires_at": now_ts + cache_ttl_seconds,
-                    "updated_at": now_ts,
-                }
-                if len(_download_url_cache) > 1000:
-                    ordered = sorted(
-                        _download_url_cache.items(),
-                        key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
-                    )
-                    for key, _ in ordered[: len(_download_url_cache) - 1000]:
-                        _download_url_cache.pop(key, None)
+        _store_cached_download_payload(cache_key, download_url, download_cookie, cache_ttl_seconds)
         mark_cookie_health_success("115", trigger="runtime:strm_resolve_download")
         return download_url, download_cookie
     except Exception as exc:
@@ -876,20 +893,7 @@ def _register_relay_token(
             "expires_at": now_ts + normalized_ttl,
             "updated_at": now_ts,
         }
-        expired_keys = [
-            key
-            for key, payload in _relay_token_cache.items()
-            if now_ts >= float((payload or {}).get("expires_at", 0.0) or 0.0)
-        ]
-        for key in expired_keys:
-            _relay_token_cache.pop(key, None)
-        if len(_relay_token_cache) > 2000:
-            ordered = sorted(
-                _relay_token_cache.items(),
-                key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
-            )
-            for key, _ in ordered[: len(_relay_token_cache) - 2000]:
-                _relay_token_cache.pop(key, None)
+        _prune_ttl_cache_locked(_relay_token_cache, now_ts, _RELAY_TOKEN_CACHE_MAX_ENTRIES)
     return token
 
 

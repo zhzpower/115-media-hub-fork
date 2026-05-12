@@ -1,11 +1,11 @@
 {
-  "version": "0.3.20",
-  "buildDate": "2026-05-12T00:51:34+08:00",
+  "version": "0.3.21",
+  "buildDate": "2026-05-12T22:43:57+08:00",
   "notes": [
-    "优化 NAS 常驻运行下的内存释放与日志读取",
-    "订阅分享扫描按目录和条目预算收敛请求范围",
-    "资源状态和任务状态新增短 TTL 快照层",
-    "SSE 增量状态和图片代理缓存降低重复开销"
+    "新增后台内存 housekeeping，定期清理运行时缓存",
+    "资源搜索取消标记改为 TTL 自动过期",
+    "STRM、图片代理、115、夸克和 TMDB 缓存增加主动剪枝",
+    "资源频道运行态会随配置变更清理无效频道数据"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

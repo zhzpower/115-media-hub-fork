@@ -171,6 +171,15 @@ def _prune_115_list_cache_locked(now_ts: float) -> None:
     for key, _ in ordered[:overflow]:
         _api_115_list_cache.pop(key, None)
 
+
+def prune_115_list_cache() -> Dict[str, int]:
+    now_ts = time.time()
+    with _api_115_list_cache_lock:
+        before = len(_api_115_list_cache)
+        _prune_115_list_cache_locked(now_ts)
+        return {"removed": max(0, before - len(_api_115_list_cache))}
+
+
 def invalidate_115_entries_cache(cid: str = "") -> None:
     target_cid = str(cid or "").strip()
     with _api_115_list_cache_lock:

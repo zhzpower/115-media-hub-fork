@@ -49,6 +49,25 @@ def prune_tmdb_cache(max_entries: int = 900) -> None:
     for key in keys[:overflow]:
         tmdb_cache_entries.pop(key, None)
 
+
+def prune_tmdb_runtime_cache(cfg: Optional[Dict[str, Any]] = None, max_entries: int = 900) -> Dict[str, int]:
+    runtime = get_tmdb_runtime_config(cfg or get_config())
+    ttl_seconds = max(3600, int(runtime.get("cache_ttl_seconds", 24 * 3600) or 24 * 3600))
+    now = time.time()
+    removed_expired = 0
+    for key, entry in list(tmdb_cache_entries.items()):
+        saved_at = float((entry or {}).get("saved_at", 0) or 0)
+        if saved_at <= 0 or now - saved_at > ttl_seconds:
+            tmdb_cache_entries.pop(key, None)
+            removed_expired += 1
+    before_max_prune = len(tmdb_cache_entries)
+    prune_tmdb_cache(max_entries=max_entries)
+    return {
+        "expired": removed_expired,
+        "overflow": max(0, before_max_prune - len(tmdb_cache_entries)),
+    }
+
+
 def parse_tmdb_http_error(exc: Exception) -> str:
     status_code = 0
     if isinstance(exc, urllib.error.HTTPError):

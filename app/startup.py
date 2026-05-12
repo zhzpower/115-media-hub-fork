@@ -5,11 +5,46 @@ from datetime import datetime
 
 from .core import *  # noqa: F401,F403
 from .background import start_background_runtime, stop_background_runtime, submit_background
+from .memory import release_process_memory
 from .services.monitor import queue_monitor_job
 from .services.resource import schedule_resource_job_refresh
 from .services.sign115 import refresh_sign115_status, run_sign115_job
 from .services.subscription import queue_subscription_job
 from .services.tree import run_sync
+
+
+MEMORY_HOUSEKEEPING_INTERVAL_SECONDS = max(
+    60,
+    min(3600, int(os.environ.get("MEMORY_HOUSEKEEPING_INTERVAL_SECONDS", 300) or 300)),
+)
+
+
+def _run_prune_step(callback) -> Dict[str, Any]:
+    try:
+        result = callback()
+        return result if isinstance(result, dict) else {"removed": int(result or 0)}
+    except Exception as exc:
+        return {"error": str(exc)[:180]}
+
+
+def prune_runtime_memory_caches() -> Dict[str, Any]:
+    cfg = get_config()
+    detail: Dict[str, Any] = {
+        "core": _run_prune_step(lambda: prune_core_runtime_memory_caches(cfg)),
+    }
+
+    from .providers.pan115 import prune_115_list_cache
+    from .providers.quark import prune_quark_share_memory_caches
+    from .providers.tmdb import prune_tmdb_runtime_cache
+    from .routes.resource import prune_resource_image_cache
+    from .routes.strm import prune_strm_runtime_caches
+
+    detail["pan115"] = _run_prune_step(prune_115_list_cache)
+    detail["quark"] = _run_prune_step(prune_quark_share_memory_caches)
+    detail["tmdb"] = _run_prune_step(lambda: prune_tmdb_runtime_cache(cfg))
+    detail["resource_image"] = _run_prune_step(prune_resource_image_cache)
+    detail["strm"] = _run_prune_step(prune_strm_runtime_caches)
+    return detail
 
 
 @app.on_event("startup")
@@ -177,10 +212,18 @@ async def startup() -> None:
                     submit_background(run_sign115_job, "cron", label="sign115-cron")
             await asyncio.sleep(20)
 
+    async def memory_housekeeper() -> None:
+        await asyncio.sleep(MEMORY_HOUSEKEEPING_INTERVAL_SECONDS)
+        while True:
+            await asyncio.to_thread(prune_runtime_memory_caches)
+            await asyncio.to_thread(release_process_memory, "runtime-housekeeping")
+            await asyncio.sleep(MEMORY_HOUSEKEEPING_INTERVAL_SECONDS)
+
     asyncio.create_task(scheduler())
     asyncio.create_task(monitor_scheduler())
     asyncio.create_task(subscription_scheduler())
     asyncio.create_task(sign115_scheduler())
+    asyncio.create_task(memory_housekeeper())
 
 
 @app.on_event("shutdown")

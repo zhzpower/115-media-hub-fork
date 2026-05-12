@@ -159,6 +159,21 @@ def _prune_quark_memory_cache_locked(cache: Dict[str, Dict[str, Any]], now_ts: f
         cache.pop(key, None)
 
 
+def prune_quark_share_memory_caches() -> Dict[str, int]:
+    now_ts = time.time()
+    detail: Dict[str, int] = {}
+    for name, cache, lock, max_rows in (
+        ("token", _quark_share_token_cache, _quark_share_token_cache_lock, _QUARK_SHARE_TOKEN_CACHE_MAX_ROWS),
+        ("page", _quark_share_page_cache, _quark_share_page_cache_lock, _QUARK_SHARE_PAGE_CACHE_MAX_ROWS),
+        ("result", _quark_share_result_cache, _quark_share_result_cache_lock, _QUARK_SHARE_RESULT_CACHE_MAX_ROWS),
+    ):
+        with lock:
+            before = len(cache)
+            _prune_quark_memory_cache_locked(cache, now_ts, max_rows)
+            detail[name] = max(0, before - len(cache))
+    return detail
+
+
 def _get_quark_memory_cache_payload(
     cache: Dict[str, Dict[str, Any]],
     lock: threading.Lock,

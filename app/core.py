@@ -175,8 +175,12 @@ from .versioning import (
 )
 
 
+RESOURCE_SEARCH_CANCEL_TTL_SECONDS = max(
+    60,
+    min(3600, int(os.environ.get("RESOURCE_SEARCH_CANCEL_TTL_SECONDS", 900) or 900)),
+)
 RESOURCE_SEARCH_CANCEL_LOCK = threading.Lock()
-RESOURCE_SEARCH_CANCELLED_IDS: Set[str] = set()
+RESOURCE_SEARCH_CANCELLED_IDS: Dict[str, float] = {}
 
 
 class ResourceSearchCancelled(RuntimeError):
@@ -191,12 +195,31 @@ def normalize_resource_search_id(value: Any) -> str:
     return normalized[:80]
 
 
+def _prune_resource_search_cancelled_locked(now_mono: Optional[float] = None) -> int:
+    now_value = time.monotonic() if now_mono is None else float(now_mono or 0.0)
+    expired_ids = [
+        search_id
+        for search_id, expires_at in RESOURCE_SEARCH_CANCELLED_IDS.items()
+        if float(expires_at or 0.0) <= now_value
+    ]
+    for search_id in expired_ids:
+        RESOURCE_SEARCH_CANCELLED_IDS.pop(search_id, None)
+    return len(expired_ids)
+
+
+def prune_resource_search_cancelled() -> int:
+    with RESOURCE_SEARCH_CANCEL_LOCK:
+        return _prune_resource_search_cancelled_locked()
+
+
 def cancel_resource_search(search_id: Any) -> bool:
     normalized = normalize_resource_search_id(search_id)
     if not normalized:
         return False
     with RESOURCE_SEARCH_CANCEL_LOCK:
-        RESOURCE_SEARCH_CANCELLED_IDS.add(normalized)
+        now_mono = time.monotonic()
+        _prune_resource_search_cancelled_locked(now_mono)
+        RESOURCE_SEARCH_CANCELLED_IDS[normalized] = now_mono + RESOURCE_SEARCH_CANCEL_TTL_SECONDS
     return True
 
 
@@ -205,7 +228,7 @@ def clear_resource_search_cancel(search_id: Any) -> None:
     if not normalized:
         return
     with RESOURCE_SEARCH_CANCEL_LOCK:
-        RESOURCE_SEARCH_CANCELLED_IDS.discard(normalized)
+        RESOURCE_SEARCH_CANCELLED_IDS.pop(normalized, None)
 
 
 def is_resource_search_cancelled(search_id: Any) -> bool:
@@ -213,6 +236,7 @@ def is_resource_search_cancelled(search_id: Any) -> bool:
     if not normalized:
         return False
     with RESOURCE_SEARCH_CANCEL_LOCK:
+        _prune_resource_search_cancelled_locked()
         return normalized in RESOURCE_SEARCH_CANCELLED_IDS
 
 
@@ -571,6 +595,10 @@ RESOURCE_JOBS_STATE_SNAPSHOT_TTL_SECONDS = max(
 RESOURCE_COMPACT_STATE_SNAPSHOT_TTL_SECONDS = max(
     0.0,
     min(5.0, float(os.environ.get("RESOURCE_COMPACT_STATE_SNAPSHOT_TTL_SECONDS", 2.0) or 2.0)),
+)
+RESOURCE_STATE_SNAPSHOT_CACHE_MAX_ENTRIES = max(
+    8,
+    min(512, int(os.environ.get("RESOURCE_STATE_SNAPSHOT_CACHE_MAX_ENTRIES", 128) or 128)),
 )
 TMDB_API_BASE_URL = os.environ.get("TMDB_API_BASE_URL", "https://api.themoviedb.org/3").strip().rstrip("/")
 TMDB_IMAGE_BASE_URL = os.environ.get("TMDB_IMAGE_BASE_URL", "https://image.tmdb.org/t/p").strip().rstrip("/")
@@ -3518,11 +3546,90 @@ def _set_resource_state_snapshot(
         return
     now_ts = time.monotonic()
     with resource_state_snapshot_lock:
+        _prune_resource_state_snapshot_cache_locked(cache, now_ts)
         cache[key] = {
             "epoch": resource_state_snapshot_epoch,
             "expires_at": now_ts + ttl_seconds,
             "payload": clone_jsonable(payload),
         }
+        _prune_resource_state_snapshot_cache_locked(cache, now_ts)
+
+
+def _prune_resource_state_snapshot_cache_locked(
+    cache: Dict[Tuple[Any, ...], Dict[str, Any]],
+    now_ts: Optional[float] = None,
+) -> int:
+    now_value = time.monotonic() if now_ts is None else float(now_ts or 0.0)
+    removed = 0
+    for key, entry in list(cache.items()):
+        if int(entry.get("epoch", -1) or -1) != resource_state_snapshot_epoch:
+            cache.pop(key, None)
+            removed += 1
+            continue
+        if float(entry.get("expires_at", 0.0) or 0.0) <= now_value:
+            cache.pop(key, None)
+            removed += 1
+    max_entries = max(1, int(RESOURCE_STATE_SNAPSHOT_CACHE_MAX_ENTRIES or 128))
+    overflow = len(cache) - max_entries
+    if overflow > 0:
+        ordered = sorted(
+            cache.items(),
+            key=lambda item: float((item[1] or {}).get("expires_at", 0.0) or 0.0),
+        )
+        for key, _entry in ordered[:overflow]:
+            cache.pop(key, None)
+            removed += 1
+    return removed
+
+
+def prune_resource_state_snapshot_caches() -> Dict[str, int]:
+    with resource_state_snapshot_lock:
+        return {
+            "jobs": _prune_resource_state_snapshot_cache_locked(resource_jobs_state_snapshot_cache),
+            "compact": _prune_resource_state_snapshot_cache_locked(resource_compact_state_snapshot_cache),
+        }
+
+
+def _active_resource_channel_ids_from_config(cfg: Optional[Dict[str, Any]] = None) -> Set[str]:
+    active_cfg = cfg or get_config()
+    sources = active_cfg.get("resource_sources", [])
+    if not isinstance(sources, list):
+        return set()
+    return {
+        channel_id
+        for channel_id in (
+            normalize_telegram_channel_id_from_input((source or {}).get("channel_id", ""))
+            for source in sources
+            if isinstance(source, dict)
+        )
+        if channel_id
+    }
+
+
+def prune_resource_channel_runtime_state(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    active_channel_ids = _active_resource_channel_ids_from_config(cfg)
+    detail: Dict[str, int] = {}
+    for name, mapping in (
+        ("last_sync", resource_channel_last_sync),
+        ("last_error", resource_channel_last_error),
+        ("profiles", resource_channel_profiles),
+    ):
+        removed = 0
+        for channel_id in list(mapping.keys()):
+            if str(channel_id or "").strip() in active_channel_ids:
+                continue
+            mapping.pop(channel_id, None)
+            removed += 1
+        detail[name] = removed
+    return detail
+
+
+def prune_core_runtime_memory_caches(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "resource_search_cancelled": prune_resource_search_cancelled(),
+        "resource_state_snapshots": prune_resource_state_snapshot_caches(),
+        "resource_channel_runtime": prune_resource_channel_runtime_state(cfg),
+    }
 
 
 def normalize_cookie_health_provider(value: Any) -> str:
