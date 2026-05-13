@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.3.22] - 2026-05-13
+- 更新版本号到 0.3.22，为首页资源卡片状态刷新优化预留新的发布点。
+
 ## [0.3.21] - 2026-05-12
 - 新增后台内存 housekeeping，定期清理资源状态、STRM、图片代理、115、夸克和 TMDB 等运行时缓存，并在清理后尝试释放进程空闲内存。
 - 资源搜索取消标记改为 TTL 自动过期，避免异常中断或漏清理的搜索 ID 长期留在内存中。

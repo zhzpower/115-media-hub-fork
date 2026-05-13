@@ -1,11 +1,9 @@
 {
-  "version": "0.3.21",
-  "buildDate": "2026-05-12T22:43:57+08:00",
+  "version": "0.3.22",
+  "buildDate": "2026-05-13T18:26:28+08:00",
   "notes": [
-    "新增后台内存 housekeeping，定期清理运行时缓存",
-    "资源搜索取消标记改为 TTL 自动过期",
-    "STRM、图片代理、115、夸克和 TMDB 缓存增加主动剪枝",
-    "资源频道运行态会随配置变更清理无效频道数据"
+    "更新版本号到 0.3.22",
+    "为首页资源卡片状态刷新优化预留新的发布点"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"
