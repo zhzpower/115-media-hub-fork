@@ -22,6 +22,25 @@ function mergeMonitorLogSegments(currentState, data) {
     return [...older, ...incoming];
 }
 
+function setMonitorSummary(summary) {
+    const step = String(summary?.step || '空闲').trim() || '空闲';
+    const detail = String(summary?.detail || '等待监控任务').trim() || '等待监控任务';
+    const fullText = `当前状态：${step} / ${detail}`;
+
+    const summaryStep = document.getElementById('monitor-summary-step');
+    if (summaryStep) summaryStep.innerText = step;
+    const summaryDetail = document.getElementById('monitor-summary-detail');
+    if (summaryDetail) {
+        summaryDetail.innerText = detail;
+        summaryDetail.setAttribute('title', detail);
+    }
+    const summaryPill = document.getElementById('monitor-summary-pill');
+    if (summaryPill) {
+        summaryPill.setAttribute('title', fullText);
+        summaryPill.setAttribute('aria-label', fullText);
+    }
+}
+
 export function applyMonitorState(data, {
     forceRender = false,
     getMonitorState,
@@ -59,10 +78,7 @@ export function applyMonitorState(data, {
         setIntroExpanded(pruneTaskIntroExpanded(expandedMap, nextState.tasks));
     }
 
-    const summaryStep = document.getElementById('monitor-summary-step');
-    if (summaryStep) summaryStep.innerText = nextState.summary?.step || '空闲';
-    const summaryDetail = document.getElementById('monitor-summary-detail');
-    if (summaryDetail) summaryDetail.innerText = nextState.summary?.detail || '等待监控任务';
+    setMonitorSummary(nextState.summary);
 
     const renderKey = typeof buildMonitorRenderKey === 'function' ? buildMonitorRenderKey(nextState) : '';
     const lastRenderKey = typeof getLastMonitorRenderKey === 'function' ? String(getLastMonitorRenderKey() || '') : '';

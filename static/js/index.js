@@ -1474,6 +1474,25 @@
             }
         }
 
+        function setMonitorSummary(summary) {
+            const step = String(summary?.step || '空闲').trim() || '空闲';
+            const detail = String(summary?.detail || '等待监控任务').trim() || '等待监控任务';
+            const fullText = `当前状态：${step} / ${detail}`;
+
+            const summaryStep = document.getElementById('monitor-summary-step');
+            if (summaryStep) summaryStep.innerText = step;
+            const summaryDetail = document.getElementById('monitor-summary-detail');
+            if (summaryDetail) {
+                summaryDetail.innerText = detail;
+                summaryDetail.setAttribute('title', detail);
+            }
+            const summaryPill = document.getElementById('monitor-summary-pill');
+            if (summaryPill) {
+                summaryPill.setAttribute('title', fullText);
+                summaryPill.setAttribute('aria-label', fullText);
+            }
+        }
+
         function applyMonitorState(data, { forceRender = false } = {}) {
             const monitorModule = tabRuntimeState.tabModuleCache.monitor;
             if (monitorModule?.applyMonitorState) {
@@ -1534,8 +1553,7 @@
             };
             monitorTaskIntroExpanded = pruneTaskIntroExpanded(monitorTaskIntroExpanded, monitorState.tasks);
 
-            document.getElementById('monitor-summary-step').innerText = monitorState.summary?.step || '空闲';
-            document.getElementById('monitor-summary-detail').innerText = monitorState.summary?.detail || '等待监控任务';
+            setMonitorSummary(monitorState.summary);
 
             const renderKey = buildMonitorRenderKey(monitorState);
             if (forceRender || renderKey !== lastMonitorRenderKey) {

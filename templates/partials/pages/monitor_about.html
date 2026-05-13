@@ -1,17 +1,17 @@
         <div id="page-monitor" class="page-panel module-page hidden space-y-6">
             <div class="group-card">
-                <div class="flex flex-wrap justify-between gap-3 items-center">
-                    <div>
+                <div class="monitor-page-head">
+                    <div class="monitor-head-copy">
                         <h3 class="group-title mb-2">文件夹监控任务列表</h3>
                         <div class="text-xs text-slate-400 leading-6">扫描 115 网盘目录，生成或刷新本地 `/strm` 文件；资源导入 / Webhook 命中 savepath 时会优先局部刷新。</div>
                     </div>
-                    <div class="flex items-center gap-3 flex-wrap">
-                        <div class="text-xs px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-slate-300">
-                            当前状态：<span id="monitor-summary-step" class="text-sky-400 font-bold">空闲</span>
-                            <span class="text-slate-500"> / </span>
-                            <span id="monitor-summary-detail">等待监控任务</span>
+                    <div class="monitor-head-actions">
+                        <div id="monitor-summary-pill" class="monitor-status-pill" title="当前状态：空闲 / 等待监控任务" aria-label="当前状态：空闲 / 等待监控任务">
+                            <span class="monitor-status-label">当前状态：</span><span id="monitor-summary-step" class="monitor-status-step">空闲</span>
+                            <span class="monitor-status-separator"> / </span>
+                            <span id="monitor-summary-detail" class="monitor-status-detail" title="等待监控任务">等待监控任务</span>
                         </div>
-                        <button onclick="openNewMonitorTask()" class="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold min-h-[42px]">+ 新增任务</button>
+                        <button onclick="openNewMonitorTask()" class="monitor-head-add-btn px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold min-h-[42px]">+ 新增任务</button>
                     </div>
                 </div>
                 <div id="monitor-task-list" class="space-y-3 mt-5"></div>

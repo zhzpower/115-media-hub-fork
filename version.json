@@ -1,9 +1,9 @@
 {
-  "version": "0.3.24",
-  "buildDate": "2026-05-13T22:27:41+08:00",
+  "version": "0.3.25",
+  "buildDate": "2026-05-13T23:11:42+08:00",
   "notes": [
-    "更新版本号到 0.3.24",
-    "企业微信订阅成功推送仅高亮命中资源标题和新增剧集集数"
+    "更新版本号到 0.3.25",
+    "固定文件夹监控页当前状态区布局，避免任务运行时状态文本变化导致页面闪烁"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

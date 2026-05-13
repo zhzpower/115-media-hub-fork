@@ -89,6 +89,64 @@
         .btn-disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; filter: grayscale(1); }
         .group-card { background: linear-gradient(180deg, rgba(30,41,59,0.96), rgba(15,23,42,0.96)); border: 1px solid #334155; border-radius: 1.5rem; padding: 1.5rem; box-shadow: 0 10px 28px rgba(2, 6, 23, 0.35); }
         .group-title { color: #38bdf8; font-weight: 800; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1.25rem; border-left: 4px solid #38bdf8; padding-left: 0.75rem; }
+        .monitor-page-head {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(28rem, 42rem);
+            align-items: center;
+            gap: 1rem;
+        }
+        .monitor-head-copy {
+            min-width: 0;
+        }
+        .monitor-head-actions {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: center;
+            justify-self: end;
+            width: min(100%, 42rem);
+            min-width: 0;
+            gap: 0.85rem;
+        }
+        .monitor-status-pill {
+            display: flex;
+            align-items: center;
+            width: 100%;
+            min-width: 0;
+            min-height: 42px;
+            padding: 0.5rem 0.75rem;
+            overflow: hidden;
+            white-space: nowrap;
+            border-radius: 0.85rem;
+            border: 1px solid #475569;
+            background: rgba(15, 23, 42, 0.86);
+            color: #cbd5e1;
+            font-size: 0.75rem;
+            line-height: 1.35;
+        }
+        .monitor-status-label,
+        .monitor-status-step,
+        .monitor-status-separator {
+            flex: 0 0 auto;
+        }
+        .monitor-status-step {
+            color: #38bdf8;
+            font-weight: 800;
+        }
+        .monitor-status-separator {
+            color: #64748b;
+            padding: 0 0.45rem;
+        }
+        .monitor-status-detail {
+            display: block;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .monitor-head-add-btn {
+            min-width: 8.4rem;
+            white-space: nowrap;
+        }
         .footer-text { text-align: center; padding: 1.4rem 0 1.2rem 0; color: #64748b; font-size: 0.75rem; letter-spacing: 0.05em; }
         .tab-active { color: #38bdf8; border-bottom: 2px solid #38bdf8; padding-bottom: 0.25rem; }
         .tab-inactive { color: #94a3b8; padding-bottom: 0.25rem; }
@@ -4536,6 +4594,14 @@
         @media (max-width: 1024px) {
             #main-nav-actions { width: auto; justify-content: flex-end; }
             .footer-text { padding: 1rem 0 1rem; }
+            #page-monitor .monitor-page-head {
+                grid-template-columns: 1fr;
+                align-items: stretch;
+            }
+            #page-monitor .monitor-head-actions {
+                justify-self: stretch;
+                width: 100%;
+            }
         }
 
         @media (max-width: 960px) {
@@ -4863,6 +4929,8 @@
             #monitor-log-box { height: 38vh !important; }
             #page-monitor .grid.grid-cols-1.sm\:grid-cols-2.md\:grid-cols-4 { grid-template-columns: 1fr; }
             #page-monitor .grid.grid-cols-1.sm\:grid-cols-2.md\:grid-cols-4 button { width: 100%; }
+            #page-monitor .monitor-head-actions { grid-template-columns: 1fr; }
+            #page-monitor .monitor-head-add-btn { width: 100%; }
             #page-monitor .flex.items-center.gap-3 { width: 100%; justify-content: space-between; flex-wrap: wrap; }
             #page-monitor .flex.justify-between.items-center.mb-4 { gap: 0.5rem; align-items: flex-start; flex-wrap: wrap; }
             #page-task .grid.grid-cols-1.md\:grid-cols-3 { gap: 0.6rem; }
@@ -6918,6 +6986,18 @@
         html.theme-day #help-modal-body { background: #fff !important; border-color: var(--border) !important; }
         html.theme-day #monitor-modal,
         html.theme-day #help-modal { background: rgba(15, 23, 42, 0.35) !important; }
+        html.theme-day .monitor-status-pill {
+            background: rgba(255, 255, 255, 0.96);
+            border-color: rgba(148, 163, 184, 0.72);
+            color: #334155;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(15, 23, 42, 0.05);
+        }
+        html.theme-day .monitor-status-step {
+            color: #0369a1;
+        }
+        html.theme-day .monitor-status-separator {
+            color: #64748b;
+        }
         html.theme-day .text-emerald-400 { color: #047857 !important; }
         html.theme-day .text-red-400 { color: var(--danger) !important; }
         html.theme-day #prog-step,
