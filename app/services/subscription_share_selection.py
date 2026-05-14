@@ -1106,6 +1106,40 @@ async def _build_tv_share_selection_for_missing_episodes(
         "skipped_small_files": skipped_small_files,
     }
 
+    strict_filter = filter_subscription_manifest_files_by_strict_identity(
+        task,
+        {
+            "share_root_title": share_root_title,
+            "share_scope_path": start_parent_path,
+            "files": matched_file_entries,
+            "covered_episodes": sorted(covered_missing),
+        },
+    )
+    strict_filter_reason = str((strict_filter or {}).get("reason", "") or "").strip()
+    strict_skipped_files = max(0, int((strict_filter or {}).get("skipped_files", 0) or 0))
+    if strict_filter_reason or strict_skipped_files > 0:
+        strict_manifest = (strict_filter or {}).get("manifest", {}) if isinstance((strict_filter or {}).get("manifest", {}), dict) else {}
+        matched_file_entries = strict_manifest.get("files", []) if isinstance(strict_manifest.get("files"), list) else []
+        covered_missing = _clamp_episode_values(
+            {
+                max(0, int(value or 0))
+                for raw_entry in matched_file_entries
+                if isinstance(raw_entry, dict)
+                for value in (raw_entry.get("episodes", []) if isinstance(raw_entry.get("episodes"), list) else [])
+                if max(0, int(value or 0)) in target_missing
+            }
+        )
+        stats["strict_identity_skipped_files"] = strict_skipped_files
+        stats["strict_identity_reason"] = strict_filter_reason
+        stats["strict_identity_conflict_tmdb_ids"] = (
+            (strict_filter or {}).get("conflict_tmdb_ids", [])
+            if isinstance((strict_filter or {}).get("conflict_tmdb_ids", []), list)
+            else []
+        )
+        stats["covered_total"] = len(covered_missing)
+        stats["covered_episodes"] = sorted(covered_missing)[:300]
+        stats["covered_preview"] = _format_episode_preview(covered_missing) if covered_missing else "--"
+
     best_selection = _pick_best_tv_share_files_by_episode_bucket(task, matched_file_entries, target_missing)
     selected_entries = (
         best_selection.get("selected_entries", [])
@@ -1133,7 +1167,7 @@ async def _build_tv_share_selection_for_missing_episodes(
     )
 
     if not selected_ids:
-        stats["reason"] = "no_precise_episode_match"
+        stats["reason"] = strict_filter_reason or "no_precise_episode_match"
         return {}, stats
 
     selection = normalize_share_selection_meta(
@@ -1778,6 +1812,15 @@ def _build_tv_share_selection_from_manifest(
     task: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     payload = manifest if isinstance(manifest, dict) else {}
+    strict_filter = filter_subscription_manifest_files_by_strict_identity(task or {}, payload)
+    payload = strict_filter.get("manifest", payload) if isinstance(strict_filter, dict) else payload
+    strict_skipped_files = max(0, int((strict_filter or {}).get("skipped_files", 0) or 0))
+    strict_filter_reason = str((strict_filter or {}).get("reason", "") or "").strip()
+    strict_conflict_tmdb_ids = (
+        (strict_filter or {}).get("conflict_tmdb_ids", [])
+        if isinstance((strict_filter or {}).get("conflict_tmdb_ids", []), list)
+        else []
+    )
     target_missing = {max(0, int(value or 0)) for value in (missing_episodes or set()) if max(0, int(value or 0)) > 0}
     if not target_missing:
         return {}, {"reason": "missing_episodes_empty", "from_runtime_cache": True}
@@ -1835,6 +1878,9 @@ def _build_tv_share_selection_from_manifest(
         "share_scope_path": normalize_relative_path(str(payload.get("share_scope_path", "") or "").strip()),
         "bucket_count": max(0, int(best_selection.get("bucket_count", 0) or 0)),
         "duplicate_bucket_hits": max(0, int(best_selection.get("duplicate_bucket_hits", 0) or 0)),
+        "strict_identity_skipped_files": strict_skipped_files,
+        "strict_identity_reason": strict_filter_reason,
+        "strict_identity_conflict_tmdb_ids": strict_conflict_tmdb_ids,
         "selected_file_samples": _build_subscription_selected_file_samples(
             file_entries,
             selected_ids,
@@ -1843,7 +1889,7 @@ def _build_tv_share_selection_from_manifest(
         ),
     }
     if not selected_entries:
-        stats["reason"] = "no_precise_episode_match"
+        stats["reason"] = strict_filter_reason or "no_precise_episode_match"
         return {}, stats
 
     selection = normalize_share_selection_meta(

@@ -1559,6 +1559,7 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
         task.get("quality_priority", SUBSCRIPTION_QUALITY_PRIORITY_DEFAULT)
     )
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
+    strict_title_match = normalize_bool(task.get("strict_title_match", False), default=False)
     anime_mode = bool(task.get("anime_mode", False))
     multi_season_mode = bool(task.get("multi_season_mode", anime_mode))
     tmdb_media_type = normalize_tmdb_media_type(task.get("tmdb_media_type", ""), fallback=media_type)
@@ -1660,6 +1661,7 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "min_score": max(30, min(100, min_score)),
         "quality_priority": quality_priority,
         "min_file_size_mb": min_file_size_mb,
+        "strict_title_match": strict_title_match,
         "candidate_scan_prefetch_limit": scan_settings["candidate_scan_prefetch_limit"],
         "candidate_scan_concurrency": scan_settings["candidate_scan_concurrency"],
         "share_scan_concurrency": scan_settings["share_scan_concurrency"],
@@ -2259,6 +2261,7 @@ def normalize_115_pick_code(value: Any) -> str:
 
 
 from .subscription_scoring import (
+    build_subscription_candidate_identity_text,
     build_subscription_candidate_text,
     build_subscription_query_tokens,
     build_subscription_text_tokens,
@@ -2266,6 +2269,10 @@ from .subscription_scoring import (
     detect_resource_year,
     detect_subscription_resolution,
     evaluate_subscription_candidate_title_match,
+    extract_subscription_candidate_tmdb_ids,
+    extract_subscription_tmdb_ids_from_text,
+    filter_subscription_manifest_files_by_strict_identity,
+    is_subscription_strict_title_match,
     match_subscription_exclude_keyword,
     match_subscription_media_type,
     parse_resource_episode_meta,

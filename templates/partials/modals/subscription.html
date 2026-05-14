@@ -39,6 +39,13 @@
                         <input id="subscription_exclude_keywords" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="例如：短剧, 解说">
                         <div class="text-[11px] text-slate-500 mt-2">候选标题或正文包含这些词时会跳过；保存时会把中文逗号统一为英文逗号。</div>
                     </label>
+                    <label class="flex items-start gap-3 cursor-pointer text-sm rounded-xl border border-slate-700 bg-slate-900/50 p-3">
+                        <input type="checkbox" id="subscription_strict_title_match" class="ui-checkbox mt-0.5">
+                        <span class="min-w-0">
+                            <span class="block font-bold text-slate-100">精准匹配</span>
+                            <span class="block text-[11px] text-slate-500 mt-1 leading-5">开启后只认片名、分享目录、文件路径或 TMDB ID；简介里的片名词不算同剧证据。</span>
+                        </span>
+                    </label>
                     <label class="block">
                         <span class="text-xs text-slate-500">导入文件最小大小（MB）</span>
                         <input id="subscription_min_file_size_mb" type="number" min="0" step="0.1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="0">

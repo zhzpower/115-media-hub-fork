@@ -69,6 +69,11 @@ SUBSCRIPTION_REASON_CODE_LABELS: Dict[str, str] = {
     "manifest_empty": "分享清单为空",
     "manifest_fallback": "按清单回退匹配",
     "no_episode_files": "未识别到剧集文件",
+    "strict_root_tmdb_conflict": "分享根目录 TMDB ID 与订阅不一致",
+    "strict_file_tmdb_conflict": "分享文件 TMDB ID 与订阅不一致",
+    "strict_raw_text_only": "仅正文/简介命中",
+    "tmdb_id_conflict": "TMDB ID 与订阅不一致",
+    "identity_title_mismatch": "片名身份不匹配",
     "missing_episodes_empty": "缺失集为空",
     "cookie_missing": "未配置网盘 Cookie",
     "share_url_missing": "分享链接为空",
@@ -1404,6 +1409,9 @@ async def find_subscription_task_match_candidate_by_search(
     title_blocked_candidates = 0
     title_match_low_score_kept = 0
     title_match_media_relaxed_pass = 0
+    strict_title_match_enabled = is_subscription_strict_title_match(task)
+    strict_title_filtered = 0
+    strict_title_reasons: Dict[str, int] = {}
     season_guard_deferred = 0
     seen_quark_scored_keys: Set[str] = set()
     for item in persisted_items:
@@ -1439,6 +1447,17 @@ async def find_subscription_task_match_candidate_by_search(
             if title_first_search_enabled
             else score_subscription_candidate(task, item, query_tokens, last_episode)
         )
+        if strict_title_match_enabled and not bool(scored.get("title_match", False)):
+            media_guard_filtered += 1
+            title_blocked_candidates += 1
+            strict_title_filtered += 1
+            reason_key = str(scored.get("title_match_reason", "") or scored.get("title_block_reason", "") or "strict_title_mismatch").strip()
+            if reason_key == "raw_text_only_match":
+                reason_key = "strict_raw_text_only"
+            reason_key = reason_key or "strict_title_mismatch"
+            media_guard_reasons[reason_key] = int(media_guard_reasons.get(reason_key, 0) or 0) + 1
+            strict_title_reasons[reason_key] = int(strict_title_reasons.get(reason_key, 0) or 0) + 1
+            continue
         if title_first_search_enabled and not bool(scored.get("title_match", False)):
             media_guard_filtered += 1
             title_blocked_candidates += 1
@@ -1608,6 +1627,9 @@ async def find_subscription_task_match_candidate_by_search(
             "title_blocked_candidates": title_blocked_candidates,
             "title_match_low_score_kept": title_match_low_score_kept,
             "title_match_media_relaxed_pass": title_match_media_relaxed_pass,
+            "strict_title_match_enabled": strict_title_match_enabled,
+            "strict_title_filtered": strict_title_filtered,
+            "strict_title_reasons": strict_title_reasons,
             "quark_low_score_kept": title_match_low_score_kept if provider == "quark" else 0,
             "quark_media_relaxed_pass": title_match_media_relaxed_pass if provider == "quark" else 0,
             "incremental_search_enabled": incremental_search_enabled,

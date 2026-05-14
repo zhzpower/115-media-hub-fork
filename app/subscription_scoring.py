@@ -1,3 +1,5 @@
+import unicodedata
+
 from .core import *  # noqa: F401,F403
 
 def pick_subscription_display_title(task: Dict[str, Any], item: Dict[str, Any], fallback: str = "未命名资源") -> str:
@@ -70,6 +72,181 @@ def build_subscription_candidate_text(item: Dict[str, Any]) -> str:
     ]
     return re.sub(r"\s+", " ", " ".join(str(part or "").lower() for part in parts)).strip()
 
+SUBSCRIPTION_STRICT_WEAK_RAW_PREFIXES = (
+    "简介",
+    "剧情",
+    "主演",
+    "演员",
+    "类型",
+    "分类",
+    "质量",
+    "大小",
+    "评分",
+    "来源",
+    "时间",
+    "备注",
+    "链接",
+)
+
+SUBSCRIPTION_STRICT_TITLE_PREFIXES = (
+    "标题",
+    "片名",
+    "剧名",
+    "资源",
+    "电视剧",
+    "电影",
+    "番剧",
+    "动漫",
+)
+
+
+def is_subscription_strict_title_match(task: Dict[str, Any]) -> bool:
+    return normalize_bool((task or {}).get("strict_title_match", False), default=False)
+
+
+def _normalize_subscription_raw_line_label(line: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(line or "")).strip()
+    normalized = re.sub(r"^[^\w\u4e00-\u9fff]+", "", normalized).strip()
+    head = re.split(r"[:：]", normalized, maxsplit=1)[0].strip().lower()
+    return compact_subscription_text(head)
+
+
+def extract_subscription_tmdb_ids_from_text(text: Any) -> Set[int]:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    if not normalized:
+        return set()
+    ids: Set[int] = set()
+    patterns = (
+        r"\btmdb\s*id\s*[:：#_\-\s]*([0-9]{3,})",
+        r"\btmdbid\s*[:：#_\-\s]*([0-9]{3,})",
+        r"\btmdb\s*[:：#_\-\s]+([0-9]{3,})",
+        r"[\{\[\(（]\s*tmdb\s*[:：#_\-\s]*([0-9]{3,})\s*[\}\]\)）]",
+    )
+    for pattern in patterns:
+        for matched in re.finditer(pattern, normalized, re.IGNORECASE):
+            try:
+                tmdb_id = max(0, int(matched.group(1) or 0))
+            except (TypeError, ValueError):
+                tmdb_id = 0
+            if tmdb_id > 0:
+                ids.add(tmdb_id)
+    return ids
+
+
+def _collect_subscription_manifest_identity_text(manifest: Optional[Dict[str, Any]]) -> Tuple[List[str], Set[int]]:
+    if not isinstance(manifest, dict):
+        return [], set()
+    parts: List[str] = []
+    tmdb_ids: Set[int] = set()
+    for field in ("share_root_title", "share_scope_path", "auto_sharetitle"):
+        value = str(manifest.get(field, "") or "").strip()
+        if value:
+            parts.append(value)
+            tmdb_ids.update(extract_subscription_tmdb_ids_from_text(value))
+    for raw_entry in manifest.get("files", []) if isinstance(manifest.get("files"), list) else []:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry_name = str(raw_entry.get("name", "") or "").strip()
+        if entry_name:
+            parts.append(entry_name)
+            tmdb_ids.update(extract_subscription_tmdb_ids_from_text(entry_name))
+    return parts, tmdb_ids
+
+
+def extract_subscription_candidate_tmdb_ids(
+    item: Dict[str, Any],
+    manifest: Optional[Dict[str, Any]] = None,
+) -> Set[int]:
+    payload = item if isinstance(item, dict) else {}
+    parts: List[str] = []
+    for field in ("title", "raw_text", "link_url", "message_url"):
+        value = str(payload.get(field, "") or "").strip()
+        if value:
+            parts.append(value)
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else safe_json_loads(payload.get("extra_json"), {})
+    if isinstance(extra, dict):
+        for field in ("title", "sharetitle", "tmdb_id", "tmdbid"):
+            value = str(extra.get(field, "") or "").strip()
+            if value:
+                parts.append(value)
+    manifest_parts, manifest_ids = _collect_subscription_manifest_identity_text(manifest)
+    parts.extend(manifest_parts)
+    ids: Set[int] = set(manifest_ids)
+    for value in parts:
+        ids.update(extract_subscription_tmdb_ids_from_text(value))
+    return ids
+
+
+def _format_subscription_scoring_episode_preview(episodes: Set[int], max_items: int = 8) -> str:
+    values: Set[int] = set()
+    for value in episodes or set():
+        try:
+            episode_no = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+        if episode_no > 0:
+            values.add(episode_no)
+    ordered = sorted(values)
+    if not ordered:
+        return "--"
+    preview = [f"E{episode_no}" for episode_no in ordered[:max(1, int(max_items or 8))]]
+    if len(ordered) > len(preview):
+        preview.append(f"... E{ordered[-1]}")
+    return "、".join(preview)
+
+
+def _is_subscription_strict_weak_raw_line(line: str) -> bool:
+    label = _normalize_subscription_raw_line_label(line)
+    if not label:
+        return False
+    return any(label.startswith(compact_subscription_text(prefix)) for prefix in SUBSCRIPTION_STRICT_WEAK_RAW_PREFIXES)
+
+
+def _is_subscription_strict_title_raw_line(line: str, index: int) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(line or "")).strip()
+    if not normalized:
+        return False
+    if extract_subscription_tmdb_ids_from_text(normalized):
+        return True
+    label = _normalize_subscription_raw_line_label(normalized)
+    if any(label.startswith(compact_subscription_text(prefix)) for prefix in SUBSCRIPTION_STRICT_TITLE_PREFIXES):
+        return True
+    lowered = normalized.lower()
+    if re.search(r"\bs\d{1,2}e\d{1,4}\b|\bseason\s*\d+\b|第\s*[一二三四五六七八九十两兩0-9]+\s*季", lowered, re.IGNORECASE):
+        return True
+    if "/" in normalized and re.search(r"\.(mkv|mp4|avi|ts|mov|m2ts)\b", lowered):
+        return True
+    return index == 0 and not _is_subscription_strict_weak_raw_line(normalized)
+
+
+def build_subscription_candidate_identity_text(
+    item: Dict[str, Any],
+    manifest: Optional[Dict[str, Any]] = None,
+) -> str:
+    payload = item if isinstance(item, dict) else {}
+    parts: List[str] = []
+    title = str(payload.get("title", "") or "").strip()
+    if title:
+        parts.append(title)
+    raw_text = str(payload.get("raw_text", "") or "")
+    raw_lines = [line.strip() for line in re.split(r"[\r\n]+", raw_text) if str(line or "").strip()]
+    for index, line in enumerate(raw_lines[:80]):
+        if _is_subscription_strict_title_raw_line(line, index):
+            parts.append(line)
+    extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else safe_json_loads(payload.get("extra_json"), {})
+    if isinstance(extra, dict):
+        for field in ("title", "sharetitle"):
+            value = str(extra.get(field, "") or "").strip()
+            if value:
+                parts.append(value)
+    manifest_parts, _ = _collect_subscription_manifest_identity_text(manifest)
+    parts.extend(manifest_parts)
+    return "\n".join(
+        re.sub(r"\s+", " ", str(part or "").lower()).strip()
+        for part in unique_preserve_order(parts)
+        if str(part or "").strip()
+    ).strip()
+
 def compact_subscription_text(text: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(text or "").lower())
 
@@ -131,6 +308,69 @@ def score_subscription_title_signal(
         compact_without_particles = strip_subscription_cjk_particles(title_compact)
         if len(compact_without_particles) >= 2 and compact_without_particles in text_compact:
             return int(cjk_bonus)
+    return 0
+
+
+def _strip_subscription_strict_title_prefix(segment: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(segment or "")).strip()
+    normalized = re.sub(r"^[^\w\u4e00-\u9fff]+", "", normalized).strip()
+    for prefix in SUBSCRIPTION_STRICT_TITLE_PREFIXES:
+        if re.match(rf"^{re.escape(prefix)}\s*[:：]", normalized, re.IGNORECASE):
+            return re.split(r"[:：]", normalized, maxsplit=1)[1].strip()
+    return normalized
+
+
+def _subscription_strict_title_segment_keys(text: str) -> List[str]:
+    keys: List[str] = []
+    for raw_line in re.split(r"[\r\n]+", str(text or "")):
+        line = _strip_subscription_strict_title_prefix(raw_line)
+        if not line:
+            continue
+        probes = [line]
+        probes.extend([segment for segment in re.split(r"[\\/]+", line) if segment.strip()])
+        for probe in probes:
+            candidate = re.sub(r"[\{\[\(（]\s*tmdb\s*[:：#_\-\s]*[0-9]{3,}\s*[\}\]\)）]", " ", probe, flags=re.IGNORECASE)
+            candidate = re.split(r"\s+[-–—]\s+|\s+[|｜]\s+", candidate, maxsplit=1)[0]
+            candidate = re.split(r"[\(（\[]\s*(?:19|20)\d{2}", candidate, maxsplit=1)[0]
+            candidate = re.split(r"\bs\d{1,2}e\d{1,4}\b|\bseason\s*\d+\b", candidate, maxsplit=1, flags=re.IGNORECASE)[0]
+            key = compact_subscription_text(candidate)
+            if key:
+                keys.append(key)
+    return unique_preserve_order(keys)
+
+
+def score_subscription_strict_title_signal(
+    title: str,
+    text: str,
+    text_compact: str,
+    exact_bonus: int,
+    compact_bonus: int,
+    cjk_bonus: int,
+) -> int:
+    title_norm = str(title or "").strip().lower()
+    if not title_norm:
+        return 0
+    title_compact = compact_subscription_text(title_norm)
+    if not title_compact:
+        return 0
+
+    title_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", title_compact))
+    short_cjk_title = title_has_cjk and len(title_compact) <= 3
+    segment_keys = _subscription_strict_title_segment_keys(text)
+    if title_compact in segment_keys:
+        return int(exact_bonus)
+
+    compact_without_particles = strip_subscription_cjk_particles(title_compact) if title_has_cjk else ""
+    if compact_without_particles and len(compact_without_particles) >= 2:
+        if compact_without_particles in {strip_subscription_cjk_particles(key) for key in segment_keys}:
+            return int(cjk_bonus)
+
+    if short_cjk_title:
+        return 0
+    if title_compact and title_compact in text_compact:
+        return int(compact_bonus)
+    if compact_without_particles and len(compact_without_particles) >= 2 and compact_without_particles in text_compact:
+        return int(cjk_bonus)
     return 0
 
 def score_subscription_quality_preference(task: Dict[str, Any], item: Dict[str, Any]) -> Tuple[int, int, str]:
@@ -359,8 +599,13 @@ def _collect_subscription_title_signals(task: Dict[str, Any]) -> List[Tuple[str,
         title_signals.extend([(str(alias or "").strip(), 10, 8, 6) for alias in tmdb_aliases[:8]])
     return title_signals
 
-def evaluate_subscription_candidate_title_match(task: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
-    text = build_subscription_candidate_text(item)
+
+def _evaluate_subscription_title_signals_on_text(
+    task: Dict[str, Any],
+    text: str,
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
     text_compact = compact_subscription_text(text)
     matched_titles: List[str] = []
     matched_score = 0
@@ -371,7 +616,8 @@ def evaluate_subscription_candidate_title_match(task: Dict[str, Any], item: Dict
         if not normalized_title or not normalized_key or normalized_key in seen_title_tokens:
             continue
         seen_title_tokens.add(normalized_key)
-        signal_bonus = score_subscription_title_signal(
+        scorer = score_subscription_strict_title_signal if strict else score_subscription_title_signal
+        signal_bonus = scorer(
             normalized_title,
             text,
             text_compact,
@@ -387,6 +633,138 @@ def evaluate_subscription_candidate_title_match(task: Dict[str, Any], item: Dict
         "matched": bool(matched_titles),
         "matched_score": int(matched_score),
         "matched_titles": matched_titles[:8],
+    }
+
+
+def evaluate_subscription_candidate_title_match(
+    task: Dict[str, Any],
+    item: Dict[str, Any],
+    manifest: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    strict_mode = is_subscription_strict_title_match(task)
+    broad_text = build_subscription_candidate_text(item)
+    broad_eval = _evaluate_subscription_title_signals_on_text(task, broad_text, strict=False)
+    if not strict_mode:
+        return {
+            **broad_eval,
+            "strict": False,
+            "match_reason": "broad_text_match" if bool(broad_eval.get("matched", False)) else "title_mismatch",
+            "candidate_tmdb_ids": sorted(extract_subscription_candidate_tmdb_ids(item, manifest)),
+        }
+
+    identity_text = build_subscription_candidate_identity_text(item, manifest)
+    identity_eval = _evaluate_subscription_title_signals_on_text(task, identity_text, strict=True)
+    task_tmdb_id = max(0, int((task or {}).get("tmdb_id", 0) or 0))
+    candidate_tmdb_ids = extract_subscription_candidate_tmdb_ids(item, manifest)
+    candidate_tmdb_id_values = sorted(candidate_tmdb_ids)
+    matched_by_tmdb = bool(task_tmdb_id > 0 and task_tmdb_id in candidate_tmdb_ids)
+    tmdb_conflicts = [
+        tmdb_id
+        for tmdb_id in candidate_tmdb_id_values
+        if task_tmdb_id > 0 and tmdb_id != task_tmdb_id
+    ]
+    if matched_by_tmdb:
+        return {
+            **identity_eval,
+            "matched": True,
+            "matched_score": max(int(identity_eval.get("matched_score", 0) or 0), 24),
+            "strict": True,
+            "match_reason": "tmdb_id_match",
+            "candidate_tmdb_ids": candidate_tmdb_id_values,
+            "tmdb_conflicts": tmdb_conflicts,
+        }
+    if tmdb_conflicts:
+        return {
+            **identity_eval,
+            "matched": False,
+            "matched_score": 0,
+            "matched_titles": [],
+            "strict": True,
+            "match_reason": "tmdb_id_conflict",
+            "candidate_tmdb_ids": candidate_tmdb_id_values,
+            "tmdb_conflicts": tmdb_conflicts,
+            "raw_text_title_match": bool(broad_eval.get("matched", False)),
+        }
+    if bool(identity_eval.get("matched", False)):
+        return {
+            **identity_eval,
+            "strict": True,
+            "match_reason": "identity_title_match",
+            "candidate_tmdb_ids": candidate_tmdb_id_values,
+            "tmdb_conflicts": [],
+        }
+    return {
+        **identity_eval,
+        "matched": False,
+        "matched_score": 0,
+        "matched_titles": [],
+        "strict": True,
+        "match_reason": "raw_text_only_match" if bool(broad_eval.get("matched", False)) else "identity_title_mismatch",
+        "candidate_tmdb_ids": candidate_tmdb_id_values,
+        "tmdb_conflicts": [],
+        "raw_text_title_match": bool(broad_eval.get("matched", False)),
+    }
+
+
+def filter_subscription_manifest_files_by_strict_identity(
+    task: Dict[str, Any],
+    manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = manifest if isinstance(manifest, dict) else {}
+    if not is_subscription_strict_title_match(task):
+        return {"manifest": payload, "skipped_files": 0, "reason": ""}
+
+    task_tmdb_id = max(0, int((task or {}).get("tmdb_id", 0) or 0))
+    if task_tmdb_id <= 0:
+        return {"manifest": payload, "skipped_files": 0, "reason": ""}
+
+    root_ids: Set[int] = set()
+    for field in ("share_root_title", "share_scope_path", "auto_sharetitle"):
+        root_ids.update(extract_subscription_tmdb_ids_from_text(payload.get(field, "")))
+    if root_ids and task_tmdb_id not in root_ids:
+        next_payload = {**payload, "files": [], "covered_episodes": [], "covered_preview": "--"}
+        return {
+            "manifest": next_payload,
+            "skipped_files": len(payload.get("files", []) if isinstance(payload.get("files"), list) else []),
+            "reason": "strict_root_tmdb_conflict",
+            "conflict_tmdb_ids": sorted(root_ids),
+        }
+
+    files = payload.get("files", []) if isinstance(payload.get("files"), list) else []
+    filtered_files: List[Dict[str, Any]] = []
+    skipped = 0
+    conflict_ids: Set[int] = set()
+    for raw_entry in files:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry_ids = extract_subscription_tmdb_ids_from_text(raw_entry.get("name", ""))
+        if entry_ids and task_tmdb_id not in entry_ids:
+            skipped += 1
+            conflict_ids.update(entry_ids)
+            continue
+        filtered_files.append(raw_entry)
+    if skipped <= 0:
+        return {"manifest": payload, "skipped_files": 0, "reason": ""}
+    covered_episodes: Set[int] = set()
+    for entry in filtered_files:
+        for episode_no in entry.get("episodes", []) if isinstance(entry.get("episodes"), list) else []:
+            try:
+                normalized_episode = max(0, int(episode_no or 0))
+            except (TypeError, ValueError):
+                normalized_episode = 0
+            if normalized_episode > 0:
+                covered_episodes.add(normalized_episode)
+    next_payload = {
+        **payload,
+        "files": filtered_files,
+        "covered_episodes": sorted(covered_episodes),
+        "covered_preview": _format_subscription_scoring_episode_preview(covered_episodes),
+    }
+    return {
+        "manifest": next_payload,
+        "skipped_files": skipped,
+        "reason": "strict_file_tmdb_conflict",
+        "conflict_tmdb_ids": sorted(conflict_ids),
     }
 
 def match_subscription_exclude_keyword(task: Dict[str, Any], item: Dict[str, Any]) -> str:
@@ -555,6 +933,10 @@ def score_subscription_candidate(
         "title_match": bool(title_eval.get("matched", False)),
         "title_match_score": int(title_eval.get("matched_score", 0) or 0),
         "title_match_titles": title_eval.get("matched_titles", []) if isinstance(title_eval.get("matched_titles"), list) else [],
+        "title_match_reason": str(title_eval.get("match_reason", "") or "").strip(),
+        "strict_title_match": bool(title_eval.get("strict", False)),
+        "candidate_tmdb_ids": title_eval.get("candidate_tmdb_ids", []) if isinstance(title_eval.get("candidate_tmdb_ids"), list) else [],
+        "tmdb_conflicts": title_eval.get("tmdb_conflicts", []) if isinstance(title_eval.get("tmdb_conflicts"), list) else [],
     }
 
 def score_subscription_candidate_quark(
@@ -578,7 +960,7 @@ def score_subscription_candidate_quark(
         if media_type == "tv" and episode_hit:
             score_value -= 20
         scored["title_blocked"] = True
-        scored["title_block_reason"] = "title_mismatch"
+        scored["title_block_reason"] = str(scored.get("title_match_reason", "") or "title_mismatch").strip()
     else:
         score_value += 8 if int(scored.get("title_match_score", 0) or 0) >= 10 else 5
         if media_type == "tv":

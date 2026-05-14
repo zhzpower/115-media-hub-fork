@@ -846,6 +846,7 @@ async def _write_subscription_task_overview(
     exclude_keywords = normalize_subscription_exclude_keywords(task.get("exclude_keywords", []))
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
     file_size_filter_tail = f" | 最小文件: {min_file_size_mb:g}MB" if min_file_size_mb > 0 else ""
+    strict_title_tail = " | 匹配模式: 精准（简介命中不算同剧）" if is_subscription_strict_title_match(task) else ""
     await write_subscription_section("任务信息")
     await write_subscription_log(
         (
@@ -860,11 +861,13 @@ async def _write_subscription_task_overview(
         f"保存路径: {str(task.get('savepath', '') or '--').strip()} | 执行批次: {subscription_run_id} | "
         f"批次收口刷新: {batch_refresh_label}"
         + file_size_filter_tail
+        + strict_title_tail
         + (f" | 排除词: {', '.join(exclude_keywords[:5])}" if exclude_keywords else ""),
         "info",
         compact=f"配置 | 保存路径: {str(task.get('savepath', '') or '--').strip()} | "
                 f"批次收口: {batch_refresh_label}"
                 + (f" | 最小文件 {min_file_size_mb:g}MB" if min_file_size_mb > 0 else "")
+                + (" | 精准匹配" if is_subscription_strict_title_match(task) else "")
                 + (f" | 排除词: {len(exclude_keywords)}个" if exclude_keywords else ""),
     )
     scan_settings = normalize_subscription_scan_settings(task, task.get("provider", "115"))
@@ -1105,6 +1108,25 @@ async def _run_subscription_task_quark(
             f"已拦截 {int(search_stats.get('title_blocked_candidates', 0) or 0)} 条“仅集数命中/标题不匹配”候选",
             "warn",
         )
+    if int(search_stats.get("strict_title_filtered", 0) or 0) > 0:
+        strict_reasons = search_stats.get("strict_title_reasons", {}) if isinstance(search_stats.get("strict_title_reasons"), dict) else {}
+        strict_reason_labels = {
+            "strict_raw_text_only": "仅正文/简介命中",
+            "raw_text_only_match": "仅正文/简介命中",
+            "tmdb_id_conflict": "TMDB ID 不一致",
+            "identity_title_mismatch": "片名身份不匹配",
+            "strict_title_mismatch": "精准片名不匹配",
+        }
+        strict_reason_text = "，".join(
+            f"{strict_reason_labels.get(str(key), str(key))} {int(value or 0)} 条"
+            for key, value in strict_reasons.items()
+            if int(value or 0) > 0
+        )
+        await write_subscription_log(
+            f"精准匹配已过滤 {int(search_stats.get('strict_title_filtered', 0) or 0)} 条候选"
+            + (f"（{strict_reason_text}）" if strict_reason_text else "（简介命中不算同剧证据）"),
+            "warn",
+        )
     if int(search_stats.get("title_match_media_relaxed_pass", search_stats.get("quark_media_relaxed_pass", 0)) or 0) > 0:
         await write_subscription_log(
             f"已放行 {int(search_stats.get('title_match_media_relaxed_pass', search_stats.get('quark_media_relaxed_pass', 0)) or 0)} 条“标题命中但无集数标记”候选，待后续精细扫描判定",
@@ -1173,6 +1195,12 @@ async def _run_subscription_task_quark(
             status = "waiting"
         elif supported_items <= 0:
             detail = "命中资源均非夸克分享链接，请调整频道或关键词"
+            status = "waiting"
+        elif int(search_stats.get("strict_title_filtered", 0) or 0) > 0 and int(search_stats.get("scored_items", 0) or 0) <= 0:
+            detail = (
+                f"精准匹配已过滤候选 {int(search_stats.get('strict_title_filtered', 0) or 0)} 条，"
+                "当前暂无可导入资源"
+            )
             status = "waiting"
         elif int(search_stats.get("title_blocked_candidates", 0) or 0) > 0 and int(search_stats.get("scored_items", 0) or 0) <= 0:
             detail = (
@@ -2573,6 +2601,25 @@ async def run_subscription_task(
                     + (f"（{exclude_text}）" if exclude_text else ""),
                     "warn",
                 )
+            if int(search_stats.get("strict_title_filtered", 0) or 0) > 0:
+                strict_reasons = search_stats.get("strict_title_reasons", {}) if isinstance(search_stats.get("strict_title_reasons"), dict) else {}
+                strict_reason_labels = {
+                    "strict_raw_text_only": "仅正文/简介命中",
+                    "raw_text_only_match": "仅正文/简介命中",
+                    "tmdb_id_conflict": "TMDB ID 不一致",
+                    "identity_title_mismatch": "片名身份不匹配",
+                    "strict_title_mismatch": "精准片名不匹配",
+                }
+                strict_reason_text = "，".join(
+                    f"{strict_reason_labels.get(str(key), str(key))} {int(value or 0)} 条"
+                    for key, value in strict_reasons.items()
+                    if int(value or 0) > 0
+                )
+                await write_subscription_log(
+                    f"精准匹配已过滤 {int(search_stats.get('strict_title_filtered', 0) or 0)} 条候选"
+                    + (f"（{strict_reason_text}）" if strict_reason_text else "（简介命中不算同剧证据）"),
+                    "warn",
+                )
             if int(search_stats.get("media_guard_filtered", 0) or 0) > 0:
                 media_reasons = search_stats.get("media_guard_reasons", {}) if isinstance(search_stats.get("media_guard_reasons"), dict) else {}
                 reason_labels = {
@@ -2581,6 +2628,11 @@ async def run_subscription_task(
                     "movie_like": "电视剧命中电影资源",
                     "missing_episode_meta": "电视剧缺少季集信息",
                     "title_mismatch": "标题不匹配",
+                    "strict_raw_text_only": "仅正文/简介命中",
+                    "raw_text_only_match": "仅正文/简介命中",
+                    "tmdb_id_conflict": "TMDB ID 不一致",
+                    "identity_title_mismatch": "片名身份不匹配",
+                    "strict_title_mismatch": "精准片名不匹配",
                 }
                 reason_text = "，".join(
                     f"{reason_labels.get(str(key), str(key))} {int(value or 0)} 条"
@@ -2683,6 +2735,12 @@ async def run_subscription_task(
             elif int(search_stats.get("supported_items", 0) or 0) <= 0:
                 supported_link_label = "夸克分享" if provider == "quark" else "115 分享"
                 detail = f"命中资源均非可导入类型（仅支持 {supported_link_label}），请调整频道或关键词"
+                status = "waiting"
+            elif int(search_stats.get("strict_title_filtered", 0) or 0) > 0 and int(search_stats.get("scored_items", 0) or 0) <= 0:
+                detail = (
+                    f"精准匹配已过滤候选 {int(search_stats.get('strict_title_filtered', 0) or 0)} 条，"
+                    "当前暂无可导入资源"
+                )
                 status = "waiting"
             elif int(search_stats.get("media_guard_filtered", 0) or 0) > 0 and int(search_stats.get("scored_items", 0) or 0) <= 0:
                 media_label = "电影" if task.get("media_type") == "movie" else "电视剧"

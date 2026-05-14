@@ -858,7 +858,7 @@ def find_subscription_task_match_candidate(task: Dict[str, Any], last_episode: i
             if provider == "quark"
             else score_subscription_candidate(task, item, query_tokens, last_episode)
         )
-        if provider == "quark" and not bool(scored.get("title_match", False)):
+        if (provider == "quark" or is_subscription_strict_title_match(task)) and not bool(scored.get("title_match", False)):
             continue
         if matched_before:
             if media_type != "tv":

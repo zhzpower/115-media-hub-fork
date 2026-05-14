@@ -198,7 +198,8 @@
             const excludeText = excludeKeywords.length ? `，排除 ${excludeKeywords.slice(0, 4).join('、')}` : '';
             const minFileSizeMb = normalizeSubscriptionMinFileSizeMb(task?.min_file_size_mb ?? 0);
             const sizeFilterText = minFileSizeMb > 0 ? `，小于 ${formatSubscriptionMinFileSizeMb(minFileSizeMb)}MB 不导入` : '';
-            return `状态：${statusText}（${enabledText}）。${providerText} · ${mediaText}《${titleText}》保存到 ${savepath}${fixedShareText}${shareScopeText}${providerRuleText}${excludeText}${sizeFilterText}，${modeText}，${episodeText}；${scheduleText}；${latestText}。`;
+            const strictMatchText = task?.strict_title_match ? '，精准匹配：简介命中不算同剧证据' : '';
+            return `状态：${statusText}（${enabledText}）。${providerText} · ${mediaText}《${titleText}》保存到 ${savepath}${fixedShareText}${shareScopeText}${providerRuleText}${excludeText}${sizeFilterText}${strictMatchText}，${modeText}，${episodeText}；${scheduleText}；${latestText}。`;
         }
 
         function buildSubscriptionTaskProgressBar({ progress = 0, detail = '' } = {}) {
@@ -1378,6 +1379,7 @@
                 min_score: parseInt(document.getElementById('subscription_min_score').value || '55', 10) || 55,
                 quality_priority: normalizeSubscriptionQualityPriority(document.getElementById('subscription_quality_priority').value || 'ultra'),
                 min_file_size_mb: minFileSizeMb,
+                strict_title_match: !!document.getElementById('subscription_strict_title_match')?.checked,
                 candidate_scan_prefetch_limit: scanSettings.candidate_scan_prefetch_limit,
                 candidate_scan_concurrency: scanSettings.candidate_scan_concurrency,
                 share_scan_concurrency: scanSettings.share_scan_concurrency,
@@ -1431,6 +1433,8 @@
             document.getElementById('subscription_schedule_interval_minutes').value = SUBSCRIPTION_DEFAULT_SCHEDULE_INTERVAL_MINUTES;
             document.getElementById('subscription_min_score').value = 55;
             document.getElementById('subscription_min_file_size_mb').value = 0;
+            const strictTitleInput = document.getElementById('subscription_strict_title_match');
+            if (strictTitleInput) strictTitleInput.checked = false;
             document.getElementById('subscription_quality_priority').value = 'ultra';
             setSubscriptionScanSettingsToForm(getSubscriptionScanRecommendedDefaults('115'), '115');
             document.getElementById('subscription_enabled').checked = true;
@@ -1629,6 +1633,8 @@
             );
             document.getElementById('subscription_min_score').value = task.min_score ?? 55;
             document.getElementById('subscription_min_file_size_mb').value = formatSubscriptionMinFileSizeMb(task.min_file_size_mb ?? 0);
+            const strictTitleInput = document.getElementById('subscription_strict_title_match');
+            if (strictTitleInput) strictTitleInput.checked = !!task.strict_title_match;
             document.getElementById('subscription_quality_priority').value = normalizeSubscriptionQualityPriority(task.quality_priority || 'balanced');
             setSubscriptionScanSettingsToForm(task, normalizeSubscriptionProvider(task.provider || '115', '115'));
             document.getElementById('subscription_enabled').checked = task.enabled !== false;
@@ -1964,6 +1970,9 @@
                 const displayTitle = String(task.title || taskName || '').trim() || taskName;
                 const provider = normalizeSubscriptionProvider(task.provider || '115', '115');
                 const providerBadgeHtml = buildSubscriptionProviderBadge(provider);
+                const strictBadgeHtml = task?.strict_title_match
+                    ? '<span class="text-[10px] px-2 py-0.5 rounded-full border border-emerald-400/35 bg-emerald-500/10 text-emerald-200 font-bold">精准</span>'
+                    : '';
                 const running = subscriptionState.running && subscriptionState.current_task === taskName;
                 const queued = (subscriptionState.queued || []).includes(taskName);
                 const status = running ? 'running' : (task.status || 'idle');
@@ -2064,6 +2073,7 @@
                                     <div class="flex flex-wrap items-center gap-2">
                                         <span class="text-lg font-black text-white break-all leading-tight">${escapeHtml(displayTitle)}</span>
                                         ${providerBadgeHtml}
+                                        ${strictBadgeHtml}
                                     </div>
                                 </button>
                                 <button
