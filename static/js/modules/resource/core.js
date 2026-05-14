@@ -1187,6 +1187,51 @@
             }));
         }
 
+        function normalizeResourceItemStatusFromJob(status) {
+            const normalized = String(status || '').trim().toLowerCase();
+            if (normalized === 'running') return 'importing';
+            if (normalized === 'pending') return 'queued';
+            if (['queued', 'importing', 'submitted', 'completed', 'failed'].includes(normalized)) return normalized;
+            return '';
+        }
+
+        function buildResourceItemStatusByJob(jobs = [], activeJobs = []) {
+            const statusByResourceId = new Map();
+            [...(Array.isArray(jobs) ? jobs : []), ...(Array.isArray(activeJobs) ? activeJobs : [])].forEach((job) => {
+                const resourceId = Number(job?.resource_id || 0) || 0;
+                if (!resourceId || statusByResourceId.has(resourceId)) return;
+                const status = normalizeResourceItemStatusFromJob(job?.status || '');
+                if (status) statusByResourceId.set(resourceId, status);
+            });
+            return statusByResourceId;
+        }
+
+        function applyResourceJobStatusesToItems(items = [], statusByResourceId = new Map()) {
+            if (!statusByResourceId.size || !Array.isArray(items)) return items;
+            let changed = false;
+            const nextItems = items.map((item) => {
+                const resourceId = Number(item?.id || 0) || 0;
+                const status = statusByResourceId.get(resourceId);
+                if (!resourceId || !status || String(item?.status || '') === status) return item;
+                changed = true;
+                return { ...item, status };
+            });
+            return changed ? nextItems : items;
+        }
+
+        function applyResourceJobStatusesToSections(sections = [], statusByResourceId = new Map()) {
+            if (!statusByResourceId.size || !Array.isArray(sections)) return sections;
+            let changed = false;
+            const nextSections = sections.map((section) => {
+                const items = Array.isArray(section?.items) ? section.items : [];
+                const nextItems = applyResourceJobStatusesToItems(items, statusByResourceId);
+                if (nextItems === items) return section;
+                changed = true;
+                return { ...section, items: nextItems };
+            });
+            return changed ? nextSections : sections;
+        }
+
         function syncResourceSectionsWithSources(sections, sources) {
             const sourceIndex = new Map();
             (Array.isArray(sources) ? sources : []).forEach(source => {
@@ -2121,9 +2166,27 @@
             const nextFavoriteDirs = data.favorite_dirs && typeof data.favorite_dirs === 'object'
                 ? normalizeResourceFavoriteDirsPayload(data.favorite_dirs)
                 : normalizeResourceFavoriteDirsPayload(resourceState.favorite_dirs || {});
-            const nextItems = hydrateResourceItems(Array.isArray(data.items) ? data.items : (resourceState.items || []));
             const nextJobs = Array.isArray(data.jobs) ? data.jobs : (resourceState.jobs || []);
             const nextActiveJobs = Array.isArray(data.active_jobs) ? data.active_jobs : (resourceState.active_jobs || []);
+            const nextJobStatusByResourceId = buildResourceItemStatusByJob(nextJobs, nextActiveJobs);
+            const nextItems = applyResourceJobStatusesToItems(
+                hydrateResourceItems(Array.isArray(data.items) ? data.items : (resourceState.items || [])),
+                nextJobStatusByResourceId
+            );
+            const nextChannelSections = applyResourceJobStatusesToSections(
+                syncResourceSectionsWithSources(
+                    hydrateResourceSections(Array.isArray(data.channel_sections) ? data.channel_sections : (resourceState.channel_sections || [])),
+                    nextSources
+                ),
+                nextJobStatusByResourceId
+            );
+            const nextSearchSections = applyResourceJobStatusesToSections(
+                syncResourceSectionsWithSources(
+                    hydrateResourceSections(Array.isArray(data.search_sections) ? data.search_sections : (resourceState.search_sections || [])),
+                    nextSources
+                ),
+                nextJobStatusByResourceId
+            );
             const nextJobCounts = data.job_counts && typeof data.job_counts === 'object'
                 ? data.job_counts
                 : (resourceState.job_counts || {});
@@ -2156,20 +2219,14 @@
                 active_jobs: nextActiveJobs,
                 job_counts: nextJobCounts,
                 job_pagination: nextJobPagination,
-                channel_sections: syncResourceSectionsWithSources(
-                    hydrateResourceSections(Array.isArray(data.channel_sections) ? data.channel_sections : (resourceState.channel_sections || [])),
-                    nextSources
-                ),
+                channel_sections: nextChannelSections,
                 channel_profiles: data.channel_profiles && typeof data.channel_profiles === 'object'
                     ? data.channel_profiles
                     : (resourceState.channel_profiles || {}),
                 subscription_channel_support: data.subscription_channel_support && typeof data.subscription_channel_support === 'object'
                     ? data.subscription_channel_support
                     : (resourceState.subscription_channel_support || {}),
-                search_sections: syncResourceSectionsWithSources(
-                    hydrateResourceSections(Array.isArray(data.search_sections) ? data.search_sections : (resourceState.search_sections || [])),
-                    nextSources
-                ),
+                search_sections: nextSearchSections,
                 last_syncs: data.last_syncs || resourceState.last_syncs || {},
                 channel_sync: data.channel_sync && typeof data.channel_sync === 'object'
                     ? data.channel_sync

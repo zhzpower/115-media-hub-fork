@@ -739,6 +739,7 @@ def upsert_subscription_task_state(task_name: str, **fields: Any) -> None:
                 ),
             )
             conn.commit()
+            schedule_ui_state_push(0)
             return
         except sqlite3.OperationalError as exc:
             message = str(exc or "").lower()

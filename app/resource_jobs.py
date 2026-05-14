@@ -216,6 +216,7 @@ def clear_resource_jobs(scope: str = "completed") -> Dict[str, int]:
     conn.close()
     if deleted_count > 0 or reset_item_count > 0:
         invalidate_resource_state_snapshot("resource-jobs-clear")
+        touch_resource_jobs_state_signal("resource-jobs-clear")
     return {
         "scope": normalized_scope,
         "deleted": deleted_count,
@@ -258,6 +259,7 @@ def prune_resource_job_history(
     conn.close()
     if sum(deleted.values()) > 0:
         invalidate_resource_state_snapshot("resource-jobs-prune")
+        touch_resource_jobs_state_signal("resource-jobs-prune")
     return {
         "completed": deleted.get("completed", 0),
         "failed": deleted.get("failed", 0),
@@ -346,6 +348,7 @@ def recover_stale_resource_jobs(max_age_seconds: int = RESOURCE_JOB_STALE_RECOVE
     conn.close()
     if recovered > 0:
         invalidate_resource_state_snapshot("resource-jobs-recover-stale")
+        touch_resource_jobs_state_signal("resource-jobs-recover-stale")
     return {"recovered": recovered, "checked": checked}
 
 def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[str, int]:
@@ -429,6 +432,7 @@ def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[st
     conn.close()
     if recovered > 0:
         invalidate_resource_state_snapshot("resource-jobs-recover-submitted")
+        touch_resource_jobs_state_signal("resource-jobs-recover-submitted")
     return {"recovered": recovered, "checked": checked}
 
 def create_resource_job(resource: Dict[str, Any], data: Dict[str, Any]) -> int:
@@ -502,6 +506,16 @@ def create_resource_job(resource: Dict[str, Any], data: Dict[str, Any]) -> int:
     conn.commit()
     conn.close()
     invalidate_resource_state_snapshot("resource-job-create")
+    touch_resource_jobs_state_signal(
+        "resource-job-create",
+        {
+            "id": job_id,
+            "resource_id": resource_id,
+            "status": "pending",
+            "status_detail": f"等待提交到 {provider_label}",
+            "updated_at": now,
+        },
+    )
     return job_id
 
 def update_resource_job(job_id: int, **fields: Any) -> None:
@@ -516,10 +530,27 @@ def update_resource_job(job_id: int, **fields: Any) -> None:
     params = list(payload.values()) + [job_id]
     cursor.execute(f"UPDATE resource_jobs SET {', '.join(sets)} WHERE id = ?", params)
     updated = int(cursor.rowcount or 0)
+    latest_job: Dict[str, Any] = {}
+    if updated > 0:
+        cursor.execute(
+            "SELECT id, resource_id, status, status_detail, updated_at FROM resource_jobs WHERE id = ?",
+            (job_id,),
+        )
+        row = cursor.fetchone()
+        if row:
+            data = sqlite_row_to_dict(row)
+            latest_job = {
+                "id": max(0, int(data.get("id", 0) or 0)),
+                "resource_id": max(0, int(data.get("resource_id", 0) or 0)),
+                "status": str(data.get("status", "") or "").strip().lower(),
+                "status_detail": str(data.get("status_detail", "") or "").strip(),
+                "updated_at": str(data.get("updated_at", "") or "").strip(),
+            }
     conn.commit()
     conn.close()
     if updated > 0:
         invalidate_resource_state_snapshot("resource-job-update")
+        touch_resource_jobs_state_signal("resource-job-update", latest_job)
 
 def delete_resource_item(resource_id: int) -> None:
     ensure_db()
@@ -530,3 +561,4 @@ def delete_resource_item(resource_id: int) -> None:
     conn.commit()
     conn.close()
     invalidate_resource_state_snapshot("resource-item-delete")
+    touch_resource_jobs_state_signal("resource-item-delete")

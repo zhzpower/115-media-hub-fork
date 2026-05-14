@@ -8,6 +8,27 @@
             });
         }
 
+        function mergeSubscriptionTaskUpdates(tasks = [], updates = []) {
+            const sourceTasks = Array.isArray(tasks) ? tasks : [];
+            const updateMap = new Map();
+            (Array.isArray(updates) ? updates : []).forEach((item) => {
+                const name = String(item?.name || item?.task_name || '').trim();
+                if (!name) return;
+                updateMap.set(name, item);
+            });
+            if (!updateMap.size) return sourceTasks;
+            return sourceTasks.map((task) => {
+                const name = String(task?.name || task?.task_name || '').trim();
+                if (!name || !updateMap.has(name)) return task;
+                const update = updateMap.get(name) || {};
+                return {
+                    ...task,
+                    ...update,
+                    name: task?.name || update.name || name,
+                };
+            });
+        }
+
         const SUBSCRIPTION_LOG_RECENT_TASK_LIMIT = 1;
         const SUBSCRIPTION_LOG_PAGE_TASK_LIMIT = 1;
         const SUBSCRIPTION_SCAN_RECOMMENDED_DEFAULTS = {
@@ -91,10 +112,13 @@
                 return;
             }
             if (!data) return;
+            const nextTasks = Array.isArray(data.tasks)
+                ? data.tasks
+                : mergeSubscriptionTaskUpdates(subscriptionState.tasks || [], data.task_updates || []);
             subscriptionState = {
                 ...subscriptionState,
                 ...data,
-                tasks: Array.isArray(data.tasks) ? data.tasks : (subscriptionState.tasks || []),
+                tasks: nextTasks,
                 logs: Array.isArray(data.logs) ? data.logs : [],
                 queued: Array.isArray(data.queued) ? data.queued : (subscriptionState.queued || []),
                 next_runs: data.next_runs || subscriptionState.next_runs || {},

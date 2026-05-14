@@ -5,6 +5,27 @@ export async function ensureTabData(context) {
     }
 }
 
+function mergeSubscriptionTaskUpdates(tasks = [], updates = []) {
+    const sourceTasks = Array.isArray(tasks) ? tasks : [];
+    const updateMap = new Map();
+    (Array.isArray(updates) ? updates : []).forEach((item) => {
+        const name = String(item?.name || item?.task_name || '').trim();
+        if (!name) return;
+        updateMap.set(name, item);
+    });
+    if (!updateMap.size) return sourceTasks;
+    return sourceTasks.map((task) => {
+        const name = String(task?.name || task?.task_name || '').trim();
+        if (!name || !updateMap.has(name)) return task;
+        const update = updateMap.get(name) || {};
+        return {
+            ...task,
+            ...update,
+            name: task?.name || update.name || name,
+        };
+    });
+}
+
 export function applySubscriptionState(data, {
     forceRender = false,
     getSubscriptionState,
@@ -22,10 +43,13 @@ export function applySubscriptionState(data, {
 } = {}) {
     if (!data) return;
     const currentSubscriptionState = typeof getSubscriptionState === 'function' ? (getSubscriptionState() || {}) : {};
+    const nextTasks = Array.isArray(data.tasks)
+        ? data.tasks
+        : mergeSubscriptionTaskUpdates(currentSubscriptionState.tasks || [], data.task_updates || []);
     const nextState = {
         ...currentSubscriptionState,
         ...data,
-        tasks: Array.isArray(data.tasks) ? data.tasks : (currentSubscriptionState.tasks || []),
+        tasks: nextTasks,
         logs: Array.isArray(data.logs) ? data.logs : [],
         queued: Array.isArray(data.queued) ? data.queued : (currentSubscriptionState.queued || []),
         next_runs: data.next_runs || currentSubscriptionState.next_runs || {},

@@ -70,6 +70,51 @@ export function hasActiveResourceJobs({ getResourceState } = {}) {
     });
 }
 
+function normalizeResourceItemStatusFromJob(status) {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (normalized === 'running') return 'importing';
+    if (normalized === 'pending') return 'queued';
+    if (['queued', 'importing', 'submitted', 'completed', 'failed'].includes(normalized)) return normalized;
+    return '';
+}
+
+function buildResourceItemStatusByJob(jobs = [], activeJobs = []) {
+    const statusByResourceId = new Map();
+    [...(Array.isArray(jobs) ? jobs : []), ...(Array.isArray(activeJobs) ? activeJobs : [])].forEach((job) => {
+        const resourceId = Number(job?.resource_id || 0) || 0;
+        if (!resourceId || statusByResourceId.has(resourceId)) return;
+        const status = normalizeResourceItemStatusFromJob(job?.status || '');
+        if (status) statusByResourceId.set(resourceId, status);
+    });
+    return statusByResourceId;
+}
+
+function applyResourceJobStatusesToItems(items = [], statusByResourceId = new Map()) {
+    if (!statusByResourceId.size || !Array.isArray(items)) return items;
+    let changed = false;
+    const nextItems = items.map((item) => {
+        const resourceId = Number(item?.id || 0) || 0;
+        const status = statusByResourceId.get(resourceId);
+        if (!resourceId || !status || String(item?.status || '') === status) return item;
+        changed = true;
+        return { ...item, status };
+    });
+    return changed ? nextItems : items;
+}
+
+function applyResourceJobStatusesToSections(sections = [], statusByResourceId = new Map()) {
+    if (!statusByResourceId.size || !Array.isArray(sections)) return sections;
+    let changed = false;
+    const nextSections = sections.map((section) => {
+        const items = Array.isArray(section?.items) ? section.items : [];
+        const nextItems = applyResourceJobStatusesToItems(items, statusByResourceId);
+        if (nextItems === items) return section;
+        changed = true;
+        return { ...section, items: nextItems };
+    });
+    return changed ? nextSections : sections;
+}
+
 export function applyResourceJobsState(data, {
     getResourceState,
     setResourceState,
@@ -85,6 +130,7 @@ export function applyResourceJobsState(data, {
     const currentResourceState = typeof getResourceState === 'function' ? (getResourceState() || {}) : {};
     const nextJobs = Array.isArray(data.jobs) ? data.jobs : (currentResourceState.jobs || []);
     const nextActiveJobs = Array.isArray(data.active_jobs) ? data.active_jobs : (currentResourceState.active_jobs || []);
+    const nextJobStatusByResourceId = buildResourceItemStatusByJob(nextJobs, nextActiveJobs);
     const nextMonitorTasks = Array.isArray(data.monitor_tasks) ? data.monitor_tasks : (currentResourceState.monitor_tasks || []);
     const incomingStats = data.stats && typeof data.stats === 'object' ? data.stats : {};
     const nextJobCounts = data.job_counts && typeof data.job_counts === 'object'
@@ -98,6 +144,9 @@ export function applyResourceJobsState(data, {
         : {};
     const nextState = {
         ...currentResourceState,
+        items: applyResourceJobStatusesToItems(currentResourceState.items || [], nextJobStatusByResourceId),
+        channel_sections: applyResourceJobStatusesToSections(currentResourceState.channel_sections || [], nextJobStatusByResourceId),
+        search_sections: applyResourceJobStatusesToSections(currentResourceState.search_sections || [], nextJobStatusByResourceId),
         jobs: nextJobs,
         active_jobs: nextActiveJobs,
         job_counts: nextJobCounts,

@@ -3504,6 +3504,13 @@ resource_state_snapshot_lock = threading.Lock()
 resource_state_snapshot_epoch = 0
 resource_jobs_state_snapshot_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 resource_compact_state_snapshot_cache: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+resource_jobs_signal_lock = threading.Lock()
+resource_jobs_signal_state: Dict[str, Any] = {
+    "revision": 0,
+    "updated_at": "",
+    "reason": "",
+    "latest_job": {},
+}
 
 
 def invalidate_resource_state_snapshot(reason: str = "") -> None:
@@ -3512,6 +3519,25 @@ def invalidate_resource_state_snapshot(reason: str = "") -> None:
         resource_state_snapshot_epoch += 1
         resource_jobs_state_snapshot_cache.clear()
         resource_compact_state_snapshot_cache.clear()
+
+
+def touch_resource_jobs_state_signal(reason: str = "", latest_job: Optional[Dict[str, Any]] = None) -> None:
+    with resource_jobs_signal_lock:
+        resource_jobs_signal_state["revision"] = int(resource_jobs_signal_state.get("revision", 0) or 0) + 1
+        resource_jobs_signal_state["updated_at"] = now_text()
+        resource_jobs_signal_state["reason"] = str(reason or "").strip()[:120]
+        resource_jobs_signal_state["latest_job"] = latest_job if isinstance(latest_job, dict) else {}
+    schedule_ui_state_push(0)
+
+
+def build_resource_jobs_signal_payload() -> Dict[str, Any]:
+    with resource_jobs_signal_lock:
+        return {
+            "revision": int(resource_jobs_signal_state.get("revision", 0) or 0),
+            "updated_at": str(resource_jobs_signal_state.get("updated_at", "") or ""),
+            "reason": str(resource_jobs_signal_state.get("reason", "") or ""),
+            "latest_job": dict(resource_jobs_signal_state.get("latest_job") or {}),
+        }
 
 
 def _get_resource_state_snapshot(
@@ -4964,10 +4990,37 @@ def build_subscription_status_payload(
     }
     if include_logs:
         payload["logs"] = _tail_subscription_ui_logs(logs, SUBSCRIPTION_UI_RECENT_LOG_LIMIT)
+    if compact:
+        payload["task_updates"] = build_subscription_task_update_payload(cfg)
     if not compact:
         payload["tasks"] = clone_jsonable(list_subscription_task_runtime(cfg))
         payload["next_runs"] = clone_jsonable(subscription_next_run)
     return payload
+
+
+def build_subscription_task_update_payload(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    update_keys = (
+        "name",
+        "status",
+        "progress",
+        "detail",
+        "last_run_at",
+        "last_success_at",
+        "last_error",
+        "last_episode",
+        "total_episodes",
+        "matched_resource_id",
+        "matched_resource_title",
+        "matched_score",
+        "queued_job_id",
+        "updated_at",
+    )
+    updates: List[Dict[str, Any]] = []
+    for task in list_subscription_task_runtime(cfg):
+        task_update = {key: task.get(key) for key in update_keys if key in task}
+        if task_update.get("name"):
+            updates.append(task_update)
+    return clone_jsonable(updates)
 
 
 def compute_sign115_next_run_text(cron_time: str, now: Optional[datetime] = None) -> str:
@@ -5033,6 +5086,7 @@ def build_ui_state_payload(
         "sign115": build_sign115_status_payload(active_cfg),
         "cookie_health": build_cookie_health_payload(active_cfg),
         "resource_channel_sync": build_resource_channel_sync_payload(),
+        "resource_jobs": build_resource_jobs_signal_payload(),
     }
     if not incremental:
         return full

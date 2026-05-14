@@ -1,9 +1,10 @@
 {
-  "version": "0.3.25",
-  "buildDate": "2026-05-13T23:11:42+08:00",
+  "version": "0.3.26",
+  "buildDate": "2026-05-14T00:00:00+08:00",
   "notes": [
-    "更新版本号到 0.3.25",
-    "固定文件夹监控页当前状态区布局，避免任务运行时状态文本变化导致页面闪烁"
+    "更新版本号到 0.3.26",
+    "修复订阅任务结束后前端进度条仍显示运行中的状态收敛问题",
+    "修复资源中心手动导入完成后资源卡片状态不能及时从导入中更新为已完成的问题"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

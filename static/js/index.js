@@ -186,6 +186,7 @@
         let statusFallbackTimer = null;
         let resourcePollTimer = null;
         let resourcePollInFlight = false;
+        let resourceJobsSignalState = { revision: 0, updated_at: '', reason: '', latest_job: {} };
         let lastResourceChannelSyncFinishNotifiedAt = '';
         let sensitiveConfigMeta = {};
         const monitorActionLocks = new Set();
@@ -1576,6 +1577,7 @@
                     applySign115State(payload.sign115);
                     applyCookieHealthState(payload.cookie_health);
                     applyResourceChannelSyncState(payload.resource_channel_sync);
+                    applyResourceJobsSignalState(payload.resource_jobs);
                 } catch (e) {}
             }, STATUS_FALLBACK_INTERVAL);
         }
@@ -1660,6 +1662,92 @@
             const next = normalizeResourceChannelSyncState(payload);
             resourceState = { ...resourceState, channel_sync: next };
             handleResourceChannelSyncStateChange(previous, next, options);
+        }
+
+        function normalizeResourceItemStatusFromJob(status) {
+            const normalized = String(status || '').trim().toLowerCase();
+            if (normalized === 'running') return 'importing';
+            if (normalized === 'pending') return 'queued';
+            if (['queued', 'importing', 'submitted', 'completed', 'failed'].includes(normalized)) return normalized;
+            return '';
+        }
+
+        function applyResourceJobStatusToItems(items = [], resourceId = 0, status = '') {
+            if (!resourceId || !status || !Array.isArray(items)) return items;
+            let changed = false;
+            const nextItems = items.map((item) => {
+                if (Number(item?.id || 0) !== resourceId || String(item?.status || '') === status) return item;
+                changed = true;
+                return { ...item, status };
+            });
+            return changed ? nextItems : items;
+        }
+
+        function applyResourceJobStatusToSections(sections = [], resourceId = 0, status = '') {
+            if (!resourceId || !status || !Array.isArray(sections)) return sections;
+            let changed = false;
+            const nextSections = sections.map((section) => {
+                const items = Array.isArray(section?.items) ? section.items : [];
+                const nextItems = applyResourceJobStatusToItems(items, resourceId, status);
+                if (nextItems === items) return section;
+                changed = true;
+                return { ...section, items: nextItems };
+            });
+            return changed ? nextSections : sections;
+        }
+
+        function applyResourceJobSignalToResourceState(job = {}) {
+            const resourceId = Number(job?.resource_id || 0) || 0;
+            const status = normalizeResourceItemStatusFromJob(job?.status || '');
+            if (!resourceId || !status) return false;
+            const currentItems = Array.isArray(resourceState.items) ? resourceState.items : [];
+            const currentChannelSections = Array.isArray(resourceState.channel_sections) ? resourceState.channel_sections : [];
+            const currentSearchSections = Array.isArray(resourceState.search_sections) ? resourceState.search_sections : [];
+            const nextItems = applyResourceJobStatusToItems(currentItems, resourceId, status);
+            const nextChannelSections = applyResourceJobStatusToSections(currentChannelSections, resourceId, status);
+            const nextSearchSections = applyResourceJobStatusToSections(currentSearchSections, resourceId, status);
+            const selectedChanged = selectedResourceItem && Number(selectedResourceItem?.id || 0) === resourceId;
+            const changed = nextItems !== currentItems
+                || nextChannelSections !== currentChannelSections
+                || nextSearchSections !== currentSearchSections
+                || selectedChanged;
+            if (!changed) return false;
+            resourceState = {
+                ...resourceState,
+                items: nextItems,
+                channel_sections: nextChannelSections,
+                search_sections: nextSearchSections,
+            };
+            if (selectedChanged) {
+                selectedResourceItem = { ...selectedResourceItem, status };
+            }
+            if (currentTab === 'resource') {
+                renderResourceBoard();
+                renderResourceBoardHint();
+            }
+            return true;
+        }
+
+        function normalizeResourceJobsSignalState(value) {
+            const source = value && typeof value === 'object' ? value : {};
+            return {
+                revision: Number(source.revision || 0) || 0,
+                updated_at: String(source.updated_at || ''),
+                reason: String(source.reason || ''),
+                latest_job: source.latest_job && typeof source.latest_job === 'object' ? source.latest_job : {},
+            };
+        }
+
+        function applyResourceJobsSignalState(payload) {
+            if (!payload || typeof payload !== 'object') return;
+            const previous = resourceJobsSignalState || { revision: 0 };
+            const next = normalizeResourceJobsSignalState(payload);
+            resourceJobsSignalState = next;
+            if (next.revision <= 0 || next.revision === Number(previous.revision || 0)) return;
+            applyResourceJobSignalToResourceState(next.latest_job);
+            if (!document.hidden) {
+                scheduleResourcePolling(1000);
+            }
         }
 
         function getResourcePollingDelay() {
@@ -1764,6 +1852,7 @@
                         if (changed.includes('sign115') && payload.sign115) applySign115State(payload.sign115);
                         if (changed.includes('cookie_health') && payload.cookie_health) applyCookieHealthState(payload.cookie_health);
                         if (changed.includes('resource_channel_sync') && payload.resource_channel_sync) applyResourceChannelSyncState(payload.resource_channel_sync);
+                        if (changed.includes('resource_jobs') && payload.resource_jobs) applyResourceJobsSignalState(payload.resource_jobs);
                     } else {
                         if (payload.main) applyMainState(payload.main);
                         if (payload.monitor) applyMonitorState(payload.monitor);
@@ -1771,6 +1860,7 @@
                         if (payload.sign115) applySign115State(payload.sign115);
                         if (payload.cookie_health) applyCookieHealthState(payload.cookie_health);
                         if (payload.resource_channel_sync) applyResourceChannelSyncState(payload.resource_channel_sync);
+                        if (payload.resource_jobs) applyResourceJobsSignalState(payload.resource_jobs);
                     }
                 } catch (err) {
                     console.warn('Status stream parse failed', err);
