@@ -233,7 +233,9 @@
             settings: { title: '参数配置' },
             about: { title: '关于与版本' }
         };
-        const btnTexts = ["🌐 联网同步更新", "🛠 本地调试解析", "🔥 强制全量重刷"];
+        const btnTexts = ["🌐 联网增量写入", "🛠 本地调试解析", "🔥 强制全量重写"];
+        let strmOrphanPreviewState = { candidates: [], empty_dirs: [], manual_check: [] };
+        let strmOrphanScanBusy = false;
         const DEFAULT_EXTENSIONS = "mp4,mkv,avi,mov,wmv,flv,webm,vob,mpg,mpeg,ts,m2ts,mts,rmvb,rm,asf,3gp,m4v,f4v,iso";
         const SENSITIVE_SETTING_FIELDS = Object.freeze([
             'password',
@@ -1153,6 +1155,8 @@
                 '失败目录': 'summary-fail',
                 '删除文件': 'summary-delete',
                 '删除目录': 'summary-delete',
+                '删除 STRM': 'summary-delete',
+                '删除空目录': 'summary-delete',
                 '删除失败': 'summary-fail',
                 '索引清理': 'summary-delete'
             };
@@ -2033,6 +2037,137 @@
             if (data?.status === 'started') updateButtonState(true);
         }
 
+        function formatOrphanExtensions(item) {
+            const extensions = Array.isArray(item?.extensions) ? item.extensions : [];
+            const unknown = Array.isArray(item?.unknown_extensions) ? item.unknown_extensions : [];
+            const knownText = extensions.filter(ext => ext !== '.strm').slice(0, 8).join('、') || '--';
+            if (!unknown.length) return knownText;
+            return `${knownText}；未知：${unknown.slice(0, 6).join('、')}`;
+        }
+
+        function getSelectedOrphanMetadataPaths() {
+            return Array.from(document.querySelectorAll('.strm-orphan-checkbox:checked'))
+                .map(input => String(input.value || '').trim())
+                .filter(Boolean);
+        }
+
+        function updateOrphanMetadataSelection() {
+            const selectedCount = getSelectedOrphanMetadataPaths().length;
+            const btn = document.getElementById('strm-orphan-delete-btn');
+            if (!btn) return;
+            btn.disabled = selectedCount <= 0 || strmOrphanScanBusy;
+            btn.classList.toggle('btn-disabled', btn.disabled);
+            btn.innerText = selectedCount > 0 ? `删除选中 ${selectedCount} 项` : '删除选中';
+        }
+
+        async function openStrmCleanupTool() {
+            await switchTab('task');
+            window.setTimeout(() => {
+                const card = document.getElementById('strm-orphan-cleanup-card');
+                if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 80);
+        }
+
+        function renderOrphanMetadataPreview(data) {
+            strmOrphanPreviewState = {
+                candidates: Array.isArray(data?.candidates) ? data.candidates : [],
+                empty_dirs: Array.isArray(data?.empty_dirs) ? data.empty_dirs : [],
+                manual_check: Array.isArray(data?.manual_check) ? data.manual_check : []
+            };
+            const candidates = strmOrphanPreviewState.candidates;
+            const emptyDirs = strmOrphanPreviewState.empty_dirs;
+            const manualCheck = strmOrphanPreviewState.manual_check;
+            const summaryEl = document.getElementById('strm-orphan-summary');
+            const listEl = document.getElementById('strm-orphan-list');
+            const manualEl = document.getElementById('strm-orphan-manual');
+            if (summaryEl) {
+                summaryEl.innerText = `可清理元数据目录 ${candidates.length} 个；空目录 ${emptyDirs.length} 个；需手动检查 ${manualCheck.length} 个目录`;
+            }
+            if (listEl) {
+                const safeItems = [
+                    ...candidates.map(item => ({ ...item, cleanup_kind: 'metadata' })),
+                    ...emptyDirs.map(item => ({ ...item, cleanup_kind: 'empty' })),
+                ];
+                listEl.innerHTML = safeItems.length
+                    ? safeItems.map((item) => {
+                        const path = String(item?.path || '');
+                        const fileCount = Number(item?.file_count || 0) || 0;
+                        const modified = String(item?.last_modified || '') || '--';
+                        const isEmpty = item.cleanup_kind === 'empty';
+                        const detailText = isEmpty
+                            ? `空目录 · 最后修改 ${modified}`
+                            : `文件 ${fileCount} 个 · 类型 ${formatOrphanExtensions(item)} · 最后修改 ${modified}`;
+                        return `
+                            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/50 p-3 text-sm">
+                                <input type="checkbox" class="ui-checkbox strm-orphan-checkbox mt-1" value="${escapeHtml(path)}" onchange="updateOrphanMetadataSelection()">
+                                <span class="min-w-0 flex-1">
+                                    <span class="block font-bold text-slate-100 break-all">${escapeHtml(path)}</span>
+                                    <span class="block text-xs text-slate-500 mt-1">${escapeHtml(detailText)}</span>
+                                </span>
+                            </label>
+                        `;
+                    }).join('')
+                    : '<div class="rounded-2xl border border-slate-800 bg-slate-950/40 p-3 text-sm text-slate-500">没有发现可自动清理的废弃元数据目录或空目录。</div>';
+            }
+            if (manualEl) {
+                manualEl.innerHTML = manualCheck.length
+                    ? `
+                        <div class="text-xs font-bold text-amber-300">需手动检查</div>
+                        ${manualCheck.map(item => `
+                            <div class="rounded-2xl border border-amber-500/25 bg-amber-500/5 p-3 text-sm">
+                                <div class="font-bold text-amber-100 break-all">${escapeHtml(item?.path || '')}</div>
+                                <div class="text-xs text-amber-200/75 mt-1">文件 ${Number(item?.file_count || 0) || 0} 个 · ${escapeHtml(formatOrphanExtensions(item))}</div>
+                            </div>
+                        `).join('')}
+                    `
+                    : '';
+            }
+            updateOrphanMetadataSelection();
+        }
+
+        async function scanOrphanMetadataDirs() {
+            if (strmOrphanScanBusy) return;
+            strmOrphanScanBusy = true;
+            const summaryEl = document.getElementById('strm-orphan-summary');
+            if (summaryEl) summaryEl.innerText = '正在扫描 /strm...';
+            updateOrphanMetadataSelection();
+            try {
+                const data = await window.MediaHubApi.getJson('/strm/orphan-metadata/preview');
+                renderOrphanMetadataPreview(data);
+            } catch (error) {
+                showToast(`扫描失败：${error?.message || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
+            } finally {
+                strmOrphanScanBusy = false;
+                updateOrphanMetadataSelection();
+            }
+        }
+
+        async function deleteSelectedOrphanMetadataDirs() {
+            const paths = getSelectedOrphanMetadataPaths();
+            if (!paths.length) {
+                showToast('请先勾选要清理的目录', { tone: 'warn', duration: 2400, placement: 'top-center' });
+                return;
+            }
+            const confirmed = await showAppConfirm(
+                `将删除 ${paths.length} 个废弃目录。后端会再次校验：只删除没有 STRM 且只含已知元数据的目录，或仍为空的目录。继续吗？`,
+                { title: '确认清理废弃目录', tone: 'error', confirmText: '删除选中' }
+            );
+            if (!confirmed) return;
+            try {
+                const result = await window.MediaHubApi.postJson('/strm/orphan-metadata/delete', { paths });
+                const deletedCount = Number(result?.deleted_count || 0) || 0;
+                const skippedCount = Number(result?.skipped_count || 0) || 0;
+                showToast(`清理完成：删除 ${deletedCount} 个，跳过 ${skippedCount} 个`, {
+                    tone: skippedCount > 0 ? 'warn' : 'success',
+                    duration: 3200,
+                    placement: 'top-center'
+                });
+                await scanOrphanMetadataDirs();
+            } catch (error) {
+                showToast(`清理失败：${error?.message || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
+            }
+        }
+
         function updateButtonState(running) {
             const taskModule = tabRuntimeState.tabModuleCache.task;
             if (taskModule?.updateButtonState) {
@@ -2564,7 +2699,9 @@
                 scan_path: rawScanPath ? normalizeRemotePathInput(rawScanPath) : '',
                 target_path: document.getElementById('monitor_target_path').value.trim(),
                 skip_by_dir_mtime: document.getElementById('monitor_skip_by_dir_mtime').checked,
-                incremental: document.getElementById('monitor_incremental').checked,
+                strm_write_mode: document.getElementById('monitor_strm_write_mode')?.value || 'incremental',
+                sync_clean: document.getElementById('monitor_sync_clean').checked,
+                incremental: !document.getElementById('monitor_sync_clean').checked,
                 retries: parseInt(document.getElementById('monitor_retries').value || '3', 10) || 3,
                 list_delay_ms: document.getElementById('monitor_list_delay_ms').value === ''
                     ? 250
@@ -2780,7 +2917,8 @@
             monitorFolderLoading = false;
             document.getElementById('monitor_target_path').value = '';
             document.getElementById('monitor_skip_by_dir_mtime').checked = false;
-            document.getElementById('monitor_incremental').checked = false;
+            document.getElementById('monitor_strm_write_mode').value = 'incremental';
+            document.getElementById('monitor_sync_clean').checked = true;
             document.getElementById('monitor_retries').value = 3;
             document.getElementById('monitor_list_delay_ms').value = 250;
             document.getElementById('monitor_min_file_size_mb').value = 0;
@@ -2861,7 +2999,10 @@
             monitorFolderLoading = false;
             document.getElementById('monitor_target_path').value = task.target_path || '';
             document.getElementById('monitor_skip_by_dir_mtime').checked = !!task.skip_by_dir_mtime;
-            document.getElementById('monitor_incremental').checked = !!task.incremental;
+            document.getElementById('monitor_strm_write_mode').value = task.strm_write_mode === 'full' ? 'full' : 'incremental';
+            document.getElementById('monitor_sync_clean').checked = Object.prototype.hasOwnProperty.call(task, 'sync_clean')
+                ? !!task.sync_clean
+                : !task.incremental;
             document.getElementById('monitor_retries').value = task.retries ?? 3;
             document.getElementById('monitor_list_delay_ms').value = task.list_delay_ms ?? 250;
             document.getElementById('monitor_min_file_size_mb').value = task.min_file_size_mb ?? 0;
@@ -2949,13 +3090,16 @@
             const statusText = running ? '运行中' : (queued ? '已排队' : '待命');
             const scanPath = String(task?.scan_path || '').trim() || '--';
             const targetPath = String(task?.target_path || '').trim() || '--';
-            const modeText = task?.incremental ? '增量刷新' : '全量刷新';
+            const writeModeText = task?.strm_write_mode === 'full' ? '全量重写 STRM' : '增量写入 STRM';
+            const cleanupText = (Object.prototype.hasOwnProperty.call(task || {}, 'sync_clean') ? !!task.sync_clean : !task?.incremental)
+                ? '生成并清理过期 STRM'
+                : '仅生成/更新 STRM';
             const scheduleMinutes = Math.max(0, Number(task?.cron_minutes || 0) || 0);
             const scheduleText = scheduleMinutes > 0
                 ? `每 ${scheduleMinutes} 分钟自动执行一次，下次定时 ${String(nextRun || '计算中')}`
                 : '未开启定时，仅手动运行或通过 Webhook 触发';
             const webhookText = task?.webhook_enabled ? '已启用 Webhook 触发' : '未启用 Webhook';
-            return `状态：${statusText}。该任务会扫描 ${scanPath}，输出到 /strm/${targetPath}，采用 ${modeText} 策略；${scheduleText}；${webhookText}。`;
+            return `状态：${statusText}。该任务会扫描 ${scanPath}，输出到 /strm/${targetPath}，写入模式为 ${writeModeText}，清理策略为 ${cleanupText}；${scheduleText}；${webhookText}。`;
         }
 
         function toggleMonitorTaskIntro(taskName) {

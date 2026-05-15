@@ -2,7 +2,7 @@
             <div class="group-card">
                 <h3 class="group-title mb-2">目录树同步</h3>
                 <div class="text-xs text-slate-400 leading-6">
-                    读取 115 官方目录树 TXT，批量生成本地 `/strm` 文件；日常使用优先选择“联网同步更新”。
+                    读取 115 官方目录树 TXT，生成受管 `.strm`；自动清理只处理过期 `.strm`，字幕、海报、NFO 等刮削元数据需要手动确认后清理。
                 </div>
             </div>
             <div class="bg-slate-800 p-6 rounded-3xl border border-slate-700 shadow-2xl">
@@ -19,9 +19,24 @@
                 </div>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <button onclick="triggerTask(false, false)" class="btn-ctrl bg-sky-600 hover:bg-sky-500 p-5 rounded-2xl font-bold transition-all active:scale-95 shadow-lg text-white">🌐 联网同步更新</button>
+                <button onclick="triggerTask(false, false)" class="btn-ctrl bg-sky-600 hover:bg-sky-500 p-5 rounded-2xl font-bold transition-all active:scale-95 shadow-lg text-white">🌐 联网增量写入</button>
                 <button onclick="triggerTask(true, false)" class="btn-ctrl bg-slate-700 hover:bg-slate-600 p-5 rounded-2xl font-bold transition-all active:scale-95 shadow-lg text-white">🛠 本地调试解析</button>
-                <button onclick="triggerTask(false, true)" class="btn-ctrl border-2 border-red-500/50 text-red-400 hover:bg-red-500/10 p-5 rounded-2xl font-bold transition-all active:scale-95 shadow-lg">🔥 强制全量重刷</button>
+                <button onclick="triggerTask(false, true)" class="btn-ctrl border-2 border-red-500/50 text-red-400 hover:bg-red-500/10 p-5 rounded-2xl font-bold transition-all active:scale-95 shadow-lg">🔥 强制全量重写</button>
+            </div>
+            <div id="strm-orphan-cleanup-card" class="bg-slate-900/75 rounded-3xl border border-slate-800 p-4 shadow-inner space-y-3">
+                <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+                    <div>
+                        <h3 class="group-title mb-1">STRM 清理工具</h3>
+                        <div class="text-xs text-slate-400 leading-6">扫描 `/strm` 下没有 `.strm` 且只包含字幕、海报、NFO 等已知元数据的目录，或仍为空的目录。</div>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                        <button onclick="scanOrphanMetadataDirs()" class="px-4 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">扫描废弃元数据目录</button>
+                        <button id="strm-orphan-delete-btn" onclick="deleteSelectedOrphanMetadataDirs()" class="px-4 py-2.5 rounded-xl bg-red-500/10 border border-red-500/40 text-red-300 hover:bg-red-500 hover:text-white text-sm font-bold btn-disabled" disabled>删除选中</button>
+                    </div>
+                </div>
+                <div id="strm-orphan-summary" class="text-xs text-slate-500">尚未扫描</div>
+                <div id="strm-orphan-list" class="space-y-2"></div>
+                <div id="strm-orphan-manual" class="space-y-2"></div>
             </div>
             <div class="bg-slate-950/80 rounded-3xl border border-slate-800 p-4 shadow-inner">
                 <div class="flex justify-end mb-2">

@@ -64,10 +64,10 @@
                     <h3 class="group-title">4. 目录树同步策略与执行模式</h3>
                     <div class="space-y-4">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <label class="block"><span class="text-xs text-slate-500">写入模式</span>
+                            <label class="block"><span class="text-xs text-slate-500">STRM 写入模式</span>
                                 <select id="sync_mode" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
-                                    <option value="incremental">增量模式</option>
-                                    <option value="full">全量模式</option>
+                                    <option value="incremental">增量写入 STRM</option>
+                                    <option value="full">全量重写 STRM</option>
                                 </select>
                             </label>
                             <label class="block"><span class="text-xs text-slate-500">定时频率 (分钟)</span><input id="cron_hour" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1"></label>
@@ -77,7 +77,7 @@
                                 <input type="checkbox" id="check_hash" class="ui-checkbox"> 开启 MD5 校验（目录树无变动时复用缓存并跳过同步）
                             </label>
                             <label class="flex items-center gap-3 cursor-pointer text-sm hover:text-white transition-colors">
-                                <input type="checkbox" id="sync_clean" class="ui-checkbox"> 自动清理模式 (本地同步删除)
+                                <input type="checkbox" id="sync_clean" class="ui-checkbox"> 清理过期 STRM（不删除字幕、海报、NFO 等刮削元数据）
                             </label>
                         </div>
                     </div>

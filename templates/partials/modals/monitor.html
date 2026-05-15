@@ -51,9 +51,16 @@
                         <button type="button" class="info-dot" onclick="showHelp('开启后会按文件夹修改时间判断是否刷新；修改时间未变化的目录将跳过更新，以减少无效扫描。若你手动删除了本地文件并需要重新生成，请先取消勾选此项再执行任务。')">i</button>
                     </label>
                     <div class="text-xs text-slate-500 pl-8 -mt-2">备注：若本地文件是手动删除后要重新生成，请先取消勾选此项，再运行任务。</div>
+                    <label class="block">
+                        <span class="text-xs text-slate-500">STRM 写入模式</span>
+                        <select id="monitor_strm_write_mode" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
+                            <option value="incremental">增量写入 STRM</option>
+                            <option value="full">全量重写 STRM</option>
+                        </select>
+                    </label>
                     <label class="flex items-center gap-3 cursor-pointer text-sm">
-                        <input type="checkbox" id="monitor_incremental" class="ui-checkbox">
-                        增量模式 (开启后不删除本地多余文件)
+                        <input type="checkbox" id="monitor_sync_clean" class="ui-checkbox">
+                        清理过期 STRM（不删除字幕、海报、NFO 等刮削元数据）
                     </label>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <label class="block">

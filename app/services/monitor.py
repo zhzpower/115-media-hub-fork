@@ -2,32 +2,20 @@ from ..background import submit_background
 from ..core import *  # noqa: F401,F403
 from ..memory import release_process_memory
 from .notify import push_monitor_success_notification
+from .strm_files import delete_managed_strm_file, managed_strm_file_path, remove_empty_parent_dirs
 
-def write_strm_file(target_file: str, url: str) -> bool:
+def write_strm_file(target_file: str, url: str, force: bool = False) -> bool:
     next_url = str(url or "").strip()
     old_content = None
     if os.path.exists(target_file):
         with open(target_file, "r", encoding="utf-8", errors="ignore") as f:
             old_content = str(f.read() or "").strip()
-    if old_content == next_url:
+    if old_content == next_url and not force:
         return False
     os.makedirs(os.path.dirname(target_file), exist_ok=True)
     with open(target_file, "w", encoding="utf-8") as f:
         f.write(next_url)
     return True
-
-
-def remove_empty_parent_dirs(start_dir: str, stop_dir: str) -> int:
-    removed = 0
-    current = start_dir
-    while current.startswith(stop_dir) and current != stop_dir:
-        if os.path.isdir(current) and not os.listdir(current):
-            os.rmdir(current)
-            removed += 1
-            current = os.path.dirname(current)
-            continue
-        break
-    return removed
 
 
 async def mark_cached_dir_as_seen(
@@ -94,6 +82,7 @@ async def run_monitor_task(
         "success_dirs": 0,
     }
     generated_strm_paths: List[str] = []
+    force_strm_rewrite = str(task.get("strm_write_mode", "incremental") or "incremental").strip().lower() == "full"
 
     try:
         await write_monitor_task_header(task, trigger, payload)
@@ -254,9 +243,9 @@ async def run_monitor_task(
                     stats["skipped"] += 1
                     continue
 
-                target_file = os.path.join(STRM_ROOT, item_local_rel + ".strm")
+                target_file = managed_strm_file_path(item_local_rel)
                 strm_url = build_strm_play_url(cfg, item_remote_path, pick_code=item.get("pick_code", ""))
-                changed = await asyncio.to_thread(write_strm_file, target_file, strm_url)
+                changed = await asyncio.to_thread(write_strm_file, target_file, strm_url, force=force_strm_rewrite)
                 if changed:
                     stats["generated"] += 1
                     generated_rel_path = normalize_relative_path(item_local_rel + ".strm")
@@ -291,9 +280,10 @@ async def run_monitor_task(
         await write_monitor_section("清理校正")
         await write_monitor_log(f"清理范围: {start_remote_path}", "info")
         if stats["success_dirs"] == 0:
-            raise RuntimeError("未成功读取任何目录，已停止并跳过清理（避免误删本地文件）")
+            raise RuntimeError("未成功读取任何目录，已停止并跳过过期 STRM 清理（避免误删）")
 
-        if not task["incremental"] and stats["failed_dirs"] == 0:
+        cleanup_enabled = bool(task.get("sync_clean", not task.get("incremental", False)))
+        if cleanup_enabled and stats["failed_dirs"] == 0:
             if start_local_rel == task_root:
                 cursor.execute(
                     """
@@ -317,9 +307,8 @@ async def run_monitor_task(
             stale_files = [row[0] for row in cursor.fetchall()]
             for local_rel_path in stale_files:
                 check_monitor_cancelled()
-                target_file = os.path.join(STRM_ROOT, local_rel_path + ".strm")
-                if os.path.exists(target_file):
-                    os.remove(target_file)
+                target_file = managed_strm_file_path(local_rel_path)
+                if delete_managed_strm_file(local_rel_path):
                     stats["deleted_files"] += 1
                     stats["deleted_dirs"] += remove_empty_parent_dirs(
                         os.path.dirname(target_file), os.path.join(STRM_ROOT, task_root)
@@ -338,8 +327,8 @@ async def run_monitor_task(
                 )
 
         else:
-            if not task["incremental"] and stats["failed_dirs"] > 0:
-                await write_monitor_log("检测到目录读取失败，已自动跳过清理阶段以防误删", "warn")
+            if cleanup_enabled and stats["failed_dirs"] > 0:
+                await write_monitor_log("检测到目录读取失败，已自动跳过过期 STRM 清理以防误删", "warn")
             cursor.execute(
                 """
                 DELETE FROM monitor_files
@@ -360,7 +349,7 @@ async def run_monitor_task(
         conn = None
 
         await write_monitor_section("执行结果")
-        await write_monitor_task_summary(stats)
+        await write_monitor_task_summary(stats, cleanup_enabled=cleanup_enabled)
         try:
             notify_result = await push_monitor_success_notification(
                 cfg=cfg,
@@ -393,12 +382,18 @@ async def run_monitor_task(
         update_monitor_summary("任务完成", f"{task_name} 执行结束")
     except asyncio.CancelledError:
         await write_monitor_section("执行结果")
-        await write_monitor_task_summary(stats)
+        await write_monitor_task_summary(
+            stats,
+            cleanup_enabled=bool(task.get("sync_clean", not task.get("incremental", False))) if "task" in locals() else None,
+        )
         await write_monitor_task_footer(task_name, "已中断")
         update_monitor_summary("任务中断", task_name)
     except Exception as exc:
         await write_monitor_section("执行结果")
-        await write_monitor_task_summary(stats)
+        await write_monitor_task_summary(
+            stats,
+            cleanup_enabled=bool(task.get("sync_clean", not task.get("incremental", False))) if "task" in locals() else None,
+        )
         await write_monitor_log(f"失败原因: {exc}", "error")
         await write_monitor_task_footer(task_name, "执行失败")
         update_monitor_summary("任务失败", str(exc))

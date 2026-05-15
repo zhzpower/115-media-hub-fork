@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from ..core import *  # noqa: F401,F403
+from ..services.strm_files import delete_orphan_metadata_dirs, preview_orphan_metadata_dirs
 
 router = APIRouter()
 
@@ -203,6 +204,18 @@ _M115_G_KTS = [
 _M115_G_KEY_S = [0x29, 0x23, 0x21, 0x5E]
 _M115_G_KEY_L = [120, 6, 173, 76, 51, 134, 93, 24, 76, 1, 63, 70]
 _DEFAULT_115_USER_AGENT = "Mozilla/5.0 115-media-hub"
+
+
+@router.get("/strm/orphan-metadata/preview")
+async def preview_strm_orphan_metadata(request: Request) -> Dict[str, Any]:
+    return await asyncio.to_thread(preview_orphan_metadata_dirs)
+
+
+@router.post("/strm/orphan-metadata/delete")
+async def delete_strm_orphan_metadata(request: Request) -> Dict[str, Any]:
+    data = await request.json()
+    paths = data.get("paths", []) if isinstance(data, dict) else []
+    return await asyncio.to_thread(delete_orphan_metadata_dirs, paths)
 
 
 def _normalize_115_user_agent(value: Any) -> str:

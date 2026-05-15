@@ -1,5 +1,7 @@
-from ..core import *  # noqa: F401,F403
 from http.cookies import SimpleCookie
+
+from ..core import *  # noqa: F401,F403
+from .strm_files import delete_managed_strm_file, managed_strm_file_path
 
 
 def _format_tree_elapsed_seconds(seconds: float) -> str:
@@ -347,10 +349,12 @@ async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
             if can_skip_by_hash:
                 await write_log("ℹ 已开启 MD5 校验：目录树内容无变化时将复用缓存并跳过同步")
             else:
-                await write_log("ℹ 已开启 MD5 校验，但当前为全量模式，跳过策略不生效")
+                await write_log("ℹ 已开启 MD5 校验，但当前为全量重写 STRM，跳过策略不生效")
 
+        write_mode_label = "全量重写 STRM" if cfg.get("sync_mode") == "full" or force_full else "增量写入 STRM"
+        cleanup_mode_label = "开启" if cfg.get("sync_clean", True) else "关闭"
         await write_log(
-            f"━━━━━━━━━━【任务开始 | 目录树文件 | 源 {len(trees)} 个 | 模式 {cfg.get('sync_mode', 'incremental')}】━━━━━━━━━━",
+            f"━━━━━━━━━━【任务开始 | 目录树文件 | 源 {len(trees)} 个 | 写入 {write_mode_label} | 清理过期 STRM {cleanup_mode_label}】━━━━━━━━━━",
             "task-divider",
         )
 
@@ -472,7 +476,7 @@ async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
         await write_log(f"解析完成，共发现 {total_files} 个有效文件")
         if total_files == 0:
             if fetched_tree_count > 0 or local_raw_cache_count > 0 or use_local:
-                await write_log("⚠ 目录树读取成功，但未匹配到可生成文件；本次按成功结束并跳过清理")
+                await write_log("⚠ 目录树读取成功，但未匹配到可生成文件；本次按成功结束并跳过过期 STRM 清理")
                 total_elapsed_seconds = max(0.0, time.perf_counter() - run_started_at)
                 await write_log(
                     f"任务耗时：前置处理 {_format_tree_elapsed_seconds(prefetch_elapsed_seconds)} | 总 {_format_tree_elapsed_seconds(total_elapsed_seconds)}"
@@ -493,7 +497,7 @@ async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
             generate_started_at = time.perf_counter()
 
             for i, rel_path in enumerate(scan_results):
-                target = os.path.join(STRM_ROOT, rel_path + ".strm")
+                target = managed_strm_file_path(rel_path)
                 needs_regenerate = (not os.path.exists(target)) or cfg["sync_mode"] == "full" or force_full
                 if needs_regenerate:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -520,12 +524,9 @@ async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
             stale_file_candidates = len(stale_rows)
             if cfg.get("sync_clean", True):
                 for (dead_path,) in stale_rows:
-                    target = os.path.join(STRM_ROOT, dead_path + ".strm")
-                    if not os.path.exists(target):
-                        continue
                     try:
-                        os.remove(target)
-                        deleted_file_count += 1
+                        if delete_managed_strm_file(dead_path):
+                            deleted_file_count += 1
                     except Exception:
                         delete_failed_file_count += 1
 
@@ -544,7 +545,7 @@ async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
         )
         await write_log(
             (
-                f"清理汇总: 模式 {cleanup_mode_label} | 过期记录 {stale_file_candidates} | 删除文件 {deleted_file_count} | "
+                f"清理汇总: 清理过期 STRM {cleanup_mode_label} | 过期记录 {stale_file_candidates} | 删除 STRM {deleted_file_count} | "
                 f"删除失败 {delete_failed_file_count} | 索引清理 {stale_index_count}"
             )
         )

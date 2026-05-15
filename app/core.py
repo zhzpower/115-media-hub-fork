@@ -860,13 +860,22 @@ def normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
     min_file_size_mb = float(task.get("min_file_size_mb", 0) or 0)
     delay_seconds = int(task.get("delay_seconds", 0) or 0)
     cron_minutes = int(task.get("cron_minutes", 0) or 0)
+    if "sync_clean" in task:
+        sync_clean = normalize_bool(task.get("sync_clean"), default=True)
+    else:
+        sync_clean = not normalize_bool(task.get("incremental", False), default=False)
+    strm_write_mode = str(task.get("strm_write_mode", "incremental") or "incremental").strip().lower()
+    if strm_write_mode not in {"incremental", "full"}:
+        strm_write_mode = "incremental"
     return {
         "name": name,
         "webhook_enabled": normalize_bool(task.get("webhook_enabled", False), default=False),
         "scan_path": normalize_remote_path(task.get("scan_path", "")),
         "target_path": normalize_relative_path(task.get("target_path", "")),
         "skip_by_dir_mtime": normalize_bool(task.get("skip_by_dir_mtime", False), default=False),
-        "incremental": normalize_bool(task.get("incremental", False), default=False),
+        "strm_write_mode": strm_write_mode,
+        "sync_clean": sync_clean,
+        "incremental": not sync_clean,
         "retries": retries,
         "list_delay_ms": max(0, list_delay_ms),
         "min_file_size_mb": max(0, min_file_size_mb),
@@ -5995,6 +6004,7 @@ async def write_subscription_section(title: str) -> None:
 
 
 async def write_monitor_task_header(task: Dict[str, Any], trigger: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    write_mode_label = "全量重写 STRM" if task.get("strm_write_mode") == "full" else "增量生成/更新 STRM"
     await write_monitor_log(
         f"━━━━━━━━━━【任务开始 | {task['name']} | {format_monitor_trigger(trigger)}】━━━━━━━━━━",
         "task-divider",
@@ -6004,7 +6014,11 @@ async def write_monitor_task_header(task: Dict[str, Any], trigger: str, payload:
         "info",
     )
     await write_monitor_log(
-        f"模式: {'增量' if task['incremental'] else '全量'} | 目录时间检查: {format_monitor_bool(task['skip_by_dir_mtime'])}",
+        (
+            f"写入: {write_mode_label} | "
+            f"清理过期 STRM: {format_monitor_bool(task.get('sync_clean', not task.get('incremental', False)))} | "
+            f"目录时间检查: {format_monitor_bool(task['skip_by_dir_mtime'])}"
+        ),
         "info",
     )
     if payload and trigger in ("webhook", "resource"):
@@ -6032,13 +6046,14 @@ async def write_monitor_task_footer(task_name: str, status: str, level: str = "t
     )
 
 
-async def write_monitor_task_summary(stats: Dict[str, int]) -> None:
+async def write_monitor_task_summary(stats: Dict[str, int], cleanup_enabled: Optional[bool] = None) -> None:
     await write_monitor_log(
         f"生成汇总: 新增/更新 {stats['generated']} | 跳过文件 {stats['skipped']} | 跳过目录 {stats['skipped_dirs']} | 失败目录 {stats['failed_dirs']}",
         "info",
     )
+    cleanup_label = "未配置" if cleanup_enabled is None else format_monitor_bool(bool(cleanup_enabled))
     await write_monitor_log(
-        f"清理汇总: 删除文件 {stats['deleted_files']} | 删除目录 {stats['deleted_dirs']}",
+        f"清理汇总: 清理过期 STRM {cleanup_label} | 删除 STRM {stats['deleted_files']} | 删除空目录 {stats['deleted_dirs']}",
         "info",
     )
 
