@@ -491,7 +491,13 @@ API_115_LIST_CACHE_MAX_ROWS = max(
     200,
     int(os.environ.get("API_115_LIST_CACHE_MAX_ROWS", 2000) or 2000),
 )
-COOKIE_HEALTH_PROVIDERS: Tuple[str, ...] = ("115", "quark")
+COOKIE_HEALTH_PROVIDERS: Tuple[str, ...] = ("115", "quark")  # Will be dynamically built after providers load
+
+def get_cookie_health_providers() -> Tuple[str, ...]:
+    try:
+        return tuple(p.name for p in list_all() if p.config_keys)
+    except Exception:
+        return ("115", "quark")
 COOKIE_HEALTH_MIN_REFRESH_INTERVAL_SECONDS = max(
     5,
     min(600, int(os.environ.get("COOKIE_HEALTH_MIN_REFRESH_INTERVAL_SECONDS", 20) or 20)),
@@ -908,15 +914,22 @@ def normalize_provider_enabled_config(cfg: Dict[str, Any]) -> Dict[str, bool]:
 
 
 def normalize_subscription_provider(value: Any, fallback: str = "115") -> str:
-    normalized_fallback = str(fallback or "115").strip().lower()
     normalized = str(value or "").strip().lower()
-    if normalized in ("115", "quark"):
-        return normalized
+    # First try exact match in registry
+    p = _get_provider_or_none(normalized)
+    if p:
+        return p.name
+    # Try by link_type
+    p = get_by_link_type(normalized)
+    if p:
+        return p.name
+    # Backward compat aliases
     if normalized in ("115share", "magnet", "magnet115"):
         return "115"
     if normalized in ("pan.quark", "quarkshare", "quark_pan"):
         return "quark"
-    return "quark" if normalized_fallback == "quark" else "115"
+    normalized_fallback = str(fallback or "115").strip().lower()
+    return normalized_fallback if _get_provider_or_none(normalized_fallback) else "115"
 
 
 def normalize_subscription_min_file_size_mb(value: Any, fallback: float = 0.0) -> float:
@@ -2624,12 +2637,21 @@ def build_resource_channel_profile(
 
 def normalize_resource_provider_filter(value: Any) -> str:
     normalized = str(value or "all").strip().lower()
-    if normalized in ("115", "magnet", "quark", "all"):
-        return normalized
+    if normalized == "all":
+        return "all"
+    if normalized == "magnet":
+        return "magnet"
+    p = _get_provider_or_none(normalized)
+    if p:
+        return p.name
+    p = get_by_link_type(normalized)
+    if p:
+        return p.name
+    # Backward compat
     if normalized == "115share":
         return "115"
-    if normalized == "magnet115":
-        return "magnet"
+    if normalized in ("quarkshare", "pan.quark"):
+        return "quark"
     return "all"
 
 
@@ -3799,7 +3821,7 @@ def sync_cookie_health_configured(cfg: Optional[Dict[str, Any]] = None, trigger:
     active_cfg = cfg or get_config()
     changed = False
     with cookie_health_lock:
-        for provider in COOKIE_HEALTH_PROVIDERS:
+        for provider in get_cookie_health_providers():
             entry = _ensure_cookie_health_entry_locked(provider)
             if not entry:
                 continue
@@ -3981,7 +4003,7 @@ def build_cookie_health_payload(cfg: Optional[Dict[str, Any]] = None) -> Dict[st
     sync_cookie_health_configured(active_cfg, trigger="payload")
     with cookie_health_lock:
         payload: Dict[str, Any] = {}
-        for provider in COOKIE_HEALTH_PROVIDERS:
+        for provider in get_cookie_health_providers():
             entry = _ensure_cookie_health_entry_locked(provider)
             payload[provider] = {
                 "configured": bool(entry.get("configured", False)),
@@ -4096,16 +4118,16 @@ def _probe_quark_cookie(cookie: str) -> None:
 
 
 def _normalize_cookie_health_providers(providers: Any = None) -> List[str]:
-    raw_items = providers if isinstance(providers, list) else COOKIE_HEALTH_PROVIDERS
+    raw_items = providers if isinstance(providers, list) else get_cookie_health_providers()
     if providers is None:
-        raw_items = list(COOKIE_HEALTH_PROVIDERS)
+        raw_items = list(get_cookie_health_providers())
     normalized: List[str] = []
     for item in raw_items:
         provider = normalize_cookie_health_provider(item)
         if (not provider) or provider in normalized:
             continue
         normalized.append(provider)
-    return normalized or list(COOKIE_HEALTH_PROVIDERS)
+    return normalized or list(get_cookie_health_providers())
 
 
 async def refresh_cookie_health_status(
