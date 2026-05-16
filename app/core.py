@@ -6214,6 +6214,10 @@ from .providers.pansou import (
     request_pansou_search,
     test_pansou_health,
 )
+# 新网盘提供者 —— import 触发 register() 自注册
+import app.providers.tianyi  # noqa: F401
+import app.providers.pan123  # noqa: F401
+import app.providers.aliyun  # noqa: F401
 
 
 
