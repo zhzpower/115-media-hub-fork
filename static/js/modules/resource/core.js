@@ -133,71 +133,37 @@
         }
 
         function getResourceLinkTypeLabel(linkType) {
-            // Static fallback table
-            const staticLabels = {
-                '115share': '115分享', 'quark': '夸克分享', 'magnet': '磁力',
-                'ed2k': '电驴', 'url': '直链', 'aliyun': '阿里云盘', 'baidu': '百度网盘',
-                'xunlei': '迅雷云盘', 'uc': 'UC网盘', '123pan': '123云盘',
-                'tianyi': '天翼云盘', 'pikpak': 'PikPak', 'lanzou': '蓝奏云',
-                'google_drive': 'Google Drive', 'onedrive': 'OneDrive', 'mega': 'MEGA',
-                'unknown': '未知',
+            const normalized = String(linkType || 'unknown').trim().toLowerCase();
+            const map = {
+                magnet: 'Magnet',
+                '115share': '115 分享',
+                ed2k: 'ED2K',
+                quark: '夸克网盘',
+                aliyun: '阿里云盘',
+                baidu: '百度网盘',
+                xunlei: '迅雷网盘',
+                uc: 'UC 网盘',
+                '123pan': '123 网盘',
+                tianyi: '天翼云盘',
+                pikpak: 'PikPak',
+                lanzou: '蓝奏云',
+                google_drive: 'Google Drive',
+                onedrive: 'OneDrive',
+                mega: 'MEGA',
+                link: '直链',
+                unknown: '待识别'
             };
-            const p = getProviderByLinkType(linkType);
-            if (p) return p.label;
-            return staticLabels[linkType] || linkType || '未知';
+            return map[normalized] || normalized || '待识别';
         }
 
         function getResourceProviderByLinkType(linkType) {
-            const p = getProviderByLinkType(linkType);
-            return p ? p.name : '115';
+            const normalized = String(linkType || '').trim().toLowerCase();
+            if (normalized === 'quark') return 'quark';
+            return '115';
         }
 
         function getResourceProviderLabel(provider) {
-            const normalized = normalizeSubscriptionProvider(provider, '115');
-            const p = getProviderByName(normalized);
-            return p ? p.label : normalized;
-        }
-
-        let _providerMeta = [];
-
-        function setProviderMeta(list) {
-            _providerMeta = list || [];
-        }
-
-        function getProviderMeta() {
-            if (_providerMeta.length === 0 && window.providerMeta) {
-                _providerMeta = window.providerMeta;
-            }
-            return _providerMeta;
-        }
-
-        function getEnabledProviders() {
-            return getProviderMeta().filter(p => p.enabled);
-        }
-
-        function getProviderByName(name) {
-            return getProviderMeta().find(p => p.name === name);
-        }
-
-        function getProviderByLinkType(linkType) {
-            if (!linkType) return null;
-            const normalized = String(linkType).trim().toLowerCase();
-            return getProviderMeta().find(p => p.link_type === normalized);
-        }
-
-        function renderProviderFilterButtons() {
-            const container = document.getElementById('resource-provider-filters');
-            if (!container) return;
-            container.querySelectorAll('.provider-filter-dynamic').forEach(el => el.remove());
-            const enabled = getEnabledProviders();
-            enabled.forEach(p => {
-                const btn = document.createElement('button');
-                btn.id = 'resource-provider-filter-' + p.name;
-                btn.className = 'provider-filter-dynamic';
-                btn.onclick = function() { if (typeof setResourceProviderFilter === 'function') setResourceProviderFilter(p.name); };
-                btn.textContent = p.label;
-                container.appendChild(btn);
-            });
+            return normalizeSubscriptionProvider(provider, '115') === 'quark' ? '夸克' : '115';
         }
 
         function normalizeResourceFavoriteDirsPayload(value = {}) {
@@ -315,16 +281,18 @@
             return '全部';
         }
 
-        function resourceItemMatchesProviderFilter(item, filter) {
-            if (filter === 'all') return true;
-            if (filter === 'magnet') return detectResourceLinkTypeByUrl(item.link_url) === 'magnet';
-            const p = getProviderByName(filter);
-            if (p) return detectResourceLinkTypeByUrl(item.link_url) === p.link_type;
-            return false;
+        function resourceItemMatchesProviderFilter(item, providerFilter = resourceProviderFilter) {
+            const normalized = normalizeResourceProviderFilter(providerFilter);
+            if (normalized === 'all') return true;
+            const linkType = getEffectiveResourceLinkType(item);
+            if (normalized === '115') return linkType === '115share';
+            if (normalized === 'magnet') return linkType === 'magnet';
+            if (normalized === 'quark') return linkType === 'quark';
+            return true;
         }
 
         function getResourceFolderApiPrefix(provider) {
-            return normalizeSubscriptionProvider(provider, '115') === 'quark' ? '/resource/quark' : '/resource/115';
+            return '/resource/browse?provider=' + encodeURIComponent(provider);
         }
 
         function getResourceShareApiPrefix(linkType) {
@@ -334,9 +302,13 @@
         }
 
         function isProviderCookieConfigured(provider) {
-            const normalized = normalizeSubscriptionProvider(provider, '115');
-            if (normalized === 'quark') return !!resourceState?.quark_cookie_configured;
-            return !!resourceState?.cookie_configured;
+            const meta = window.providerMeta || [];
+            const p = meta.find(m => m.name === provider);
+            if (!p) return false;
+            const key = 'cookie_configured_' + p.name;
+            if (resourceState && resourceState[key] !== undefined) return resourceState[key];
+            const cookieKey = p.config_keys[0] || 'cookie_' + p.name;
+            return (resourceState && resourceState[cookieKey + '_configured']) || false;
         }
 
         function isLinkTypeCookieConfigured(linkType) {
@@ -3078,8 +3050,6 @@
             renderResourceImportSummary,
             renderResourceImportStepper,
             renderResourceImportBehaviorHint,
-            renderProviderFilterButtons,
-            resourceItemMatchesProviderFilter,
             toggleResourceSection,
             loadMoreResourceChannelItems,
             findResourceItem,
@@ -3096,10 +3066,6 @@
             getCurrentResourceProvider,
             getResourceProviderLabel,
             getResourceProviderByLinkType,
-            getProviderMeta,
-            getEnabledProviders,
-            getProviderByName,
-            getProviderByLinkType,
             getEffectiveResourceLinkType,
             isLinkTypeCookieConfigured,
             isProviderCookieConfigured,

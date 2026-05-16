@@ -583,6 +583,14 @@
             return normalizeSubscriptionProvider(document.getElementById('subscription_provider')?.value || '115', '115');
         }
 
+        function populateSubscriptionProviderSelect() {
+            const select = document.getElementById('subscription_provider');
+            if (!select) return;
+            const meta = window.providerMeta || [];
+            const enabled = meta.filter(p => p.enabled);
+            select.innerHTML = enabled.map(p => '<option value="' + p.name + '">' + p.label + '</option>').join('');
+        }
+
         function getSubscriptionScanRecommendedDefaults(provider = '115') {
             const normalizedProvider = normalizeSubscriptionProvider(provider, '115');
             return { ...(SUBSCRIPTION_SCAN_RECOMMENDED_DEFAULTS[normalizedProvider] || SUBSCRIPTION_SCAN_RECOMMENDED_DEFAULTS['115']) };

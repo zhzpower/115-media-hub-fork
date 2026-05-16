@@ -322,8 +322,9 @@
         }
 
         function getSubscriptionShareLinkPayload() {
-            if (getCurrentSubscriptionProvider() !== '115') {
-                throw new Error('当前网盘提供方不是 115，固定分享链接模式不可用');
+            const _subP = (window.providerMeta || []).find(m => m.name === getCurrentSubscriptionProvider());
+            if (!_subP || !_subP.supports_fixed_share_link) {
+                throw new Error((_subP ? _subP.label : '当前网盘') + ' 不支持固定分享链接模式');
             }
             const linkInput = document.getElementById('subscription_share_link_url');
             const receiveInput = document.getElementById('subscription_share_receive_code');
@@ -589,8 +590,9 @@
         }
 
         async function openSubscriptionShareFolderModal() {
-            if (getCurrentSubscriptionProvider() !== '115') {
-                showToast('Quark 模式不支持固定分享链接目录浏览', { tone: 'warn', duration: 2600, placement: 'top-center' });
+            const _subP = (window.providerMeta || []).find(m => m.name === getCurrentSubscriptionProvider());
+            if (!_subP || !_subP.supports_fixed_share_link) {
+                showToast((_subP ? _subP.label : '当前网盘') + ' 不支持固定分享链接目录浏览', { tone: 'warn', duration: 2600, placement: 'top-center' });
                 return;
             }
             let payload;

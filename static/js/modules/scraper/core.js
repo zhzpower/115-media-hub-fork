@@ -1,5 +1,9 @@
 const SCRAPER_JOB_ACTIVE_STATUSES = new Set(['pending', 'running', 'rollback_running']);
-const SCRAPER_PROVIDER_LABELS = { '115': '115', quark: '夸克' };
+
+function getScraperProviderOptions() {
+    const meta = window.providerMeta || [];
+    return meta.filter(p => p.enabled).map(p => ({ provider: p.name, label: p.label }));
+}
 
 const state = {
     initialized: false,
@@ -73,7 +77,9 @@ function normalizeProvider(value) {
 }
 
 function getProviderLabel(provider = state.provider) {
-    return SCRAPER_PROVIDER_LABELS[normalizeProvider(provider)] || '115';
+    const options = getScraperProviderOptions();
+    const p = options.find(o => o.provider === normalizeProvider(provider));
+    return p ? p.label : (provider === 'quark' ? '夸克' : '115');
 }
 
 function isProviderConfigured(provider = state.provider) {
@@ -413,10 +419,7 @@ function renderProviderTabs() {
     if (!container) return;
     const providers = state.providers.length
         ? state.providers
-        : [
-            { provider: '115', label: '115', configured: false },
-            { provider: 'quark', label: '夸克', configured: false },
-        ];
+        : getScraperProviderOptions().map(p => ({ provider: p.provider, label: p.label, configured: false }));
     container.innerHTML = providers.map((item) => {
         const provider = normalizeProvider(item.provider);
         const active = provider === state.provider;
