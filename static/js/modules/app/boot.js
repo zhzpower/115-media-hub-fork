@@ -114,6 +114,9 @@
                     renderProviderFilterButtons();
                 }
                 const sensitiveMeta = normalizeSensitiveConfigMeta(cfg.sensitive_configured || {});
+                if (typeof renderProviderAuthBlocks === 'function') {
+                    renderProviderAuthBlocks(cfg, sensitiveMeta);
+                }
                 if (typeof setAppMountPoints === 'function') {
                     setAppMountPoints(cfg.mount_points || []);
                 }

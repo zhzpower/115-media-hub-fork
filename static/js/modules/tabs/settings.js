@@ -69,8 +69,6 @@ function collectSettingsPayload({
         'api_115_rate_limit_seconds',
         'api_115_list_cache_ttl_seconds',
         'api_115_download_url_cache_ttl_seconds',
-        'cookie_115',
-        'cookie_quark',
         'sign115_cron_time',
         'tg_proxy_protocol',
         'tg_proxy_host',
@@ -115,6 +113,18 @@ function collectSettingsPayload({
     cfg.tmdb_enabled = !!document.getElementById('tmdb_enabled')?.checked;
     cfg.pansou_enabled = !!document.getElementById('pansou_enabled')?.checked;
     cfg.resource_favorite_dirs = collectResourceFavoriteDirs();
+
+    // Dynamically collect provider cookies
+    const meta = window.providerMeta || [];
+    const providerEnabled = {};
+    meta.forEach(p => {
+        const cookieKey = p.config_keys[0] || 'cookie_' + p.name;
+        const el = document.getElementById(cookieKey);
+        if (el) cfg[cookieKey] = el.value;
+        const enabledEl = document.getElementById('provider_enabled_' + p.name);
+        providerEnabled[p.name] = enabledEl ? enabledEl.checked : p.enabled;
+    });
+    cfg.provider_enabled = providerEnabled;
 
     const rawTmdbCacheTtl = parseInt(document.getElementById('tmdb_cache_ttl_hours')?.value || '', 10);
     cfg.tmdb_cache_ttl_hours = Math.min(720, Math.max(1, Number.isFinite(rawTmdbCacheTtl) ? rawTmdbCacheTtl : 24));
@@ -538,6 +548,90 @@ export function generateWebhookSecret({ showToast } = {}) {
     input.select();
     if (typeof showToast === 'function') {
         showToast('已生成随机密钥，请记得点击“保存全部配置”', { tone: 'success', duration: 3000, placement: 'top-center' });
+    }
+}
+
+function renderProviderAuthBlocks(cfg, sensitiveMeta) {
+    const container = document.getElementById('settings-provider-auth-container');
+    if (!container) return;
+    const meta = window.providerMeta || [];
+    if (!meta.length) return;
+
+    container.innerHTML = meta.map(p => {
+        const enabled = p.enabled;
+        const cookieKey = p.config_keys[0] || 'cookie_' + p.name;
+        const cookieVal = cfg[cookieKey] || '';
+        const hasCookie = cookieVal.length > 0;
+
+        let authHint = '';
+        if (p.auth_type === 'refresh_token') {
+            authHint = '<a href="https://aliyuntoken.vercel.app/" target="_blank" class="text-xs text-blue-400 hover:text-blue-300">获取 refresh_token（手机扫码）</a>';
+        } else if (p.auth_type === 'oauth2') {
+            authHint = '<span class="text-xs text-slate-500">Cookie + OAuth2 自动续期</span>';
+        } else {
+            authHint = '<span class="text-xs text-slate-500">从浏览器复制 Cookie</span>';
+        }
+
+        const tags = [];
+        if (p.supports_share_receive) tags.push('分享转存');
+        if (p.supports_offline) tags.push('离线下载');
+        if (p.supports_strm) tags.push('STRM');
+        const tagsHtml = tags.length ? '<span class="text-xs text-slate-500 ml-2">' + tags.join(' · ') + '</span>' : '';
+
+        return '<div class="provider-auth-block mb-3 bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">' +
+            '<div class="flex items-center justify-between p-3 cursor-pointer" onclick="toggleProviderBlock(\'' + p.name + '\')">' +
+                '<div class="flex items-center gap-3">' +
+                    '<span class="text-sm text-slate-200">' + p.label + '</span>' +
+                    tagsHtml +
+                '</div>' +
+                '<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation()">' +
+                    '<input type="checkbox" id="provider_enabled_' + p.name + '" ' + (enabled ? 'checked' : '') + ' onchange="toggleProviderEnabled(\'' + p.name + '\', this.checked)" class="sr-only peer">' +
+                    '<div class="w-9 h-5 bg-slate-600 rounded-full peer peer-checked:bg-emerald-500/70 peer-focus:ring-2 peer-focus:ring-emerald-400/30 after:content-[\'\'] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>' +
+                '</label>' +
+            '</div>' +
+            '<div id="provider-block-body-' + p.name + '" class="p-3 pt-0 border-t border-slate-700/50' + (enabled ? '' : ' hidden') + '">' +
+                authHint +
+                '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + (p.auth_type === 'refresh_token' ? '粘贴 refresh_token' : '粘贴 ' + p.label + ' Cookie') + '">' + cookieVal + '</textarea>' +
+                '<div class="mt-2 flex items-center gap-2">' +
+                    '<button type="button" onclick="testProviderCookie(\'' + p.name + '\')" class="text-xs text-slate-400 hover:text-slate-200 bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors">测试连接</button>' +
+                    '<span id="provider-health-' + p.name + '" class="text-xs text-slate-500"></span>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+    }).join('');
+}
+
+function toggleProviderBlock(name) {
+    const body = document.getElementById('provider-block-body-' + name);
+    if (body) body.classList.toggle('hidden');
+}
+
+function toggleProviderEnabled(name, checked) {
+    const body = document.getElementById('provider-block-body-' + name);
+    if (body) {
+        if (checked) body.classList.remove('hidden');
+        else body.classList.add('hidden');
+    }
+    window._providerEnabledChanged = true;
+}
+
+async function testProviderCookie(name) {
+    const meta = window.providerMeta || [];
+    const p = meta.find(m => m.name === name);
+    if (!p) return;
+    const cookieKey = p.config_keys[0] || 'cookie_' + name;
+    const el = document.getElementById(cookieKey);
+    const cookie = el ? el.value.trim() : '';
+    const statusEl = document.getElementById('provider-health-' + name);
+    if (statusEl) { statusEl.textContent = '检测中...'; statusEl.className = 'text-xs text-slate-500'; }
+    try {
+        const resp = await window.MediaHubApi.postJson('/test_provider_cookie', { provider: name, cookie: cookie });
+        if (statusEl) {
+            statusEl.textContent = resp && resp.ok ? '✓ 连接成功' : '✗ ' + ((resp && resp.error) || '连接失败');
+            statusEl.className = 'text-xs ' + (resp && resp.ok ? 'text-emerald-400' : 'text-red-400');
+        }
+    } catch (e) {
+        if (statusEl) { statusEl.textContent = '✗ 请求失败'; statusEl.className = 'text-xs text-red-400'; }
     }
 }
 
