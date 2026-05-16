@@ -7,7 +7,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from ..background import submit_background
@@ -891,6 +891,40 @@ async def clear_resource_jobs_endpoint(request: Request) -> Dict[str, Any]:
         return JSONResponse(status_code=400, content={"ok": False, "msg": "清理范围不支持"})
     result = clear_resource_jobs(scope)
     return {"ok": True, **result}
+
+
+@router.get("/resource/browse")
+async def unified_browse(request: Request):
+    from app.providers.registry import get as _registry_get
+
+    provider_name = str(request.query_params.get("provider", "115")).strip()
+    cid = str(request.query_params.get("cid", "0")).strip()
+    p = _registry_get(provider_name)
+    cfg = get_config()
+    cookie = p.get_cookie(cfg)
+    if not cookie:
+        raise HTTPException(status_code=400, detail=f"{p.label} 未配置认证信息")
+    payload = await run_resource_browse_io(p.list_entries_payload, cookie, cid)
+    return JSONResponse(payload)
+
+
+@router.post("/resource/browse/create-folder")
+async def unified_create_folder(request: Request):
+    from app.providers.registry import get as _registry_get
+
+    body = await request.json()
+    provider_name = str(body.get("provider", "")).strip()
+    cid = str(body.get("cid", "0")).strip()
+    name = str(body.get("name", "")).strip()
+    if not provider_name or not name:
+        raise HTTPException(status_code=400, detail="缺少 provider 或 name 参数")
+    p = _registry_get(provider_name)
+    cfg = get_config()
+    cookie = p.get_cookie(cfg)
+    if not cookie:
+        raise HTTPException(status_code=400, detail=f"{p.label} 未配置认证信息")
+    folder = await run_resource_browse_io(p.create_folder, cookie, cid, name)
+    return JSONResponse(folder)
 
 
 @router.get("/resource/115/folders")
