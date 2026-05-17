@@ -598,7 +598,7 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
                     '<div class="w-9 h-5 bg-slate-600 rounded-full peer peer-checked:bg-emerald-500/70 peer-focus:ring-2 peer-focus:ring-emerald-400/30 after:content-[\'\'] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>' +
                 '</label>' +
             '</div>' +
-            '<div id="provider-block-body-' + p.name + '" class="p-3 pt-0 border-t border-slate-700/50' + (enabled ? '' : ' hidden') + '">' +
+            '<div id="provider-block-body-' + p.name + '" class="p-3 pt-0 border-t border-slate-700/50 hidden">' +
                 authHint +
                 '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>' +
                 '<div class="mt-2 flex items-center gap-2">' +
@@ -616,11 +616,6 @@ function toggleProviderBlock(name) {
 }
 
 function toggleProviderEnabled(name, checked) {
-    const body = document.getElementById('provider-block-body-' + name);
-    if (body) {
-        if (checked) body.classList.remove('hidden');
-        else body.classList.add('hidden');
-    }
     window._providerEnabledChanged = true;
 }
 
