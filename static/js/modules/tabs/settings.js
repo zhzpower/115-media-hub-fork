@@ -478,8 +478,10 @@ export async function checkCookiesNow({
     if (typeof setBusy === 'function') setBusy(true);
     if (typeof renderCookieHealthCards === 'function') renderCookieHealthCards();
     try {
+        const meta = window.providerMeta || [];
+        const providers = meta.filter(p => p.enabled !== false).map(p => p.name);
         const data = await window.MediaHubApi.postJson('/settings/cookies/check', {
-            providers: ['115', 'quark'],
+            providers: providers.length ? providers : ['115', 'quark'],
             force: !!force
         });
         if (data?.cookie_health && typeof applyCookieHealthState === 'function') {
