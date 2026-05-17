@@ -5,6 +5,7 @@ import time
 import unicodedata
 
 from ..core import *  # noqa: F401,F403
+from ..providers.registry import get_or_none as get_provider_or_none
 from .monitor import queue_monitor_job
 from .notify import push_subscription_success_notification
 from .resource import cancel_resource_job, run_resource_job
@@ -529,20 +530,17 @@ def _scan_subscription_task_episode_view_payload(task_name: str) -> Dict[str, An
         raise RuntimeError("任务未配置保存路径")
 
     scan_savepath = resolve_subscription_tv_scan_savepath(task, base_savepath) or base_savepath
-    folder_id = ""
-    scan_result: Dict[str, Any] = {}
-    if provider == "quark":
-        cookie_quark = str(cfg.get("cookie_quark", "")).strip()
-        if not cookie_quark:
-            raise RuntimeError("请先在参数配置页填写 Quark Cookie")
-        folder_id = ensure_quark_folder_id_by_path(cookie_quark, scan_savepath)
-        scan_result = _scan_quark_existing_tv_episodes(cookie_quark, folder_id, task)
-    else:
-        cookie_115 = str(cfg.get("cookie_115", "")).strip()
-        if not cookie_115:
-            raise RuntimeError("请先在参数配置页填写 115 Cookie")
-        folder_id = ensure_115_folder_id_by_path(cookie_115, scan_savepath)
-        scan_result = _scan_115_existing_tv_episodes(cookie_115, folder_id, task)
+    p = get_provider_or_none(provider)
+    if not p:
+        raise RuntimeError(f"不支持的网盘提供者: {provider}")
+    if not p.supports_subscription:
+        raise RuntimeError(f"{p.label} 不支持订阅功能")
+
+    cookie = p.get_cookie(cfg)
+    if not cookie:
+        raise RuntimeError(f"请先在参数配置页填写 {p.label} Cookie")
+    folder_id = p.ensure_folder_id_by_path(cookie, scan_savepath)
+    scan_result = _scan_provider_existing_tv_episodes(p, cookie, folder_id, task)
 
     scan_episodes = scan_result.get("episodes", []) if isinstance(scan_result.get("episodes"), list) else []
     existing_episodes = sorted(
@@ -981,8 +979,6 @@ def _load_subscription_cached_search_items(
     limit_per_query: int = 0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     provider = normalize_subscription_provider(task.get("provider", "115"), fallback="115")
-    if provider not in {"115", "quark"}:
-        return [], {"cached_items": 0, "cache_queries": 0, "cache_errors": 0}
 
     cfg = get_config()
     sources = [normalize_resource_source(source or {}) for source in cfg.get("resource_sources", []) if source.get("enabled")]
@@ -1057,7 +1053,7 @@ async def find_subscription_task_match_candidate_by_search(
     total_episodes: int = 0,
 ) -> Dict[str, Any]:
     provider = normalize_subscription_provider(task.get("provider", "115"), fallback="115")
-    title_first_search_enabled = provider in {"115", "quark"}
+    title_first_search_enabled = True
     search_identity_mode = "link" if title_first_search_enabled else "message"
     trigger_mode = str(trigger or "").strip().lower()
     incremental_search_enabled = trigger_mode == "cron"
