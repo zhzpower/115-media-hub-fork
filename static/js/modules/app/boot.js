@@ -124,6 +124,9 @@
                 if (typeof renderProviderAuthBlocks === 'function') {
                     renderProviderAuthBlocks(cfg, sensitiveMeta);
                 }
+                if (typeof renderMagnetProviderSetting === 'function') {
+                    renderMagnetProviderSetting(cfg);
+                }
                 if (typeof renderCookieHealthBar === 'function') {
                     renderCookieHealthBar(cfg.cookie_health || {});
                 }

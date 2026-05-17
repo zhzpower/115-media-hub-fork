@@ -184,6 +184,11 @@
         }
 
         function getResourceProviderByLinkType(linkType) {
+            if (linkType === 'magnet') {
+                const el = document.getElementById('default_magnet_provider');
+                const name = el ? el.value : '115';
+                return name !== 'ask' ? name : '115';
+            }
             const p = getProviderByLinkType(linkType);
             return p ? p.name : '115';
         }
@@ -1077,7 +1082,13 @@
             const linkType = getEffectiveResourceLinkType(item);
             if (!String(item?.link_url || '').trim()) return '暂无可导入链接';
             if (isResourceShareLinkType(linkType)) return `转存到${getResourceProviderLabel(getResourceProviderByLinkType(linkType))}`;
-            if (linkType === 'magnet') return '下载到 115';
+            if (linkType === 'magnet') {
+                const el = document.getElementById('default_magnet_provider');
+                const name = el ? el.value : '115';
+                if (name === 'ask') return '下载磁力链接';
+                const p = getProviderByName(name);
+                return '下载到 ' + (p ? p.label : '115网盘');
+            }
             return '当前不可导入';
         }
 
