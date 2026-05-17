@@ -53,7 +53,7 @@ class Pan123Provider(CloudProvider):
     def list_entries_payload(self, cookie, cid="0", folders_only=False):
         data = self._api_call(
             cookie, "GET",
-            f"https://www.123pan.com/api/file/list/new?dirID={cid or '0'}&page=1&size=200",
+            f"https://www.123pan.com/a/api/file/list/new?dirID={cid or '0'}&page=1&size=200",
         )
         entries = []
         items = data.get("data", {}).get("infoList", [])
@@ -88,7 +88,7 @@ class Pan123Provider(CloudProvider):
     def create_folder(self, cookie, cid="0", folder_name=""):
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/api/file/upload/mkdir",
+            "https://www.123pan.com/a/api/file/upload/mkdir",
             json={"driveId": 0, "dirId": int(cid or 0), "name": folder_name},
         )
         return {"cid": str(data.get("data", {}).get("dirId", "")), "name": folder_name}
@@ -129,7 +129,7 @@ class Pan123Provider(CloudProvider):
     def list_share_entries(self, cookie, share_payload, cid="0", offset=0, limit=200):
         share_code = share_payload["share_code"]
         receive_code = share_payload.get("receive_code", "")
-        url = f"https://www.123pan.com/api/share/info?shareKey={share_code}"
+        url = f"https://www.123pan.com/a/api/share/info?shareKey={share_code}"
         if receive_code:
             url += f"&sharePwd={receive_code}"
         data = self._api_call(cookie, "GET", url)
@@ -178,7 +178,7 @@ class Pan123Provider(CloudProvider):
 
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/api/share/save",
+            "https://www.123pan.com/a/api/share/save",
             json={
                 "shareKey": share_code,
                 "sharePwd": receive_code,
@@ -192,7 +192,7 @@ class Pan123Provider(CloudProvider):
     def submit_offline_task(self, cookie, resource_url, folder_id="0"):
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/api/offline/download",
+            "https://www.123pan.com/a/api/offline/download",
             json={"url": resource_url, "dirId": int(folder_id or 0)},
             timeout=30,
         )
@@ -200,7 +200,7 @@ class Pan123Provider(CloudProvider):
 
     def probe_connectivity(self, cookie):
         try:
-            self._api_call(cookie, "GET", "https://www.123pan.com/api/user/info")
+            self._api_call(cookie, "GET", "https://www.123pan.com/a/api/user/info")
             return True
         except Exception as e:
             logging.warning(f"123云盘连接检测失败: {e}")
@@ -209,7 +209,7 @@ class Pan123Provider(CloudProvider):
     def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/api/file/rename",
+            "https://www.123pan.com/a/api/file/rename",
             json={"fileId": int(entry_id), "fileName": new_name.strip()},
         )
         return {"ok": True, "id": entry_id, "name": new_name}
@@ -217,7 +217,7 @@ class Pan123Provider(CloudProvider):
     def move_entries(self, cookie, entry_ids, target_id, source_id=""):
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/api/file/mod_pid",
+            "https://www.123pan.com/a/api/file/mod_pid",
             json={
                 "fileIdList": [int(eid) for eid in entry_ids],
                 "toDirId": int(target_id) if target_id != "0" else 0,
@@ -228,7 +228,7 @@ class Pan123Provider(CloudProvider):
     def copy_entries(self, cookie, entry_ids, target_id, source_id=""):
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/api/file/copy",
+            "https://www.123pan.com/a/api/file/copy",
             json={
                 "fileIdList": [int(eid) for eid in entry_ids],
                 "toDirId": int(target_id) if target_id != "0" else 0,
@@ -239,7 +239,7 @@ class Pan123Provider(CloudProvider):
     def delete_entries(self, cookie, entry_ids, parent_id=""):
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/api/file/trash",
+            "https://www.123pan.com/a/api/file/trash",
             json={"fileIdList": [int(eid) for eid in entry_ids]},
         )
         return {"ok": True, "ids": entry_ids}
