@@ -21,6 +21,11 @@ class CloudProvider(ABC):
     supports_fixed_share_link: bool = False
     supports_strm: bool = False
     supports_monitor: bool = False
+    # NEW — file operations
+    supports_rename: bool = False
+    supports_move: bool = False
+    supports_copy: bool = False
+    supports_delete: bool = False
 
     # === 限流 ===
     rate_limit_seconds: float = 0.0
@@ -73,6 +78,19 @@ class CloudProvider(ABC):
 
     def resolve_download_url(self, cookie: str, file_id: str) -> str:
         raise NotImplementedError(f"{self.label} 不支持 STRM 直链")
+
+    # === 文件操作（可选，子类按能力覆写） ===
+    def rename_entry(self, cookie: str, entry_id: str, new_name: str, parent_id: str = "") -> Dict[str, Any]:
+        raise NotImplementedError(f"{self.label} 不支持重命名")
+
+    def move_entries(self, cookie: str, entry_ids: List[str], target_id: str, source_id: str = "") -> Dict[str, Any]:
+        raise NotImplementedError(f"{self.label} 不支持移动")
+
+    def copy_entries(self, cookie: str, entry_ids: List[str], target_id: str, source_id: str = "") -> Dict[str, Any]:
+        raise NotImplementedError(f"{self.label} 不支持复制")
+
+    def delete_entries(self, cookie: str, entry_ids: List[str], parent_id: str = "") -> Dict[str, Any]:
+        raise NotImplementedError(f"{self.label} 不支持删除")
 
     # === 限流工具 ===
     def throttle(self) -> None:
