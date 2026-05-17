@@ -1389,6 +1389,10 @@ class Pan115Provider(CloudProvider):
     supports_fixed_share_link = True
     supports_strm = True
     supports_monitor = True
+    supports_rename = True
+    supports_move = True
+    supports_copy = True
+    supports_delete = True
     rate_limit_seconds = 0.35
 
     def list_entries_payload(self, cookie, cid="0", folders_only=False):
@@ -1471,6 +1475,18 @@ class Pan115Provider(CloudProvider):
 
     def resolve_download_url(self, cookie, file_id):
         raise NotImplementedError  # STRM 后续实现
+
+    def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
+        return rename_115_entry(cookie, entry_id, new_name, parent_id)
+
+    def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+        return move_115_entries(cookie, entry_ids, target_id, source_id)
+
+    def copy_entries(self, cookie, entry_ids, target_id, source_id=""):
+        return copy_115_entries(cookie, entry_ids, target_id, source_id)
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        return delete_115_entries(cookie, entry_ids, parent_id)
 
 
 register(Pan115Provider())
