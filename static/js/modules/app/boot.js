@@ -169,9 +169,9 @@
                     const cookieKey = p.config_keys[0] || ('cookie_' + p.name);
                     dynamicCookieConfigured['cookie_configured_' + p.name] = !!sensitiveMeta[cookieKey];
                 });
+                window._appConfig = cfg;
                 const resourceStateUpdates = {
                     ...resourceState,
-                    config: cfg,
                     sources: cfg.resource_sources || [],
                     quick_links: cfg.resource_quick_links || [],
                     favorite_dirs: cfg.resource_favorite_dirs || dynamicFavDirs,

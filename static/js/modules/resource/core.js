@@ -185,7 +185,7 @@
 
         function getResourceProviderByLinkType(linkType) {
             if (linkType === 'magnet') {
-                const cfg = resourceState.config || {};
+                const cfg = window._appConfig || {};
                 const providerName = cfg.default_magnet_provider || '115';
                 if (providerName !== 'ask') return providerName;
                 return '115'; // fallback for ask mode
@@ -1084,7 +1084,7 @@
             if (!String(item?.link_url || '').trim()) return '暂无可导入链接';
             if (isResourceShareLinkType(linkType)) return `转存到${getResourceProviderLabel(getResourceProviderByLinkType(linkType))}`;
             if (linkType === 'magnet') {
-                const cfg = resourceState.config || {};
+                const cfg = window._appConfig || {};
                 const providerName = cfg.default_magnet_provider || '115';
                 if (providerName === 'ask') return '下载磁力链接';
                 const p = getProviderByName(providerName);

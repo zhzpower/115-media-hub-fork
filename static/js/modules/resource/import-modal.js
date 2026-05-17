@@ -119,7 +119,7 @@
             const magnetProviderSelector = document.getElementById('resource-magnet-provider-selector');
             if (magnetProviderSelector) {
                 if (importMode && currentLinkType === 'magnet') {
-                    const cfg = resourceState.config || {};
+                    const cfg = window._appConfig || {};
                     const magnetMode = cfg.default_magnet_provider || '115';
                     if (magnetMode === 'ask') {
                         const meta = window.providerMeta || [];
@@ -316,7 +316,7 @@
                 const currentLinkType = getEffectiveResourceLinkType(selectedResourceItem);
                 const currentProvider = getCurrentResourceProvider();
                 const currentProviderLabel = getResourceProviderLabel(currentProvider);
-                const cfg = resourceState.config || {};
+                const cfg = window._appConfig || {};
                 const magnetMode = cfg.default_magnet_provider || '115';
                 let magnetProvider = magnetMode;
                 if (magnetMode === 'ask') {
