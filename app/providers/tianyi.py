@@ -18,6 +18,10 @@ class TianyiProvider(CloudProvider):
     supports_subscription = True
     supports_offline = False
     supports_fixed_share_link = True
+    supports_rename = True
+    supports_move = True
+    supports_copy = True
+    supports_delete = True
 
     def __init__(self):
         super().__init__()
@@ -229,6 +233,85 @@ class TianyiProvider(CloudProvider):
         except Exception as e:
             logging.warning(f"天翼云盘连接检测失败: {e}")
             return False
+
+    def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
+        """重命名文件/文件夹"""
+        self.throttle()
+        resp = requests.post(
+            "https://api.cloud.189.cn/open/file/renameFile.action",
+            headers=self._api_headers(cookie),
+            data={
+                "fileId": str(entry_id),
+                "destFileName": str(new_name),
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("res_code") != 0:
+            raise RuntimeError(f"天翼云盘重命名失败: {data.get('res_msg', '')}")
+        return {"ok": True, "id": str(entry_id), "name": str(new_name)}
+
+    def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+        """移动文件/文件夹（天翼云盘仅支持单文件移动，逐个调用）"""
+        entry_ids = [str(e) for e in entry_ids]
+        target_id = str(target_id or "0")
+        self.throttle()
+        for eid in entry_ids:
+            resp = requests.post(
+                "https://api.cloud.189.cn/open/file/moveFile.action",
+                headers=self._api_headers(cookie),
+                data={
+                    "fileId": eid,
+                    "destParentFolderId": target_id,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("res_code") != 0:
+                raise RuntimeError(f"天翼云盘移动失败: {data.get('res_msg', '')}")
+        return {"ok": True, "ids": entry_ids, "target_cid": target_id}
+
+    def copy_entries(self, cookie, entry_ids, target_id, source_id=""):
+        """复制文件/文件夹（天翼云盘仅支持单文件复制，逐个调用）"""
+        entry_ids = [str(e) for e in entry_ids]
+        target_id = str(target_id or "0")
+        self.throttle()
+        for eid in entry_ids:
+            resp = requests.post(
+                "https://api.cloud.189.cn/open/file/copyFile.action",
+                headers=self._api_headers(cookie),
+                data={
+                    "fileId": eid,
+                    "destParentFolderId": target_id,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("res_code") != 0:
+                raise RuntimeError(f"天翼云盘复制失败: {data.get('res_msg', '')}")
+        return {"ok": True, "ids": entry_ids, "target_cid": target_id}
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        """删除文件/文件夹"""
+        entry_ids = [str(e) for e in entry_ids]
+        self.throttle()
+        for eid in entry_ids:
+            resp = requests.post(
+                "https://api.cloud.189.cn/open/file/deleteFile.action",
+                headers=self._api_headers(cookie),
+                data={
+                    "fileId": eid,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("res_code") != 0:
+                raise RuntimeError(f"天翼云盘删除失败: {data.get('res_msg', '')}")
+        return {"ok": True, "ids": entry_ids}
 
 
 register(TianyiProvider())
