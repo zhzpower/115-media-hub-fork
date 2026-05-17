@@ -16,6 +16,10 @@ class Pan123Provider(CloudProvider):
     supports_subscription = True
     supports_offline = True
     supports_fixed_share_link = True
+    supports_rename = True
+    supports_move = True
+    supports_copy = True
+    supports_delete = True
 
     def _headers(self, cookie: str) -> dict:
         return {
@@ -178,5 +182,42 @@ class Pan123Provider(CloudProvider):
             logging.warning(f"123云盘连接检测失败: {e}")
             return False
 
+    def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
+        data = self._api_call(
+            cookie, "POST",
+            "https://www.123pan.com/api/file/rename",
+            json={"fileId": int(entry_id), "fileName": new_name.strip()},
+        )
+        return {"ok": True, "id": entry_id, "name": new_name}
+
+    def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+        data = self._api_call(
+            cookie, "POST",
+            "https://www.123pan.com/api/file/mod_pid",
+            json={
+                "fileIdList": [int(eid) for eid in entry_ids],
+                "toDirId": int(target_id) if target_id != "0" else 0,
+            },
+        )
+        return {"ok": True, "ids": entry_ids, "target_cid": target_id}
+
+    def copy_entries(self, cookie, entry_ids, target_id, source_id=""):
+        data = self._api_call(
+            cookie, "POST",
+            "https://www.123pan.com/api/file/copy",
+            json={
+                "fileIdList": [int(eid) for eid in entry_ids],
+                "toDirId": int(target_id) if target_id != "0" else 0,
+            },
+        )
+        return {"ok": True, "ids": entry_ids, "target_cid": target_id}
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        data = self._api_call(
+            cookie, "POST",
+            "https://www.123pan.com/api/file/trash",
+            json={"fileIdList": [int(eid) for eid in entry_ids]},
+        )
+        return {"ok": True, "ids": entry_ids}
 
 register(Pan123Provider())
