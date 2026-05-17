@@ -13,7 +13,7 @@ class Pan123Provider(CloudProvider):
     name = "123pan"
     label = "123云盘"
     link_type = "123pan"
-    auth_type = "cookie"
+    auth_type = "password"
     config_keys = ["123pan_username", "123pan_password"]
     supports_subscription = True
     supports_offline = True

@@ -133,6 +133,11 @@ function collectSettingsPayload({
         const cookieKey = p.config_keys[0] || 'cookie_' + p.name;
         const el = document.getElementById(cookieKey);
         if (el) cfg[cookieKey] = el.value;
+        const passwordKey = p.config_keys[1] || '';
+        if (passwordKey) {
+            const pwEl = document.getElementById(passwordKey);
+            if (pwEl) cfg[passwordKey] = pwEl.value;
+        }
         const enabledEl = document.getElementById('provider_enabled_' + p.name);
         providerEnabled[p.name] = enabledEl ? enabledEl.checked : p.enabled;
     });
@@ -565,14 +570,23 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
     container.innerHTML = meta.map(p => {
         const enabled = p.enabled;
         const cookieKey = p.config_keys[0] || 'cookie_' + p.name;
-        const isConfigured = !!sm[cookieKey];
-        const placeholder = p.auth_type === 'refresh_token' ? '粘贴 refresh_token' : '粘贴 ' + p.label + ' Cookie';
+        const passwordKey = p.config_keys[1] || '';
+        const isConfigured = p.auth_type === 'password'
+            ? (!!sm[cookieKey] && !!sm[passwordKey])
+            : !!sm[cookieKey];
+        const placeholder = p.auth_type === 'refresh_token'
+            ? '粘贴 refresh_token'
+            : p.auth_type === 'password'
+            ? '输入 ' + p.label + ' 账号'
+            : '粘贴 ' + p.label + ' Cookie';
 
         let authHint = '';
         if (p.auth_type === 'refresh_token') {
             authHint = '<a href="https://aliyuntoken.vercel.app/" target="_blank" class="text-xs text-blue-400 hover:text-blue-300">获取 refresh_token（手机扫码）</a>';
         } else if (p.auth_type === 'oauth2') {
             authHint = '<span class="text-xs text-slate-500">Cookie + OAuth2 自动续期</span>';
+        } else if (p.auth_type === 'password') {
+            authHint = '<span class="text-xs text-slate-500">账号密码登录，自动获取 Token</span>';
         } else {
             authHint = '<span class="text-xs text-slate-500">从浏览器复制 Cookie</span>';
         }
@@ -601,7 +615,10 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
             '</div>' +
             '<div id="provider-block-body-' + p.name + '" class="p-3 pt-0 border-t border-slate-700/50 hidden">' +
                 authHint +
-                '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>' +
+                (p.auth_type === 'password'
+                    ? ('<input id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="' + placeholder + '">' +
+                       '<input id="' + passwordKey + '" type="password" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 密码">')
+                    : '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>') +
                 '<div class="mt-2 flex items-center gap-2">' +
                     '<button type="button" onclick="testProviderCookie(\'' + p.name + '\')" class="text-xs text-slate-400 hover:text-slate-200 bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors">健康检查</button>' +
                     '<span id="provider-health-' + p.name + '" class="text-xs text-slate-500"></span>' +
