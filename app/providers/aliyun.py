@@ -27,6 +27,10 @@ class AliyunProvider(CloudProvider):
     supports_subscription = True
     supports_offline = False
     supports_fixed_share_link = True
+    supports_rename = True
+    supports_move = True
+    supports_copy = True
+    supports_delete = True
 
     def __init__(self):
         super().__init__()
@@ -441,6 +445,49 @@ class AliyunProvider(CloudProvider):
         except Exception as e:
             logging.warning(f"阿里云盘连接检测失败: {e}")
             return False
+
+    def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
+        drive_id = self._resolve_drive_id(cookie)
+        body = {
+            "drive_id": drive_id,
+            "file_id": str(entry_id).strip(),
+            "name": str(new_name).strip(),
+        }
+        return self._api_post(cookie, f"{ALIYUN_API_BASE}/v3/file/update", body)
+
+    def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+        drive_id = self._resolve_drive_id(cookie)
+        target_pid = self._normalize_cid(target_id)
+        for eid in entry_ids:
+            body = {
+                "drive_id": drive_id,
+                "file_id": str(eid).strip(),
+                "to_parent_file_id": target_pid,
+            }
+            self._api_post(cookie, f"{ALIYUN_API_BASE}/v3/file/move", body)
+        return {"ok": True, "ids": entry_ids, "target_cid": target_id}
+
+    def copy_entries(self, cookie, entry_ids, target_id, source_id=""):
+        drive_id = self._resolve_drive_id(cookie)
+        target_pid = self._normalize_cid(target_id)
+        for eid in entry_ids:
+            body = {
+                "drive_id": drive_id,
+                "file_id": str(eid).strip(),
+                "to_parent_file_id": target_pid,
+            }
+            self._api_post(cookie, f"{ALIYUN_API_BASE}/v3/file/copy", body)
+        return {"ok": True, "ids": entry_ids, "target_cid": target_id}
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        drive_id = self._resolve_drive_id(cookie)
+        for eid in entry_ids:
+            body = {
+                "drive_id": drive_id,
+                "file_id": str(eid).strip(),
+            }
+            self._api_post(cookie, f"{ALIYUN_API_BASE}/v3/file/delete", body)
+        return {"ok": True, "ids": entry_ids}
 
 
 register(AliyunProvider())
