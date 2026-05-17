@@ -308,6 +308,9 @@ class TianyiProvider(CloudProvider):
                 timeout=30,
             )
             resp.raise_for_status()
+            # 天翼云盘删除成功返回空 body
+            if not resp.text.strip():
+                continue
             data = resp.json()
             if data.get("res_code") != 0:
                 raise RuntimeError(f"天翼云盘删除失败: {data.get('res_msg', '')}")

@@ -39,6 +39,8 @@ class Pan123Provider(CloudProvider):
         else:
             resp = requests.post(url, headers=headers, timeout=timeout, **kwargs)
         resp.raise_for_status()
+        if resp.status_code == 204 or not resp.text.strip():
+            return {}
         data = resp.json()
         code = int(data.get("code", -1) or -1)
         if code != 0 and code != 200:
