@@ -28,6 +28,10 @@ class Pan123Provider(CloudProvider):
     drive_id = 0
     app_version = "3"
     platform = "web"
+    share_url_pattern = re.compile(
+        r"(?:https?://)?(?:www\.)?(?:123pan|123684|123865|123912)\.(?:com|cn)/s/([^/?#\s<>'\"]+)",
+        re.IGNORECASE,
+    )
 
     def __init__(self):
         super().__init__()
@@ -71,6 +75,18 @@ class Pan123Provider(CloudProvider):
                     return token
         return ""
 
+    def _extract_login_uuid(self, payload: dict) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        data = payload.get("data")
+        sources = [data, payload] if isinstance(data, dict) else [payload]
+        for source in sources:
+            for key in ("LoginUuid", "loginUuid", "login_uuid", "uuid", "UUID"):
+                value = str(source.get(key, "") or "").strip()
+                if value:
+                    return value
+        return ""
+
     def _response_code(self, payload: dict) -> int:
         if not isinstance(payload, dict):
             return -1
@@ -90,6 +106,14 @@ class Pan123Provider(CloudProvider):
             if isinstance(items, list):
                 return items
         return []
+
+    def _extract_next_marker(self, payload: dict) -> str:
+        data = self._response_data(payload)
+        for key in ("next", "Next"):
+            value = data.get(key)
+            if value is not None:
+                return str(value)
+        return ""
 
     def _item_value(self, item: dict, *keys, default=""):
         if not isinstance(item, dict):
@@ -144,6 +168,9 @@ class Pan123Provider(CloudProvider):
             "fid": "" if is_dir else item_id,
             "size": size,
             "parent_id": cid or "0",
+            "etag": str(self._item_value(item, "etag", "Etag", "ETag", default="") or ""),
+            "s3key_flag": str(self._item_value(item, "s3keyFlag", "S3KeyFlag", default="") or ""),
+            "drive_id": str(self._item_value(item, "driveId", "DriveId", "driveID", "DriveID", default=self.drive_id) or self.drive_id),
         }
 
     def _extract_created_folder_id(self, payload: dict) -> str:
@@ -159,6 +186,14 @@ class Pan123Provider(CloudProvider):
                 if value is not None and str(value).strip():
                     return str(value).strip()
         return ""
+
+    def _extract_share_key(self, share_url: str) -> str:
+        match = self.share_url_pattern.search(str(share_url or "").strip())
+        if not match:
+            return ""
+        key = urllib.parse.unquote(match.group(1)).strip()
+        key = re.sub(r"\.html?$", "", key, flags=re.IGNORECASE)
+        return key.strip().strip("，。；：！？、,.;!?")
 
     def _ensure_token(self, cfg: dict) -> str:
         """通过账号密码登录获取 auth token，缓存至过期"""
@@ -205,14 +240,19 @@ class Pan123Provider(CloudProvider):
             if not token:
                 raise RuntimeError("123云盘登录失败：未获取到 token")
 
-            self._auth_token = {"token": token, "expires_at": now + 86400, "cache_key": cache_key}
+            self._auth_token = {
+                "token": token,
+                "login_uuid": self._extract_login_uuid(data),
+                "expires_at": now + 86400,
+                "cache_key": cache_key,
+            }
             return token
 
     def get_cookie(self, cfg: dict) -> str:
         return self._ensure_token(cfg)
 
     def _headers(self, token: str) -> dict:
-        return {
+        headers = {
             "Authorization": f"Bearer {token}",
             "platform": self.platform,
             "app-version": self.app_version,
@@ -221,6 +261,11 @@ class Pan123Provider(CloudProvider):
             "Referer": "https://www.123pan.com/",
             "Origin": "https://www.123pan.com",
         }
+        cached = self._auth_token if isinstance(self._auth_token, dict) else {}
+        login_uuid = str(cached.get("login_uuid", "") or "").strip() if cached.get("token") == token else ""
+        if login_uuid:
+            headers["LoginUuid"] = login_uuid
+        return headers
 
     def _api_call(self, token: str, method: str, url: str, **kwargs) -> dict:
         self.throttle()
@@ -330,38 +375,80 @@ class Pan123Provider(CloudProvider):
         return cid
 
     def resolve_share_payload(self, cookie, share_url, raw_text="", receive_code=""):
-        share_code_match = re.search(r'/s/([A-Za-z0-9]+)', str(share_url))
-        if not share_code_match:
+        share_code = self._extract_share_key(share_url)
+        if not share_code:
             raise RuntimeError("无法识别123云盘分享链接")
         return {
-            "share_code": share_code_match.group(1),
+            "share_code": share_code,
             "receive_code": str(receive_code or "").strip(),
+            "url": str(share_url or "").strip(),
         }
 
     def list_share_entries(self, cookie, share_payload, cid="0", offset=0, limit=200):
         share_code = share_payload["share_code"]
         receive_code = share_payload.get("receive_code", "")
-        url = f"https://www.123pan.com/a/api/share/info?shareKey={share_code}"
-        if receive_code:
-            url += f"&sharePwd={receive_code}"
-        data = self._api_call(cookie, "GET", url)
+        normalized_offset = max(0, int(offset or 0))
+        normalized_limit = max(1, min(int(limit or 200), 400))
         entries = []
-        items = self._extract_item_list(data)
-        for item in items:
-            entry = self._normalize_entry(item, cid)
-            entry["share_id"] = share_code
-            entries.append(entry)
+        total_seen = 0
+        page = 1
+        next_marker = "0"
+        total = 0
+        share_title = ""
+        while len(entries) < normalized_limit:
+            data = self._api_call(
+                cookie,
+                "GET",
+                "https://www.123pan.com/b/api/share/get",
+                params={
+                    "limit": "100",
+                    "next": next_marker or "0",
+                    "orderBy": "file_id",
+                    "orderDirection": "desc",
+                    "parentFileId": str(self._int_or_zero(cid)),
+                    "Page": str(page),
+                    "shareKey": share_code,
+                    "SharePwd": receive_code,
+                },
+            )
+            payload_data = self._response_data(data)
+            if not share_title:
+                share_title = str(
+                    payload_data.get("ShareName")
+                    or payload_data.get("shareName")
+                    or payload_data.get("title")
+                    or ""
+                ).strip()
+            if not total:
+                total = self._int_or_zero(payload_data.get("total", payload_data.get("Total", 0)))
+            items = self._extract_item_list(data)
+            if not items:
+                break
+            for item in items:
+                if total_seen < normalized_offset:
+                    total_seen += 1
+                    continue
+                entry = self._normalize_entry(item, cid)
+                entry["share_id"] = share_code
+                entries.append(entry)
+                total_seen += 1
+                if len(entries) >= normalized_limit:
+                    break
+            next_marker = self._extract_next_marker(data)
+            if next_marker == "-1":
+                break
+            page += 1
         folder_count = sum(1 for e in entries if e.get("is_dir"))
         file_count = sum(1 for e in entries if not e.get("is_dir"))
         return {
             "entries": entries,
-            "total": len(entries),
+            "total": total or total_seen or len(entries),
             "summary": {
                 "folder_count": folder_count,
                 "file_count": file_count,
             },
             "share": dict(share_payload),
-            "share_title": str(share_payload.get("title", "") or share_payload.get("share_name", "") or "").strip(),
+            "share_title": share_title or str(share_payload.get("title", "") or share_payload.get("share_name", "") or "").strip(),
         }
 
     def prepare_share_receive(self, cookie, share_payload, cid="0"):
@@ -371,28 +458,44 @@ class Pan123Provider(CloudProvider):
         share_code = receive_payload["share_code"]
         receive_code = receive_payload.get("receive_code", "")
         target_cid = receive_payload.get("target_cid", "0")
-        file_ids = [
-            str(f.get("id", "")).strip()
-            for f in (files or [])
-            if str(f.get("id", "")).strip()
-        ]
+        file_list = []
+        for item in (files or []):
+            if not isinstance(item, dict):
+                continue
+            file_id = str(self._item_value(item, "id", "fileId", "fileID", "FileId", "FileID", default="") or "").strip()
+            if not file_id:
+                continue
+            is_dir = bool(item.get("is_dir")) or str(item.get("type", "")).strip().lower() == "folder"
+            try:
+                size = int(self._item_value(item, "size", "Size", "fileSize", "FileSize", default=0) or 0)
+            except (TypeError, ValueError):
+                size = 0
+            file_list.append({
+                "fileID": self._int_or_zero(file_id),
+                "size": size,
+                "etag": str(self._item_value(item, "etag", "Etag", "ETag", default="") or ""),
+                "type": 1 if is_dir else 0,
+                "parentFileID": self._int_or_zero(target_cid),
+                "fileName": str(self._item_value(item, "name", "fileName", "FileName", default="") or ""),
+                "driveID": self._int_or_zero(self._item_value(item, "drive_id", "driveId", "DriveId", "driveID", "DriveID", default=self.drive_id)),
+            })
+        file_ids = [item["fileID"] for item in file_list if item.get("fileID")]
         if not file_ids:
             raise RuntimeError("未选择要转存的文件")
 
         data = self._api_call(
             cookie, "POST",
-            "https://www.123pan.com/a/api/share/save",
+            "https://www.123pan.com/b/api/restful/goapi/v1/file/copy/save",
             json={
+                "fileList": file_list,
                 "shareKey": share_code,
                 "sharePwd": receive_code,
-                "driveId": self.drive_id,
-                "DriveId": self.drive_id,
-                "dirId": self._int_or_zero(target_cid),
-                "fileIdList": [int(fid) for fid in file_ids],
+                "currentLevel": 0,
+                "superAdmin": None,
             },
             timeout=60,
         )
-        return {"success": True, "count": len(file_ids)}
+        return {"success": True, "count": len(file_ids), "response": data}
 
     def submit_offline_task(self, cookie, resource_url, folder_id="0"):
         raise RuntimeError("123云盘当前账号密码链路不支持 magnet 离线下载，请改用 115 网盘下载磁力资源")

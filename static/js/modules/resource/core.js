@@ -591,7 +591,7 @@
             if (/https?:\/\/(?:pan|yun)\.baidu\.com\/(?:s\/|share\/)/i.test(raw)) return 'baidu';
             if (/https?:\/\/(?:pan|xlpan)\.xunlei\.com\/s\/[a-z0-9]+/i.test(raw)) return 'xunlei';
             if (/https?:\/\/drive\.uc\.cn\/s\/[a-z0-9]+/i.test(raw)) return 'uc';
-            if (/https?:\/\/(?:www\.)?(?:123pan|123684|123865|123912)\.(?:com|cn)\/s\/[a-z0-9]+/i.test(raw)) return '123pan';
+            if (/https?:\/\/(?:www\.)?(?:123pan|123684|123865|123912)\.(?:com|cn)\/s\/[a-z0-9_-]+(?:\.html?)?/i.test(raw)) return '123pan';
             if (/https?:\/\/cloud\.189\.cn\/(?:t\/|web\/share)/i.test(raw)) return 'tianyi';
             if (/https?:\/\/(?:www\.)?(?:mypikpak|pikpak)\.com\/s\/[a-z0-9]+/i.test(raw)) return 'pikpak';
             if (/https?:\/\/(?:www\.)?lanzou[a-z0-9]*\.[a-z.]+\/[a-z0-9]+/i.test(raw)) return 'lanzou';
