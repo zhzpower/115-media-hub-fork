@@ -491,7 +491,32 @@ API_115_LIST_CACHE_MAX_ROWS = max(
     200,
     int(os.environ.get("API_115_LIST_CACHE_MAX_ROWS", 2000) or 2000),
 )
-COOKIE_HEALTH_PROVIDERS: Tuple[str, ...] = ("115", "quark")
+COOKIE_HEALTH_PROVIDERS: Tuple[str, ...] = ("115", "quark")  # Will be dynamically built after providers load
+
+def get_cookie_health_providers() -> Tuple[str, ...]:
+    try:
+        return tuple(p.name for p in list_all() if p.config_keys)
+    except Exception:
+        return ("115", "quark")
+
+
+def is_cookie_health_provider_enabled(cfg: Optional[Dict[str, Any]], provider: str) -> bool:
+    provider_key = normalize_cookie_health_provider(provider)
+    if not provider_key:
+        return False
+    enabled_map = cfg.get("provider_enabled", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(enabled_map, dict):
+        enabled_map = {}
+    return bool(enabled_map.get(provider_key, provider_key in ("115", "quark")))
+
+
+def get_enabled_cookie_health_providers(cfg: Optional[Dict[str, Any]] = None) -> Tuple[str, ...]:
+    active_cfg = cfg or get_config()
+    return tuple(
+        provider
+        for provider in get_cookie_health_providers()
+        if is_cookie_health_provider_enabled(active_cfg, provider)
+    )
 COOKIE_HEALTH_MIN_REFRESH_INTERVAL_SECONDS = max(
     5,
     min(600, int(os.environ.get("COOKIE_HEALTH_MIN_REFRESH_INTERVAL_SECONDS", 20) or 20)),
@@ -775,6 +800,128 @@ def get_api_115_runtime_tuning() -> Dict[str, Any]:
         return dict(_api_115_runtime_tuning)
 
 
+_FALLBACK_PROVIDER_CONFIG_KEYS: Tuple[str, ...] = (
+    "cookie_115",
+    "cookie_quark",
+    "cookie_tianyi",
+    "tianyi_username",
+    "tianyi_password",
+    "123pan_username",
+    "123pan_password",
+    "aliyun_refresh_token",
+)
+
+
+_SETTINGS_CONFIG_KEY_ORDER_AFTER_AUTH: Tuple[str, ...] = (
+    # 1. 网盘认证与签到
+    "cookie_123pan",
+    "provider_enabled",
+    "default_magnet_provider",
+    "resource_favorite_dirs",
+    "sign115_enabled",
+    "sign115_cron_time",
+    # 2. 115 STRM 播放基础配置
+    "strm_proxy_base_url",
+    "api_115_rate_limit_seconds",
+    "api_115_list_cache_ttl_seconds",
+    "api_115_download_url_cache_ttl_seconds",
+    "extensions",
+    "strm_play_mode",
+    # 3. 目录树源配置
+    "trees",
+    # 4. 目录树同步策略与执行模式
+    "sync_mode",
+    "cron_hour",
+    "check_hash",
+    "sync_clean",
+    "last_hash",
+    # 5. TG 订阅源管理
+    "tg_channel_threads",
+    "tg_channel_sync_limit",
+    "resource_sources",
+    "resource_quick_links",
+    # 6. PanSou 盘搜
+    "pansou_enabled",
+    "pansou_base_url",
+    "pansou_username",
+    "pansou_password",
+    "pansou_token",
+    "pansou_src",
+    "pansou_channels",
+    "pansou_plugins",
+    # 7. 网络代理
+    "tg_proxy_enabled",
+    "tg_proxy_protocol",
+    "tg_proxy_host",
+    "tg_proxy_port",
+    # 8. TMDB 元数据增强
+    "tmdb_enabled",
+    "tmdb_api_key",
+    "tmdb_cache_ttl_hours",
+    "tmdb_language",
+    "tmdb_region",
+    # 9. 通知推送
+    "notify_push_enabled",
+    "notify_monitor_enabled",
+    "notify_channel",
+    "notify_wecom_webhook",
+    "notify_wecom_app_corp_id",
+    "notify_wecom_app_agent_id",
+    "notify_wecom_app_secret",
+    "notify_wecom_app_touser",
+    # 10. 后台安全管理
+    "username",
+    "password",
+    "webhook_secret",
+    # 其他页面维护的数据
+    "mount_points",
+    "monitor_tasks",
+    "subscription_tasks",
+)
+
+
+def _provider_config_key_order() -> List[str]:
+    keys: List[str] = []
+    seen: Set[str] = set()
+
+    def add(key: Any) -> None:
+        token = str(key or "").strip()
+        if token and token not in seen:
+            keys.append(token)
+            seen.add(token)
+
+    try:
+        from .providers.registry import list_all as _list_all_p
+        for provider in _list_all_p():
+            for config_key in getattr(provider, "config_keys", []) or []:
+                add(config_key)
+    except Exception:
+        pass
+
+    for config_key in _FALLBACK_PROVIDER_CONFIG_KEYS:
+        add(config_key)
+    return keys
+
+
+def order_config_for_save(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep settings.json readable by matching the settings page order."""
+    source = cfg if isinstance(cfg, dict) else {}
+    ordered: Dict[str, Any] = {}
+
+    def add(key: Any) -> None:
+        token = str(key or "").strip()
+        if token and token in source and token not in ordered:
+            ordered[token] = source[token]
+
+    for key in _provider_config_key_order():
+        add(key)
+    for key in _SETTINGS_CONFIG_KEY_ORDER_AFTER_AUTH:
+        add(key)
+    for key in sorted(str(key) for key in source.keys()):
+        add(key)
+    return ordered
+
+
 def default_config() -> Dict[str, Any]:
     return {
         "username": "admin",
@@ -786,6 +933,14 @@ def default_config() -> Dict[str, Any]:
         "api_115_download_url_cache_ttl_seconds": API_115_DOWNLOAD_URL_CACHE_TTL_SECONDS,
         "cookie_115": "",
         "cookie_quark": "",
+        "cookie_tianyi": "",
+        "tianyi_username": "",
+        "tianyi_password": "",
+        "123pan_username": "",
+        "123pan_password": "",
+        "aliyun_refresh_token": "",
+        "provider_enabled": _build_provider_enabled_defaults(),
+        "default_magnet_provider": "115",
         "sign115_enabled": False,
         "sign115_cron_time": "09:00",
         "tg_proxy_enabled": False,
@@ -892,16 +1047,57 @@ def normalize_subscription_quality_priority(value: Any) -> str:
     return normalized
 
 
-def normalize_subscription_provider(value: Any, fallback: str = "115") -> str:
-    normalized_fallback = str(fallback or "115").strip().lower()
+def _build_provider_enabled_defaults() -> Dict[str, bool]:
+    try:
+        from .providers.registry import list_all as _list_all_p
+        result = {}
+        for p in _list_all_p():
+            result[p.name] = p.name in ("115", "quark")
+        return result
+    except Exception:
+        return {"115": True, "quark": True}
+
+
+def normalize_provider_enabled_config(cfg: Dict[str, Any]) -> Dict[str, bool]:
+    enabled = cfg.get("provider_enabled")
+    if not isinstance(enabled, dict):
+        enabled = {}
+    defaults = _build_provider_enabled_defaults()
+    result = {}
+    for name in defaults:
+        result[name] = bool(enabled.get(name, defaults[name]))
+    for name in enabled:
+        if name not in result:
+            result[name] = bool(enabled[name])
+    return result
+
+
+def normalize_magnet_provider(value="115"):
+    """标准化磁力默认导入网盘；当前仅 115 支持 magnet 离线下载。"""
     normalized = str(value or "").strip().lower()
-    if normalized in ("115", "quark"):
-        return normalized
+    p = _get_provider_or_none(normalized)
+    if p and p.supports_offline:
+        return p.name
+    return "115"
+
+
+def normalize_subscription_provider(value: Any, fallback: str = "115") -> str:
+    normalized = str(value or "").strip().lower()
+    # First try exact match in registry
+    p = _get_provider_or_none(normalized)
+    if p:
+        return p.name
+    # Try by link_type
+    p = get_by_link_type(normalized)
+    if p:
+        return p.name
+    # Backward compat aliases
     if normalized in ("115share", "magnet", "magnet115"):
         return "115"
     if normalized in ("pan.quark", "quarkshare", "quark_pan"):
         return "quark"
-    return "quark" if normalized_fallback == "quark" else "115"
+    normalized_fallback = str(fallback or "115").strip().lower()
+    return normalized_fallback if _get_provider_or_none(normalized_fallback) else "115"
 
 
 def normalize_subscription_min_file_size_mb(value: Any, fallback: float = 0.0) -> float:
@@ -1413,6 +1609,24 @@ SUBSCRIPTION_SCAN_RECOMMENDED_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "share_scan_concurrency": 2,
         "share_scan_rate_limit_seconds": 0.35,
     },
+    "tianyi": {
+        "candidate_scan_prefetch_limit": 3,
+        "candidate_scan_concurrency": 1,
+        "share_scan_concurrency": 1,
+        "share_scan_rate_limit_seconds": 1.0,
+    },
+    "123pan": {
+        "candidate_scan_prefetch_limit": 3,
+        "candidate_scan_concurrency": 1,
+        "share_scan_concurrency": 1,
+        "share_scan_rate_limit_seconds": 1.0,
+    },
+    "aliyun": {
+        "candidate_scan_prefetch_limit": 3,
+        "candidate_scan_concurrency": 1,
+        "share_scan_concurrency": 1,
+        "share_scan_rate_limit_seconds": 1.0,
+    },
 }
 
 
@@ -1609,8 +1823,11 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
         or ""
     ).strip()
     share_link_type = resolve_resource_link_type("", share_link_url)
-    use_115_fixed_link = provider == "115" and share_link_type == "115share"
-    if provider != "115":
+    _p = _get_provider_or_none(provider)
+    _supports_fixed = bool(_p and _p.supports_fixed_share_link)
+    _provider_link_type = str(getattr(_p, "link_type", "") or "").strip().lower() if _p else ""
+    use_fixed_share_link = _supports_fixed and bool(_provider_link_type) and share_link_type == _provider_link_type
+    if not _supports_fixed:
         share_link_url = ""
     share_link_receive_code = normalize_receive_code(
         task.get(
@@ -1637,7 +1854,7 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
         ),
         default=False,
     )
-    if provider != "115":
+    if not use_fixed_share_link:
         share_link_receive_code = ""
         share_subdir = ""
         share_subdir_cid = ""
@@ -1656,11 +1873,11 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "season": max(1, season),
         "total_episodes": max(0, total_episodes),
         "savepath": savepath,
-        "share_link_url": share_link_url if use_115_fixed_link else "",
-        "share_link_receive_code": share_link_receive_code if use_115_fixed_link else "",
+        "share_link_url": share_link_url if use_fixed_share_link else "",
+        "share_link_receive_code": share_link_receive_code if use_fixed_share_link else "",
         "share_subdir": share_subdir,
         "share_subdir_cid": share_subdir_cid,
-        "fixed_link_channel_search": fixed_link_channel_search if use_115_fixed_link else False,
+        "fixed_link_channel_search": fixed_link_channel_search if use_fixed_share_link else False,
         "enabled": normalize_bool(task.get("enabled", True), default=True),
         # 兼容旧前端字段：cron_minutes 保留为“时段内查询间隔”镜像值。
         "cron_minutes": schedule_interval_minutes,
@@ -1833,8 +2050,12 @@ def normalize_resource_favorite_dir(item: Dict[str, Any]) -> Dict[str, str]:
 
 def normalize_resource_favorite_dirs(value: Any) -> Dict[str, List[Dict[str, str]]]:
     source = value if isinstance(value, dict) else {}
-    result: Dict[str, List[Dict[str, str]]] = {"115": [], "quark": []}
-    for provider in ("115", "quark"):
+    try:
+        provider_names = [p.name for p in list_all() if p.supports_folder_browse]
+    except Exception:
+        provider_names = ["115", "quark"]
+    result: Dict[str, List[Dict[str, str]]] = {provider: [] for provider in provider_names}
+    for provider in provider_names:
         raw_items = source.get(provider, [])
         if not isinstance(raw_items, list):
             raw_items = []
@@ -2020,6 +2241,16 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         merged["cookie_115"] = ""
     if "cookie_quark" not in merged:
         merged["cookie_quark"] = ""
+    if "cookie_tianyi" not in merged:
+        merged["cookie_tianyi"] = ""
+    if "tianyi_username" not in merged:
+        merged["tianyi_username"] = ""
+    if "tianyi_password" not in merged:
+        merged["tianyi_password"] = ""
+    if "provider_enabled" not in merged:
+        merged["provider_enabled"] = _build_provider_enabled_defaults()
+    if "default_magnet_provider" not in merged:
+        merged["default_magnet_provider"] = "115"
     if "sign115_enabled" not in merged:
         merged["sign115_enabled"] = False
     if "sign115_cron_time" not in merged:
@@ -2160,6 +2391,7 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     merged["webhook_secret"] = str(merged.get("webhook_secret", "")).strip()
     merged["cookie_115"] = str(merged.get("cookie_115", "")).strip()
     merged["cookie_quark"] = str(merged.get("cookie_quark", "")).strip()
+    merged["default_magnet_provider"] = normalize_magnet_provider(merged.get("default_magnet_provider", "115"))
     merged["pansou_enabled"] = normalize_bool(merged.get("pansou_enabled", False), default=False)
     merged["pansou_base_url"] = str(merged.get("pansou_base_url", "")).strip().rstrip("/")
     merged["pansou_username"] = str(merged.get("pansou_username", "") or "").strip()
@@ -2211,7 +2443,8 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         merged.get("tg_channel_sync_limit", TG_CHANNEL_SYNC_LIMIT_DEFAULT),
         fallback=TG_CHANNEL_SYNC_LIMIT_DEFAULT,
     )
-    return merged
+    merged["provider_enabled"] = normalize_provider_enabled_config(merged)
+    return order_config_for_save(merged)
 
 
 _config_store_lock = threading.Lock()
@@ -2607,12 +2840,21 @@ def build_resource_channel_profile(
 
 def normalize_resource_provider_filter(value: Any) -> str:
     normalized = str(value or "all").strip().lower()
-    if normalized in ("115", "magnet", "quark", "all"):
-        return normalized
+    if normalized == "all":
+        return "all"
+    if normalized == "magnet":
+        return "magnet"
+    p = _get_provider_or_none(normalized)
+    if p:
+        return p.name
+    p = get_by_link_type(normalized)
+    if p:
+        return p.name
+    # Backward compat
     if normalized == "115share":
         return "115"
-    if normalized == "magnet115":
-        return "magnet"
+    if normalized in ("quarkshare", "pan.quark"):
+        return "quark"
     return "all"
 
 
@@ -2629,13 +2871,12 @@ def resource_item_matches_provider_filter(item: Dict[str, Any], provider_filter:
         return True
     payload = item if isinstance(item, dict) else {}
     link_type = resolve_resource_link_type(payload.get("link_type", ""), payload.get("link_url", ""))
-    if normalized_filter == "115":
-        return link_type == "115share"
     if normalized_filter == "magnet":
         return link_type == "magnet"
-    if normalized_filter == "quark":
-        return link_type == "quark"
-    return True
+    p = _get_provider_or_none(normalized_filter)
+    if p:
+        return link_type == p.link_type
+    return False
 
 
 def filter_resource_items_by_provider(
@@ -3376,11 +3617,16 @@ def validate_strm_play_runtime_config(cfg: Dict[str, Any]) -> Optional[str]:
 
 def validate_subscription_runtime_config(cfg: Dict[str, Any], task: Dict[str, Any]) -> Optional[str]:
     provider = normalize_subscription_provider(task.get("provider", "115"), fallback="115")
-    if provider == "quark":
-        if not str(cfg.get("cookie_quark", "")).strip():
-            return "请先在参数配置中填写 Quark Cookie"
-    elif not str(cfg.get("cookie_115", "")).strip():
-        return "请先在参数配置中填写 115 Cookie"
+    p = _get_provider_or_none(provider)
+    if not p:
+        return "订阅网盘类型不支持"
+    enabled_map = cfg.get("provider_enabled", {}) if isinstance(cfg.get("provider_enabled", {}), dict) else {}
+    if not bool(enabled_map.get(provider, provider in ("115", "quark"))):
+        return f"{p.label} 未启用，请先在参数配置中启用该网盘"
+    if not bool(getattr(p, "supports_subscription", False)):
+        return f"{p.label} 暂不支持订阅"
+    if not p.is_configured(cfg):
+        return f"请先在参数配置中填写 {p.label} 认证信息"
     if not str(task.get("name", "")).strip():
         return "任务名未填写"
     if not str(task.get("title", "")).strip():
@@ -3390,8 +3636,6 @@ def validate_subscription_runtime_config(cfg: Dict[str, Any], task: Dict[str, An
     media_type = str(task.get("media_type", "movie") or "movie").strip().lower()
     if media_type not in ("movie", "tv"):
         return "订阅类型不支持"
-    if provider not in ("115", "quark"):
-        return "订阅网盘类型不支持"
     return None
 
 
@@ -3694,6 +3938,12 @@ def normalize_cookie_health_provider(value: Any) -> str:
         return "115"
     if token in {"quark", "cookie_quark"}:
         return "quark"
+    try:
+        p = _get_provider_or_none(token)
+        if p:
+            return p.name
+    except Exception:
+        pass
     return ""
 
 
@@ -3703,24 +3953,71 @@ def is_cookie_health_share_trigger(trigger: Any) -> bool:
 
 
 def _cookie_health_provider_label(provider: str) -> str:
-    return "Quark" if normalize_cookie_health_provider(provider) == "quark" else "115"
+    provider_key = normalize_cookie_health_provider(provider)
+    try:
+        p = _get_provider_or_none(provider_key)
+        if p:
+            return str(p.label or provider_key)
+    except Exception:
+        pass
+    return "Quark" if provider_key == "quark" else ("115" if provider_key == "115" else provider_key)
+
+
+def _cookie_health_auth_label(provider: str) -> str:
+    provider_key = normalize_cookie_health_provider(provider)
+    try:
+        p = _get_provider_or_none(provider_key)
+        if p and hasattr(p, "auth_label"):
+            return str(p.auth_label() or "认证信息")
+    except Exception:
+        pass
+    return "Cookie"
+
+
+def _cookie_health_is_configured(cfg: Dict[str, Any], provider: str) -> bool:
+    provider_key = normalize_cookie_health_provider(provider)
+    try:
+        p = _get_provider_or_none(provider_key)
+        if p and hasattr(p, "is_configured"):
+            return bool(p.is_configured(cfg or {}))
+    except Exception:
+        return False
+    if provider_key == "quark":
+        return bool(str((cfg or {}).get("cookie_quark", "") or "").strip())
+    if provider_key == "115":
+        return bool(str((cfg or {}).get("cookie_115", "") or "").strip())
+    return False
 
 
 def _cookie_health_cookie_value(cfg: Dict[str, Any], provider: str) -> str:
-    key = "cookie_quark" if normalize_cookie_health_provider(provider) == "quark" else "cookie_115"
-    return str((cfg or {}).get(key, "") or "").strip()
+    provider_key = normalize_cookie_health_provider(provider)
+    try:
+        p = _get_provider_or_none(provider_key)
+        if p and _cookie_health_is_configured(cfg, provider_key):
+            return p.get_cookie(cfg or {})
+    except Exception:
+        raise
+    if provider_key == "quark":
+        return str((cfg or {}).get("cookie_quark", "") or "").strip()
+    if provider_key == "115":
+        return str((cfg or {}).get("cookie_115", "") or "").strip()
+    return ""
 
 
 def _cookie_health_missing_message(provider: str) -> str:
-    return f"未配置 {_cookie_health_provider_label(provider)} Cookie"
+    return f"未配置 {_cookie_health_provider_label(provider)} {_cookie_health_auth_label(provider)}"
+
+
+def _cookie_health_disabled_message(provider: str) -> str:
+    return f"{_cookie_health_provider_label(provider)} 未启用"
 
 
 def _cookie_health_unknown_message(provider: str) -> str:
-    return f"已配置 {_cookie_health_provider_label(provider)} Cookie，等待检测"
+    return f"已配置 {_cookie_health_provider_label(provider)} {_cookie_health_auth_label(provider)}，等待检测"
 
 
 def _cookie_health_valid_message(provider: str) -> str:
-    return f"{_cookie_health_provider_label(provider)} Cookie 可用"
+    return f"{_cookie_health_provider_label(provider)} {_cookie_health_auth_label(provider)} 可用"
 
 
 def _ensure_cookie_health_entry_locked(provider: str) -> Dict[str, Any]:
@@ -3782,14 +4079,27 @@ def sync_cookie_health_configured(cfg: Optional[Dict[str, Any]] = None, trigger:
     active_cfg = cfg or get_config()
     changed = False
     with cookie_health_lock:
-        for provider in COOKIE_HEALTH_PROVIDERS:
+        for provider in get_cookie_health_providers():
             entry = _ensure_cookie_health_entry_locked(provider)
             if not entry:
                 continue
-            configured = bool(_cookie_health_cookie_value(active_cfg, provider))
+            enabled = is_cookie_health_provider_enabled(active_cfg, provider)
+            if not enabled:
+                changed = _set_cookie_health_entry_locked(
+                    provider,
+                    enabled=False,
+                    configured=False,
+                    state="disabled",
+                    message=_cookie_health_disabled_message(provider),
+                    trigger=str(trigger or "").strip(),
+                    fail_count=0,
+                ) or changed
+                continue
+            configured = _cookie_health_is_configured(active_cfg, provider)
             if not configured:
                 changed = _set_cookie_health_entry_locked(
                     provider,
+                    enabled=True,
                     configured=False,
                     state="missing",
                     message=_cookie_health_missing_message(provider),
@@ -3798,18 +4108,19 @@ def sync_cookie_health_configured(cfg: Optional[Dict[str, Any]] = None, trigger:
                 ) or changed
                 continue
             if not entry.get("configured", False):
-                changed = _set_cookie_health_entry_locked(provider, configured=True) or changed
+                changed = _set_cookie_health_entry_locked(provider, enabled=True, configured=True) or changed
             state = str(entry.get("state", "") or "").strip().lower()
-            if state in {"", "missing"}:
+            if state in {"", "missing", "disabled"}:
                 changed = _set_cookie_health_entry_locked(
                     provider,
+                    enabled=True,
                     configured=True,
                     state="unknown",
                     message=_cookie_health_unknown_message(provider),
                     trigger=str(trigger or "").strip(),
                 ) or changed
             elif not entry.get("configured", False):
-                changed = _set_cookie_health_entry_locked(provider, configured=True) or changed
+                changed = _set_cookie_health_entry_locked(provider, enabled=True, configured=True) or changed
     if changed:
         schedule_ui_state_push(0)
 
@@ -3821,7 +4132,10 @@ def mark_cookie_health_checking(provider: str, trigger: str = "manual_check") ->
     if is_cookie_health_share_trigger(trigger):
         return
     cfg = get_config()
-    configured = bool(_cookie_health_cookie_value(cfg, provider_key))
+    if not is_cookie_health_provider_enabled(cfg, provider_key):
+        sync_cookie_health_configured(cfg, trigger=trigger)
+        return
+    configured = _cookie_health_is_configured(cfg, provider_key)
     changed = False
     with cookie_health_lock:
         _ensure_cookie_health_entry_locked(provider_key)
@@ -3858,7 +4172,10 @@ def mark_cookie_health_success(
     if is_cookie_health_share_trigger(trigger):
         return
     cfg = get_config()
-    configured = bool(_cookie_health_cookie_value(cfg, provider_key))
+    if not is_cookie_health_provider_enabled(cfg, provider_key):
+        sync_cookie_health_configured(cfg, trigger=trigger)
+        return
+    configured = _cookie_health_is_configured(cfg, provider_key)
     now_ts = time.time()
     now_iso = now_text()
     changed = False
@@ -3915,7 +4232,10 @@ def mark_cookie_health_failure(
     if is_cookie_health_share_trigger(trigger):
         return
     cfg = get_config()
-    configured = bool(_cookie_health_cookie_value(cfg, provider_key))
+    if not is_cookie_health_provider_enabled(cfg, provider_key):
+        sync_cookie_health_configured(cfg, trigger=trigger)
+        return
+    configured = _cookie_health_is_configured(cfg, provider_key)
     now_ts = time.time()
     now_iso = now_text()
     changed = False
@@ -3964,9 +4284,10 @@ def build_cookie_health_payload(cfg: Optional[Dict[str, Any]] = None) -> Dict[st
     sync_cookie_health_configured(active_cfg, trigger="payload")
     with cookie_health_lock:
         payload: Dict[str, Any] = {}
-        for provider in COOKIE_HEALTH_PROVIDERS:
+        for provider in get_cookie_health_providers():
             entry = _ensure_cookie_health_entry_locked(provider)
             payload[provider] = {
+                "enabled": is_cookie_health_provider_enabled(active_cfg, provider),
                 "configured": bool(entry.get("configured", False)),
                 "state": str(entry.get("state", "unknown") or "unknown"),
                 "message": str(entry.get("message", "") or ""),
@@ -4079,16 +4400,16 @@ def _probe_quark_cookie(cookie: str) -> None:
 
 
 def _normalize_cookie_health_providers(providers: Any = None) -> List[str]:
-    raw_items = providers if isinstance(providers, list) else COOKIE_HEALTH_PROVIDERS
+    raw_items = providers if isinstance(providers, list) else get_enabled_cookie_health_providers()
     if providers is None:
-        raw_items = list(COOKIE_HEALTH_PROVIDERS)
+        raw_items = list(get_enabled_cookie_health_providers())
     normalized: List[str] = []
     for item in raw_items:
         provider = normalize_cookie_health_provider(item)
         if (not provider) or provider in normalized:
             continue
         normalized.append(provider)
-    return normalized or list(COOKIE_HEALTH_PROVIDERS)
+    return normalized or list(get_enabled_cookie_health_providers())
 
 
 async def refresh_cookie_health_status(
@@ -4102,8 +4423,10 @@ async def refresh_cookie_health_status(
     now_ts = time.time()
 
     for provider in provider_list:
-        cookie_value = _cookie_health_cookie_value(cfg, provider)
-        if not cookie_value:
+        if not is_cookie_health_provider_enabled(cfg, provider):
+            sync_cookie_health_configured(cfg, trigger=trigger)
+            continue
+        if not _cookie_health_is_configured(cfg, provider):
             mark_cookie_health_failure(provider, _cookie_health_missing_message(provider), trigger=trigger, force=True)
             continue
 
@@ -4115,7 +4438,15 @@ async def refresh_cookie_health_status(
 
         mark_cookie_health_checking(provider, trigger=trigger)
         try:
-            if provider == "quark":
+            cookie_value = _cookie_health_cookie_value(cfg, provider)
+            if not cookie_value:
+                raise RuntimeError(_cookie_health_missing_message(provider))
+            p = _get_provider_or_none(provider)
+            if p:
+                ok = await asyncio.to_thread(p.probe_connectivity, cookie_value)
+                if not ok:
+                    raise RuntimeError(f"{p.label} 连接检测失败")
+            elif provider == "quark":
                 await asyncio.to_thread(_probe_quark_cookie, cookie_value)
             else:
                 await asyncio.to_thread(_probe_115_cookie, cookie_value)
@@ -5288,6 +5619,19 @@ def _build_resource_state_payload_snapshot(
     failed_job_count = int(stats_payload.get("failed_job_count", 0) or 0)
     sources = cfg.get("resource_sources", [])
     enabled_sources = [source for source in sources if source.get("enabled")]
+    provider_auth_configured: Dict[str, bool] = {}
+    try:
+        for p in list_all():
+            provider_auth_configured[p.name] = bool(p.is_configured(cfg))
+    except Exception:
+        provider_auth_configured = {
+            "115": bool(str(cfg.get("cookie_115", "")).strip()),
+            "quark": bool(str(cfg.get("cookie_quark", "")).strip()),
+        }
+    provider_cookie_flags = {
+        f"cookie_configured_{provider_name}": bool(configured)
+        for provider_name, configured in provider_auth_configured.items()
+    }
     if compact and not keyword:
         return {
             "jobs": clone_jsonable(jobs),
@@ -5314,6 +5658,9 @@ def _build_resource_state_payload_snapshot(
                 "has_resource_data": total_item_count > 0,
                 "has_jobs": total_job_count > 0,
             },
+            "provider_auth": clone_jsonable(provider_auth_configured),
+            **provider_cookie_flags,
+            "default_magnet_provider": normalize_magnet_provider(cfg.get("default_magnet_provider", "115")),
             "cookie_health": build_cookie_health_payload(cfg),
         }
     tg_channel_sync_limit = get_tg_channel_sync_limit(cfg)
@@ -5346,6 +5693,9 @@ def _build_resource_state_payload_snapshot(
         "monitor_tasks": clone_jsonable(cfg.get("monitor_tasks", [])),
         "cookie_configured": bool(str(cfg.get("cookie_115", "")).strip()),
         "quark_cookie_configured": bool(str(cfg.get("cookie_quark", "")).strip()),
+        "provider_auth": clone_jsonable(provider_auth_configured),
+        **provider_cookie_flags,
+        "default_magnet_provider": normalize_magnet_provider(cfg.get("default_magnet_provider", "115")),
         "cookie_health": build_cookie_health_payload(cfg),
         "setup_status": {
             "strm_ready": bool(
@@ -5965,7 +6315,8 @@ def format_subscription_media_type_label(media_type: Any) -> str:
 
 def format_subscription_provider_label(provider: Any) -> str:
     normalized = normalize_subscription_provider(provider, fallback="115")
-    return "夸克" if normalized == "quark" else "115"
+    p = _get_provider_or_none(normalized)
+    return str(getattr(p, "label", "") or normalized).strip() if p else normalized
 
 
 def format_resource_link_type_label(link_type: Any, link_url: Any = "") -> str:
@@ -6075,6 +6426,8 @@ async def sleep_interruptible(seconds: float) -> None:
         await asyncio.sleep(min(0.5, end_at - time.time()))
 
 
+from .providers.registry import get_all_capabilities, get_by_link_type, get_or_none as _get_provider_or_none, list_all, list_enabled
+
 from .providers.common import parse_int
 from .share_selection import (
     merge_share_selection_meta,
@@ -6170,6 +6523,10 @@ from .providers.pansou import (
     request_pansou_search,
     test_pansou_health,
 )
+# 新网盘提供者 —— import 触发 register() 自注册
+from .providers import tianyi  # noqa: F401
+from .providers import pan123  # noqa: F401
+from .providers import aliyun  # noqa: F401
 
 
 

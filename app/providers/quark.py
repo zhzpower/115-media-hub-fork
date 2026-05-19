@@ -3,7 +3,9 @@ import logging
 
 import requests
 
+from .base import CloudProvider
 from .common import parse_int
+from .registry import register
 from ..share_selection import normalize_share_selection_entry, normalize_share_selection_meta
 from ..core import *  # noqa: F401,F403
 
@@ -1789,3 +1791,121 @@ def submit_quark_share_save(
         }
     except Exception:
         raise
+
+
+class QuarkProvider(CloudProvider):
+    name = "quark"
+    label = "夸克网盘"
+    link_type = "quark"
+    auth_type = "cookie"
+    config_keys = ["cookie_quark"]
+    supports_subscription = True
+    supports_offline = False
+    supports_fixed_share_link = True
+    supports_strm = False
+    supports_monitor = False
+    supports_rename = True
+    supports_move = True
+    supports_copy = True
+    supports_delete = True
+
+    def list_entries_payload(self, cookie, cid="0", folders_only=False):
+        return list_quark_entries_payload(cookie, cid, folders_only)
+
+    def list_entries(self, cookie, cid="0"):
+        return list_quark_entries(cookie, cid)
+
+    def create_folder(self, cookie, cid="0", folder_name=""):
+        return create_quark_folder(cookie, cid, folder_name)
+
+    def resolve_folder_id_by_path(self, cookie, relative_path):
+        return resolve_quark_folder_id_by_path(cookie, relative_path)
+
+    def ensure_folder_id_by_path(self, cookie, relative_path):
+        return ensure_quark_folder_id_by_path(cookie, relative_path)
+
+    def resolve_share_payload(self, cookie, share_url, raw_text="", receive_code=""):
+        payload = resolve_quark_share_payload(cookie, share_url, raw_text, receive_code)
+        payload["url"] = str(share_url or "").strip()
+        payload["raw_text"] = str(raw_text or "")
+        return payload
+
+    def list_share_entries(self, cookie, share_payload, cid="0", offset=0, limit=200):
+        payload = share_payload if isinstance(share_payload, dict) else {}
+        return list_quark_share_entries(
+            cookie,
+            str(payload.get("url", "") or payload.get("share_url", "") or "").strip(),
+            str(payload.get("raw_text", "") or ""),
+            cid,
+            str(payload.get("receive_code", "") or "").strip(),
+            False,
+            45,
+            max(0, int(offset or 0)),
+            max(20, min(int(limit or 200), 400)),
+            1,
+            False,
+        )
+
+    def prepare_share_receive(self, cookie, share_payload, cid="0"):
+        payload = share_payload if isinstance(share_payload, dict) else {}
+        selected_ids = payload.get("selected_ids", []) if isinstance(payload.get("selected_ids"), list) else []
+        selected_entries = payload.get("selected_entries", []) if isinstance(payload.get("selected_entries"), list) else []
+        prepared = prepare_quark_share_save(
+            cookie,
+            str(payload.get("url", "") or payload.get("share_url", "") or "").strip(),
+            str(payload.get("raw_text", "") or ""),
+            selected_ids,
+            str(payload.get("receive_code", "") or "").strip(),
+            selected_entries=selected_entries,
+        )
+        return {**payload, **prepared, "target_cid": str(cid or "0").strip() or "0"}
+
+    def submit_share_receive(self, cookie, receive_payload, files):
+        payload = receive_payload if isinstance(receive_payload, dict) else {}
+        selected_entries = payload.get("selected_entries", []) if isinstance(payload.get("selected_entries"), list) else []
+        if not selected_entries:
+            selected_entries = files or []
+        selected_ids = payload.get("selected_ids", []) if isinstance(payload.get("selected_ids"), list) else []
+        if not selected_ids:
+            selected_ids = [
+                str(item.get("id", "")).strip()
+                for item in selected_entries
+                if isinstance(item, dict) and str(item.get("id", "")).strip()
+            ]
+        return submit_quark_share_save(
+            cookie,
+            str(payload.get("url", "") or payload.get("share_url", "") or "").strip(),
+            str(payload.get("target_cid", "") or payload.get("folder_id", "") or "0").strip() or "0",
+            str(payload.get("raw_text", "") or ""),
+            selected_ids,
+            str(payload.get("receive_code", "") or "").strip(),
+            selected_entries,
+        )
+
+    def probe_connectivity(self, cookie):
+        try:
+            result = probe_quark_connectivity(cookie)
+            return bool(result.get("ok"))
+        except Exception:
+            return False
+
+    def submit_offline_task(self, cookie, resource_url, folder_id="0"):
+        raise NotImplementedError("Quark does not support offline download")
+
+    def resolve_download_url(self, cookie, file_id):
+        raise NotImplementedError("Quark does not support direct download URL resolution")
+
+    def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
+        return rename_quark_entry(cookie, entry_id, new_name, parent_id)
+
+    def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+        return move_quark_entries(cookie, entry_ids, target_id, source_id)
+
+    def copy_entries(self, cookie, entry_ids, target_id, source_id=""):
+        return copy_quark_entries(cookie, entry_ids, target_id, source_id)
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        return delete_quark_entries(cookie, entry_ids, parent_id)
+
+
+register(QuarkProvider())

@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from ..background import submit_background
 from ..config_runtime import build_public_settings_payload, merge_settings_preserve_sensitive
 from ..core import *  # noqa: F401,F403
+from ..providers.registry import get_or_none as _get_provider_or_none
 from ..services.notify import send_notify_test_message
 from ..services.sign115 import refresh_sign115_status, run_sign115_job
 
@@ -15,7 +16,7 @@ router = APIRouter()
 async def _run_postsave_health_checks() -> None:
     try:
         await refresh_cookie_health_status(
-            providers=list(COOKIE_HEALTH_PROVIDERS),
+            providers=list(get_enabled_cookie_health_providers()),
             trigger="settings_save",
             force=True,
         )
@@ -61,10 +62,10 @@ async def save_settings_endpoint(request: Request) -> Dict[str, Any]:
     ]
     save_config(merged_cfg)
     saved_cfg = get_config()
-    if str(saved_cfg.get("cookie_115", "")).strip():
-        mark_cookie_health_checking("115", trigger="settings_save")
-    if str(saved_cfg.get("cookie_quark", "")).strip():
-        mark_cookie_health_checking("quark", trigger="settings_save")
+    for provider_name in get_enabled_cookie_health_providers(saved_cfg):
+        p = _get_provider_or_none(provider_name)
+        if p and p.is_configured(saved_cfg):
+            mark_cookie_health_checking(provider_name, trigger="settings_save")
     cookie_health = build_cookie_health_payload(saved_cfg)
     schedule_ui_state_push(0)
     submit_background(_run_postsave_health_checks, label="postsave-health-checks")
@@ -75,7 +76,7 @@ async def save_settings_endpoint(request: Request) -> Dict[str, Any]:
 async def get_cookies_status(request: Request) -> Dict[str, Any]:
     force = request.query_params.get("refresh") == "1"
     payload = await refresh_cookie_health_status(
-        providers=list(COOKIE_HEALTH_PROVIDERS),
+        providers=list(get_enabled_cookie_health_providers()),
         trigger="status_poll",
         force=force,
     )
@@ -86,7 +87,7 @@ async def get_cookies_status(request: Request) -> Dict[str, Any]:
 async def check_cookies_status(request: Request) -> Dict[str, Any]:
     incoming = await request.json()
     payload = incoming if isinstance(incoming, dict) else {}
-    providers = payload.get("providers", list(COOKIE_HEALTH_PROVIDERS))
+    providers = payload.get("providers", list(get_enabled_cookie_health_providers()))
     force = bool(payload.get("force", True))
     result = await refresh_cookie_health_status(
         providers=providers,
@@ -153,6 +154,12 @@ async def test_notify_push(request: Request) -> JSONResponse:
     return JSONResponse(content=result)
 
 
+@router.get("/api/providers")
+async def get_providers(request: Request) -> JSONResponse:
+    cfg = get_config()
+    return JSONResponse(get_all_capabilities(cfg))
+
+
 @router.get("/settings/115/sign/status")
 async def get_sign115_status(request: Request) -> Dict[str, Any]:
     refresh = request.query_params.get("refresh") == "1"
@@ -174,3 +181,45 @@ async def run_sign115(request: Request) -> JSONResponse:
     set_sign115_status(state="checking", message="签到任务已提交，正在后台执行...", last_trigger="manual")
     submit_background(run_sign115_job, "manual", label="sign115-manual")
     return JSONResponse(content={"ok": True, "queued": True, "state": build_sign115_status_payload(cfg)})
+
+
+@router.post("/test_provider_cookie")
+async def test_provider_cookie(request: Request) -> JSONResponse:
+    try:
+        data = await request.json()
+        provider_name = str(data.get("provider", "")).strip()
+        cookie = str(data.get("cookie", "")).strip()
+        credentials = data.get("credentials", {})
+        credentials_payload = credentials if isinstance(credentials, dict) else {}
+
+        if not provider_name:
+            return JSONResponse(content={"ok": False, "error": "缺少provider"})
+
+        provider = _get_provider_or_none(provider_name)
+        if not provider:
+            return JSONResponse(content={"ok": False, "error": f"未知的网盘: {provider_name}"})
+
+        try:
+            credential_value = cookie
+            if credentials_payload:
+                probe_cfg = {
+                    key: str(credentials_payload.get(key, "") or "").strip()
+                    for key in getattr(provider, "config_keys", [])
+                }
+                if not provider.is_configured(probe_cfg):
+                    return JSONResponse(content={"ok": False, "error": f"缺少 {provider.label} 认证信息"})
+                credential_value = await asyncio.to_thread(provider.get_cookie, probe_cfg)
+
+            if not credential_value:
+                return JSONResponse(content={"ok": False, "error": f"缺少 {provider.label} 认证信息"})
+
+            ok = await asyncio.to_thread(provider.probe_connectivity, credential_value)
+            if ok:
+                return JSONResponse(content={"ok": True, "message": f"{provider.label} 认证信息可用"})
+            else:
+                return JSONResponse(content={"ok": False, "error": f"{provider.label} 连接检测失败，请检查认证信息是否有效"})
+        except Exception as e:
+            error_msg = str(e).strip()
+            return JSONResponse(content={"ok": False, "error": error_msg or "认证失败"})
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})

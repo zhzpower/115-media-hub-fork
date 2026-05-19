@@ -20,7 +20,7 @@
             quark: { configured: false, state: 'missing', message: '未配置 Quark Cookie', last_checked_at: '', last_success_at: '', trigger: '', fail_count: 0 }
         };
         let cookieHealthCheckBusy = false;
-        let resourceState = { sources: [], quick_links: [], favorite_dirs: { '115': [], quark: [] }, items: [], jobs: [], active_jobs: [], job_counts: {}, job_pagination: {}, channel_sections: [], channel_profiles: {}, subscription_channel_support: {}, search_sections: [], last_syncs: {}, channel_sync: {}, monitor_tasks: [], stats: { source_count: 0, item_count: 0, filtered_item_count: 0, completed_job_count: 0 }, cookie_configured: false, quark_cookie_configured: false, cookie_health: null, setup_status: null, search: '', search_source: 'tg', provider_filter: 'all', search_meta: {} };
+        let resourceState = { sources: [], quick_links: [], favorite_dirs: { '115': [], quark: [] }, items: [], jobs: [], active_jobs: [], job_counts: {}, job_pagination: {}, channel_sections: [], channel_profiles: {}, subscription_channel_support: {}, search_sections: [], last_syncs: {}, channel_sync: {}, monitor_tasks: [], stats: { source_count: 0, item_count: 0, filtered_item_count: 0, completed_job_count: 0 }, cookie_configured: false, quark_cookie_configured: false, cookie_health: null, setup_status: null, search: '', search_source: 'tg', provider_filter: 'all', default_magnet_provider: '115', search_meta: {} };
         let editingMonitorName = null;
         let editingSubscriptionName = null;
         let editingResourceSourceIndex = null;
@@ -249,15 +249,24 @@
         let strmCleanupRootBrowserError = '';
         let strmCleanupMainTab = 'browse';
         const DEFAULT_EXTENSIONS = "mp4,mkv,avi,mov,wmv,flv,webm,vob,mpg,mpeg,ts,m2ts,mts,rmvb,rm,asf,3gp,m4v,f4v,iso";
-        const SENSITIVE_SETTING_FIELDS = Object.freeze([
-            'password',
-            'cookie_115',
-            'cookie_quark',
-            'notify_wecom_webhook',
-            'notify_wecom_app_secret',
-            'tmdb_api_key',
-            'pansou_password',
-        ]);
+        function getSensitiveSettingFields() {
+            const fields = [
+                'password',
+                'cookie_115',
+                'cookie_quark',
+                'notify_wecom_webhook',
+                'notify_wecom_app_secret',
+                'tmdb_api_key',
+                'pansou_password',
+            ];
+            const meta = window.providerMeta || [];
+            meta.forEach(p => {
+                (p.config_keys || []).forEach(ck => {
+                    if (ck && fields.indexOf(ck) === -1) fields.push(ck);
+                });
+            });
+            return fields;
+        }
         const STATUS_FALLBACK_INTERVAL = 15000;
         const RESOURCE_SYNC_POLL_INTERVAL = 3000;
         const RESOURCE_POLL_ACTIVE_INTERVAL = 15000;
@@ -976,25 +985,27 @@
         function normalizeSensitiveConfigMeta(meta) {
             const source = meta && typeof meta === 'object' ? meta : {};
             const result = {};
-            SENSITIVE_SETTING_FIELDS.forEach((key) => {
+            getSensitiveSettingFields().forEach((key) => {
                 result[key] = !!source[key];
             });
             return result;
         }
 
         function applySensitiveConfigMeta(meta) {
+            const suffix = '（已配置，留空不覆盖）';
             sensitiveConfigMeta = normalizeSensitiveConfigMeta(meta);
-            SENSITIVE_SETTING_FIELDS.forEach((key) => {
+            getSensitiveSettingFields().forEach((key) => {
                 const el = document.getElementById(key);
                 if (!el) return;
+                let raw = String(el.getAttribute('placeholder') || '');
+                if (raw.endsWith(suffix)) raw = raw.slice(0, -suffix.length);
                 if (!Object.prototype.hasOwnProperty.call(el.dataset, 'originPlaceholder')) {
-                    el.dataset.originPlaceholder = String(el.getAttribute('placeholder') || '');
+                    el.dataset.originPlaceholder = raw;
                 }
                 const configured = !!sensitiveConfigMeta[key];
                 const originPlaceholder = String(el.dataset.originPlaceholder || '');
                 if (configured) {
-                    const suffix = '（已配置，留空不覆盖）';
-                    el.setAttribute('placeholder', originPlaceholder ? `${originPlaceholder}${suffix}` : `已配置${suffix}`);
+                    el.setAttribute('placeholder', originPlaceholder ? `${originPlaceholder}${suffix}` : suffix);
                     el.dataset.sensitiveConfigured = '1';
                 } else {
                     el.setAttribute('placeholder', originPlaceholder);
@@ -1005,15 +1016,20 @@
 
         function normalizeCookieHealthEntry(raw, provider = '115') {
             const source = raw && typeof raw === 'object' ? raw : {};
-            const providerLabel = provider === 'quark' ? 'Quark' : '115';
+            const meta = (window.providerMeta || []).find(p => p.name === provider);
+            const providerLabel = meta?.label || provider;
+            const enabled = Object.prototype.hasOwnProperty.call(source, 'enabled')
+                ? source.enabled !== false
+                : meta?.enabled !== false;
             const configured = !!source.configured;
             const rawState = String(source.state || (configured ? 'unknown' : 'missing')).trim().toLowerCase();
-            const state = ['missing', 'unknown', 'checking', 'valid', 'invalid', 'error'].includes(rawState)
+            const state = ['disabled', 'missing', 'unknown', 'checking', 'valid', 'invalid', 'error'].includes(rawState)
                 ? rawState
                 : (configured ? 'unknown' : 'missing');
             let message = String(source.message || '').trim();
             if (!message) {
-                if (state === 'missing') message = `未配置 ${providerLabel} Cookie`;
+                if (state === 'disabled') message = `${providerLabel} 未启用`;
+                else if (state === 'missing') message = `未配置 ${providerLabel} Cookie`;
                 else if (state === 'checking') message = `正在检测 ${providerLabel} Cookie...`;
                 else if (state === 'valid') message = `${providerLabel} Cookie 可用`;
                 else if (state === 'invalid') message = `${providerLabel} Cookie 可能已失效`;
@@ -1021,6 +1037,7 @@
                 else message = `已配置 ${providerLabel} Cookie，等待检测`;
             }
             return {
+                enabled,
                 configured,
                 state,
                 message,
@@ -1033,10 +1050,11 @@
 
         function normalizeCookieHealthState(raw) {
             const source = raw && typeof raw === 'object' ? raw : {};
-            return {
-                '115': normalizeCookieHealthEntry(source['115'], '115'),
-                quark: normalizeCookieHealthEntry(source.quark, 'quark'),
-            };
+            const result = {};
+            Object.keys(source).forEach((key) => {
+                result[key] = normalizeCookieHealthEntry(source[key], key);
+            });
+            return result;
         }
 
         function getCookieHealthTone(entry) {
@@ -1046,6 +1064,7 @@
             if (state === 'error') return 'error';
             if (state === 'checking') return 'checking';
             if (state === 'missing') return 'warn';
+            if (state === 'disabled') return 'idle';
             return 'idle';
         }
 
@@ -1078,13 +1097,13 @@
         }
 
         function renderCookieHealthCards() {
-            const providers = ['115', 'quark'];
-            providers.forEach((provider) => {
-                const entry = cookieHealthState?.[provider] || normalizeCookieHealthEntry({}, provider);
-                const cardEl = document.getElementById(`cookie-health-${provider}-card`);
-                const textEl = document.getElementById(`cookie-health-${provider}-text`);
+            const meta = window.providerMeta || [];
+            meta.forEach((p) => {
+                const entry = cookieHealthState?.[p.name] || normalizeCookieHealthEntry({}, p.name);
+                const cardEl = document.getElementById(`cookie-health-${p.name}-card`);
+                const textEl = document.getElementById(`cookie-health-${p.name}-text`);
                 const tone = getCookieHealthTone(entry);
-                applyCookieHealthCardTone(cardEl, tone);
+                if (cardEl) applyCookieHealthCardTone(cardEl, tone);
                 if (!textEl) return;
                 const bits = [entry.message];
                 if (entry.last_checked_at) bits.push(`上次检测 ${entry.last_checked_at}`);
@@ -1116,6 +1135,9 @@
             };
             renderCookieHealthCards();
             renderResourceCookieHint();
+            if (typeof updateCookieHealthBar === 'function') {
+                updateCookieHealthBar(cookieHealthState);
+            }
         }
 
         async function refreshCookieHealthStatus(force = false) {
@@ -1128,20 +1150,23 @@
             }
         }
 
-        async function checkCookiesNow(force = true) {
+        async function checkCookiesNow(force = true, providers = null) {
             const settingsModule = await loadSettingsTabModule();
             if (settingsModule?.checkCookiesNow) {
-                await settingsModule.checkCookiesNow({
+                return await settingsModule.checkCookiesNow({
                     force,
+                    providers,
                     isBusy: cookieHealthCheckBusy,
                     setBusy: (nextValue) => {
                         cookieHealthCheckBusy = !!nextValue;
                     },
                     renderCookieHealthCards,
+                    getCookieHealthState: () => cookieHealthState,
                     applyCookieHealthState,
                     showToast,
                 });
             }
+            return false;
         }
 
         function buildLogSignature(logs, formatter) {
@@ -1688,6 +1713,74 @@
             return '';
         }
 
+        function getResourceJobId(job = {}) {
+            return Number(job?.id || 0) || 0;
+        }
+
+        function normalizeResourceJobStatus(status) {
+            return String(status || '').trim().toLowerCase();
+        }
+
+        function isResourceJobActiveStatus(status) {
+            return ['pending', 'running', 'submitted'].includes(normalizeResourceJobStatus(status));
+        }
+
+        function normalizeResourceJobListFilter(value = 'all') {
+            const normalized = String(value || 'all').trim().toLowerCase();
+            return ['all', 'active', 'submitted', 'completed', 'failed'].includes(normalized) ? normalized : 'all';
+        }
+
+        function doesResourceJobMatchFilter(job = {}, filter = 'all') {
+            const normalizedFilter = normalizeResourceJobListFilter(filter);
+            const status = normalizeResourceJobStatus(job?.status || '');
+            if (normalizedFilter === 'active') return isResourceJobActiveStatus(status);
+            if (normalizedFilter === 'submitted') return status === 'submitted';
+            if (normalizedFilter === 'completed') return status === 'completed';
+            if (normalizedFilter === 'failed') return status === 'failed';
+            return true;
+        }
+
+        function hasResourceJobSignalDiff(previousJob = {}, nextJob = {}) {
+            return ['id', 'resource_id', 'status', 'status_detail', 'updated_at', 'finished_at', 'last_triggered_at']
+                .some(key => String(previousJob?.[key] ?? '') !== String(nextJob?.[key] ?? ''));
+        }
+
+        function mergeResourceJobSignalIntoList(jobs = [], latestJob = {}, { filter = 'all', addWhenMatched = false } = {}) {
+            const sourceJobs = Array.isArray(jobs) ? jobs : [];
+            const jobId = getResourceJobId(latestJob);
+            if (!jobId) return { jobs: sourceJobs, changed: false };
+
+            const signalJob = {
+                ...latestJob,
+                id: jobId,
+                resource_id: Number(latestJob?.resource_id || 0) || 0,
+                status: normalizeResourceJobStatus(latestJob?.status || ''),
+            };
+            const matchedFilter = doesResourceJobMatchFilter(signalJob, filter);
+            let changed = false;
+            let found = false;
+            const nextJobs = [];
+            sourceJobs.forEach((job) => {
+                if (getResourceJobId(job) !== jobId) {
+                    nextJobs.push(job);
+                    return;
+                }
+                found = true;
+                if (!matchedFilter) {
+                    changed = true;
+                    return;
+                }
+                const mergedJob = { ...job, ...signalJob };
+                if (hasResourceJobSignalDiff(job, mergedJob)) changed = true;
+                nextJobs.push(mergedJob);
+            });
+            if (!found && addWhenMatched && matchedFilter) {
+                nextJobs.unshift(signalJob);
+                changed = true;
+            }
+            return { jobs: changed ? nextJobs : sourceJobs, changed };
+        }
+
         function applyResourceJobStatusToItems(items = [], resourceId = 0, status = '') {
             if (!resourceId || !status || !Array.isArray(items)) return items;
             let changed = false;
@@ -1715,22 +1808,36 @@
         function applyResourceJobSignalToResourceState(job = {}) {
             const resourceId = Number(job?.resource_id || 0) || 0;
             const status = normalizeResourceItemStatusFromJob(job?.status || '');
-            if (!resourceId || !status) return false;
+            const jobId = getResourceJobId(job);
+            if ((!resourceId || !status) && !jobId) return false;
             const currentItems = Array.isArray(resourceState.items) ? resourceState.items : [];
             const currentChannelSections = Array.isArray(resourceState.channel_sections) ? resourceState.channel_sections : [];
             const currentSearchSections = Array.isArray(resourceState.search_sections) ? resourceState.search_sections : [];
             const nextItems = applyResourceJobStatusToItems(currentItems, resourceId, status);
             const nextChannelSections = applyResourceJobStatusToSections(currentChannelSections, resourceId, status);
             const nextSearchSections = applyResourceJobStatusToSections(currentSearchSections, resourceId, status);
+            const jobPageFilter = normalizeResourceJobListFilter(resourceState?.job_pagination?.status || resourceJobFilter || 'all');
+            const nextJobsResult = mergeResourceJobSignalIntoList(resourceState.jobs || [], job, {
+                filter: jobPageFilter,
+                addWhenMatched: false,
+            });
+            const nextActiveJobsResult = mergeResourceJobSignalIntoList(resourceState.active_jobs || [], job, {
+                filter: 'active',
+                addWhenMatched: isResourceJobActiveStatus(job?.status || ''),
+            });
             const selectedChanged = selectedResourceItem && Number(selectedResourceItem?.id || 0) === resourceId;
             const changed = nextItems !== currentItems
                 || nextChannelSections !== currentChannelSections
                 || nextSearchSections !== currentSearchSections
+                || nextJobsResult.changed
+                || nextActiveJobsResult.changed
                 || selectedChanged;
             if (!changed) return false;
             resourceState = {
                 ...resourceState,
                 items: nextItems,
+                jobs: nextJobsResult.jobs,
+                active_jobs: nextActiveJobsResult.jobs,
                 channel_sections: nextChannelSections,
                 search_sections: nextSearchSections,
             };
@@ -1738,6 +1845,8 @@
                 selectedResourceItem = { ...selectedResourceItem, status };
             }
             if (currentTab === 'resource') {
+                if (typeof renderResourceJobs === 'function') renderResourceJobs();
+                if (typeof syncResourceJobModalTrigger === 'function') syncResourceJobModalTrigger();
                 renderResourceBoard();
                 renderResourceBoardHint();
             }
@@ -3312,7 +3421,7 @@
             const settingsModule = await loadSettingsTabModule();
             if (settingsModule?.saveSettings) {
                 await settingsModule.saveSettings({
-                    sensitiveSettingFields: SENSITIVE_SETTING_FIELDS,
+                    sensitiveSettingFields: getSensitiveSettingFields(),
                     getSensitiveConfigMeta: () => sensitiveConfigMeta,
                     applySensitiveConfigMeta,
                     applyCookieHealthState,
@@ -3832,6 +3941,48 @@
             renderMonitorTasks();
         }
 
+        function buildMonitorTaskActionIcon(icon) {
+            const icons = {
+                run: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M8 5.75V18.25L17.5 12L8 5.75Z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>',
+                stop: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7.25 7.25H16.75V16.75H7.25V7.25Z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>',
+                queued: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 19.25A7.25 7.25 0 1 0 12 4.75A7.25 7.25 0 0 0 12 19.25Z" stroke="currentColor" stroke-width="1.8"/><path d="M12 8.25V12.25L14.75 14.25" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                edit: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5.25 18.75L9.1 17.9L18.45 8.55A2.05 2.05 0 0 0 15.55 5.65L6.2 15L5.25 18.75Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M14.35 6.85L17.15 9.65" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+                delete: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 7.5H19" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M9.25 7.5V5.75H14.75V7.5" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 10V18.25H16V10" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M10.5 11.5V16.5M13.5 11.5V16.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+                collapse: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 14L12 9L17 14" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+                expand: '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 10L12 15L17 10" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+            };
+            return icons[icon] || icons.edit;
+        }
+
+        function buildMonitorTaskIconButton({
+            action,
+            taskName,
+            label,
+            icon,
+            tone = 'neutral',
+            disabled = false,
+            extraAttrs = '',
+        } = {}) {
+            const normalizedAction = String(action || '').trim();
+            const normalizedLabel = String(label || '').trim();
+            if (!normalizedAction || !normalizedLabel) return '';
+            const attrText = String(extraAttrs || '').trim();
+            const disabledAttrs = disabled ? ' disabled aria-disabled="true"' : '';
+            return `
+                <button
+                    type="button"
+                    data-monitor-action="${escapeHtml(normalizedAction)}"
+                    data-task-name="${encodeURIComponent(taskName)}"
+                    class="monitor-task-icon-btn monitor-task-icon-btn-${escapeHtml(tone)} ${disabled ? 'btn-disabled' : ''}"
+                    title="${escapeHtml(normalizedLabel)}"
+                    aria-label="${escapeHtml(normalizedLabel)}"
+                    ${attrText ? `${attrText} ` : ''}${disabledAttrs}
+                >
+                    ${buildMonitorTaskActionIcon(icon)}
+                </button>
+            `;
+        }
+
         function renderMonitorTasks() {
             const container = document.getElementById('monitor-task-list');
             const tasks = monitorState.tasks || [];
@@ -3848,12 +3999,42 @@
                 const starting = isMonitorActionLocked('start', taskName);
                 const stopping = isMonitorActionLocked('stop', taskName);
                 const deleting = isMonitorActionLocked('delete', taskName);
-                const startDisabled = monitorState.running || starting || stopping || deleting;
-                const stopDisabled = !running || starting || stopping || deleting;
+                const otherTaskRunning = monitorState.running && !running;
+                const toggleRunAction = running ? 'stop' : 'start';
+                const toggleRunLabel = running
+                    ? (stopping ? '中断中' : '中断')
+                    : (queued ? '排队中' : (starting ? '启动中' : '运行'));
+                const toggleRunDisabled = queued || otherTaskRunning || starting || stopping || deleting;
+                const toggleRunTone = running ? 'stop' : (queued ? 'queued' : 'run');
+                const toggleRunIcon = running ? 'stop' : (queued ? 'queued' : 'run');
                 const deleteDisabled = running || starting || stopping || deleting;
                 const nextRun = (monitorState.next_runs || {})[taskName];
                 const introExpanded = isTaskIntroExpanded(monitorTaskIntroExpanded, taskName);
                 const introText = buildMonitorTaskIntro(task, { running, queued, nextRun });
+                const toggleRunButton = buildMonitorTaskIconButton({
+                    action: 'toggle-run',
+                    taskName,
+                    label: toggleRunLabel,
+                    icon: toggleRunIcon,
+                    tone: toggleRunTone,
+                    disabled: toggleRunDisabled,
+                    extraAttrs: `data-monitor-run-action="${escapeHtml(toggleRunAction)}"`,
+                });
+                const editButton = buildMonitorTaskIconButton({
+                    action: 'edit',
+                    taskName,
+                    label: '编辑',
+                    icon: 'edit',
+                    tone: 'edit',
+                });
+                const deleteButton = buildMonitorTaskIconButton({
+                    action: 'delete',
+                    taskName,
+                    label: deleting ? '删除中' : '删除',
+                    icon: 'delete',
+                    tone: 'delete',
+                    disabled: deleteDisabled,
+                });
                 return `
                     <div class="rounded-2xl border border-slate-700 bg-slate-900/60 p-3 sm:p-4">
                         <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3">
@@ -3870,14 +4051,15 @@
                                     type="button"
                                     data-monitor-toggle-intro="${taskKey}"
                                     aria-expanded="${introExpanded ? 'true' : 'false'}"
-                                    class="shrink-0 text-[11px] sm:text-xs font-bold text-sky-300 hover:text-sky-200 hover:underline underline-offset-2 rounded-lg px-1.5 py-1 focus:outline-none focus:ring-2 focus:ring-sky-500/45"
-                                >${introExpanded ? '收起简介' : '展开简介'}</button>
+                                    class="monitor-intro-toggle-btn"
+                                    title="${introExpanded ? '收起简介' : '展开简介'}"
+                                    aria-label="${introExpanded ? '收起简介' : '展开简介'}"
+                                >${buildMonitorTaskActionIcon(introExpanded ? 'collapse' : 'expand')}</button>
                             </div>
-                            <div class="monitor-task-actions grid grid-cols-4 gap-2 shrink-0 w-full lg:w-auto">
-                                <button type="button" data-monitor-action="start" data-task-name="${taskKey}" class="px-2 sm:px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold ${startDisabled ? 'btn-disabled' : ''}" ${startDisabled ? 'disabled' : ''}>${starting ? '启动中...' : '运行'}</button>
-                                <button type="button" data-monitor-action="stop" data-task-name="${taskKey}" class="px-2 sm:px-3 py-2 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-sm font-bold ${stopDisabled ? 'btn-disabled' : ''}" ${stopDisabled ? 'disabled' : ''}>${stopping ? '中断中...' : '中断'}</button>
-                                <button type="button" data-monitor-action="edit" data-task-name="${taskKey}" class="px-2 sm:px-3 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 text-white text-sm font-bold">编辑</button>
-                                <button type="button" data-monitor-action="delete" data-task-name="${taskKey}" class="px-2 sm:px-3 py-2 rounded-xl bg-red-500/15 hover:bg-red-500/25 text-red-300 text-sm font-bold ${deleteDisabled ? 'btn-disabled' : ''}" ${deleteDisabled ? 'disabled' : ''}>${deleting ? '删除中...' : '删除'}</button>
+                            <div class="monitor-task-actions monitor-task-actionbar" aria-label="文件夹监控任务操作">
+                                ${toggleRunButton}
+                                ${editButton}
+                                ${deleteButton}
                             </div>
                         </div>
                         ${introExpanded ? `<div class="mt-3 text-xs text-slate-300 leading-6 rounded-xl border border-slate-700/90 bg-slate-950/45 px-3 py-2">${escapeHtml(introText)}</div>` : ''}

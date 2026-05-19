@@ -17,7 +17,10 @@
         }
 
         function normalizeResourceProviderCacheKey(provider = '115') {
-            return normalizeSubscriptionProvider(provider, '115') === 'quark' ? 'quark' : '115';
+            if (typeof window.normalizeResourceProviderName === 'function') {
+                return window.normalizeResourceProviderName(provider, '115');
+            }
+            return String(provider || '115').trim().toLowerCase() || '115';
         }
 
         function buildResourceFolderBranchCacheKey(cid = '0', { provider = '115', foldersOnly = false } = {}) {
@@ -378,7 +381,8 @@
             {
                 offset = 0,
                 limit = RESOURCE_SHARE_BROWSE_PAGE_LIMIT,
-                paged = true
+                paged = true,
+                forceRefresh = false
             } = {}
         ) {
             const receiveCode = normalizeReceiveCodeInput(resourceShareReceiveCode);
@@ -396,6 +400,7 @@
                 normalizedOffset,
                 normalizedLimit,
                 paged ? '1' : '0',
+                forceRefresh ? 'refresh' : 'cache',
                 normalizedResourceId > 0 ? '' : rawText
             ].join('|');
             const inFlight = resourceShareFetchInFlight[requestKey];
@@ -419,6 +424,7 @@
                     });
                     if (receiveCode) params.set('receive_code', receiveCode);
                     if (paged) params.set('paged', '1');
+                    if (forceRefresh) params.set('force_refresh', '1');
                     params.set('offset', String(normalizedOffset));
                     params.set('limit', String(normalizedLimit));
                     data = await fetchResourceBrowserJson(`${shareApiPrefix}/share_entries?${params.toString()}`);
@@ -432,6 +438,7 @@
                             raw_text: rawText,
                             receive_code: receiveCode,
                             paged: !!paged,
+                            force_refresh: !!forceRefresh,
                             offset: normalizedOffset,
                             limit: normalizedLimit
                         })
@@ -638,7 +645,7 @@
 
         async function reloadResourceShareRoot() {
             if (!selectedResourceItem || !isCurrentResource115Share()) return;
-            await loadResourceShareBranch(selectedResourceId, '0', { resetSelection: true });
+            await loadResourceShareBranch(selectedResourceId, '0', { resetSelection: true, forceRefresh: true });
         }
 
         function applyResourceShareSelection(entry, checked, { renderAfter = true } = {}) {
@@ -670,7 +677,7 @@
             }
         }
 
-        async function loadResourceShareBranch(resourceId, cid = '0', { resetSelection = false, append = false } = {}) {
+        async function loadResourceShareBranch(resourceId, cid = '0', { resetSelection = false, append = false, forceRefresh = false } = {}) {
             if (!isLinkTypeCookieConfigured(resourceModalLinkType) || !isCurrentResource115Share()) {
                 renderResourceShareBrowser();
                 return;
@@ -710,7 +717,8 @@
                 const result = await fetchResourceShareData(resourceId, branchId, {
                     offset: requestOffset,
                     limit: RESOURCE_SHARE_BROWSE_PAGE_LIMIT,
-                    paged: true
+                    paged: true,
+                    forceRefresh: !!forceRefresh && !appendMode
                 });
                 if (selectedResourceId !== Number(resourceId)) return;
                 if (isRoot && !appendMode && currentToken !== resourceShareRequestToken) return;

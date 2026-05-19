@@ -31,7 +31,7 @@ RESOURCE_LINK_TYPE_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("baidu", re.compile(r"https?://(?:pan|yun)\.baidu\.com/(?:s/|share/)", re.IGNORECASE)),
     ("xunlei", re.compile(r"https?://(?:pan|xlpan)\.xunlei\.com/s/[a-z0-9]+", re.IGNORECASE)),
     ("uc", re.compile(r"https?://drive\.uc\.cn/s/[a-z0-9]+", re.IGNORECASE)),
-    ("123pan", re.compile(r"https?://(?:www\.)?(?:123pan|123684|123865|123912)\.(?:com|cn)/s/[a-z0-9]+", re.IGNORECASE)),
+    ("123pan", re.compile(r"https?://(?:www\.)?(?:123pan|123684|123865|123912)\.(?:com|cn)/s/[a-z0-9_-]+(?:\.html?)?", re.IGNORECASE)),
     ("tianyi", re.compile(r"https?://cloud\.189\.cn/(?:t/|web/share)", re.IGNORECASE)),
     ("pikpak", re.compile(r"https?://(?:www\.)?(?:mypikpak|pikpak)\.com/s/[a-z0-9]+", re.IGNORECASE)),
     ("lanzou", re.compile(r"https?://(?:www\.)?lanzou[a-z0-9]*\.[a-z.]+/[a-z0-9]+", re.IGNORECASE)),

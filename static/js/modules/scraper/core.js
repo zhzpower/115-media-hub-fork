@@ -1,13 +1,27 @@
 const SCRAPER_JOB_ACTIVE_STATUSES = new Set(['pending', 'running', 'rollback_running']);
-const SCRAPER_PROVIDER_LABELS = { '115': '115', quark: '夸克' };
+
+function getScraperProviderOptions() {
+    const meta = window.providerMeta || [];
+    return meta
+        .filter(p => p.enabled && p.supports_folder_browse !== false)
+        .map(p => ({
+            provider: p.name,
+            label: p.label,
+            configured: true,
+            configuredKnown: false,
+            operations: buildProviderOperationsFromMeta(p),
+        }));
+}
 
 const state = {
     initialized: false,
     provider: '115',
     providers: [],
+    providersLoaded: false,
     cid: '0',
     trail: [{ id: '0', name: '根目录' }],
     entries: [],
+    entryError: '',
     summary: { folder_count: 0, file_count: 0 },
     selected: new Map(),
     entrySort: { key: 'name', direction: 'asc' },
@@ -24,6 +38,7 @@ const state = {
     tmdb: null,
     manualBusy: false,
     manualResults: [],
+    manualMediaTypeTouched: false,
     planBusy: false,
     plan: null,
     planSelections: new Set(),
@@ -69,17 +84,67 @@ async function showConfirm(message, options = {}) {
 
 function normalizeProvider(value) {
     const raw = String(value || '').trim().toLowerCase();
-    return raw === 'quark' || raw === '夸克' ? 'quark' : '115';
+    if (!raw) return '115';
+    const known = [
+        ...(Array.isArray(state?.providers) ? state.providers : []),
+        ...(Array.isArray(window.providerMeta) ? window.providerMeta : []),
+    ];
+    const matched = known.find(item => {
+        const providerName = String(item?.provider || item?.name || '').trim().toLowerCase();
+        return providerName === raw;
+    });
+    return String(matched?.provider || matched?.name || raw).trim();
+}
+
+function buildProviderOperationsFromMeta(item = {}) {
+    const browseSupported = item?.supports_folder_browse !== false;
+    const renameSupported = item?.supports_rename === true;
+    const moveSupported = item?.supports_move === true;
+    const copySupported = item?.supports_copy === true;
+    const deleteSupported = item?.supports_delete === true;
+    const scrapeSupported = browseSupported && renameSupported && moveSupported;
+    return {
+        browse: browseSupported,
+        create_folder: browseSupported,
+        rename: renameSupported,
+        copy: copySupported,
+        move: moveSupported,
+        delete: deleteSupported,
+        scrape: scrapeSupported,
+        rollback: scrapeSupported,
+    };
+}
+
+function getProviderInfo(provider = state.provider) {
+    const normalized = normalizeProvider(provider);
+    return state.providers.find(item => normalizeProvider(item.provider) === normalized)
+        || (window.providerMeta || []).find(item => normalizeProvider(item.name) === normalized)
+        || null;
+}
+
+function getProviderOperations(provider = state.provider) {
+    const normalized = normalizeProvider(provider);
+    const info = getProviderInfo(normalized);
+    if (info?.operations && typeof info.operations === 'object') return info.operations;
+    if (info) return buildProviderOperationsFromMeta(info);
+    return { browse: true, create_folder: true, rename: false, copy: false, move: false, delete: false, scrape: false, rollback: false };
+}
+
+function supportsProviderOperation(operation, provider = state.provider) {
+    return getProviderOperations(provider)?.[operation] === true;
 }
 
 function getProviderLabel(provider = state.provider) {
-    return SCRAPER_PROVIDER_LABELS[normalizeProvider(provider)] || '115';
+    const normalized = normalizeProvider(provider);
+    const p = getProviderInfo(normalized) || getScraperProviderOptions().find(o => normalizeProvider(o.provider) === normalized);
+    return p ? (p.label || normalized) : normalized;
 }
 
 function isProviderConfigured(provider = state.provider) {
     const normalized = normalizeProvider(provider);
-    const item = state.providers.find(providerInfo => normalizeProvider(providerInfo.provider) === normalized);
-    return !!item?.configured;
+    const item = getProviderInfo(normalized);
+    if (item && typeof item.configured === 'boolean') return item.configured;
+    return true;
 }
 
 function normalizeCid(value) {
@@ -261,11 +326,24 @@ function resetIdentifyContext({ resetInputs = false } = {}) {
     state.identifySelectionKey = '';
     state.tmdb = null;
     state.manualResults = [];
+    state.manualMediaTypeTouched = false;
     if (resetInputs) {
         const manualInput = $('scraper-manual-query');
         if (manualInput) manualInput.value = '';
         const mediaSelect = $('scraper-manual-media-type');
         if (mediaSelect) mediaSelect.value = 'movie';
+    }
+}
+
+function applyIdentifyManualSearchDefaults(identifyResult = {}) {
+    const data = identifyResult && typeof identifyResult === 'object' ? identifyResult : {};
+    const manualInput = $('scraper-manual-query');
+    if (manualInput && !String(manualInput.value || '').trim() && data.query) {
+        manualInput.value = String(data.query || '');
+    }
+    const mediaSelect = $('scraper-manual-media-type');
+    if (mediaSelect && data.media_type && !state.manualMediaTypeTouched) {
+        mediaSelect.value = data.media_type === 'tv' ? 'tv' : 'movie';
     }
 }
 
@@ -413,14 +491,17 @@ function renderProviderTabs() {
     if (!container) return;
     const providers = state.providers.length
         ? state.providers
-        : [
-            { provider: '115', label: '115', configured: false },
-            { provider: 'quark', label: '夸克', configured: false },
-        ];
+        : getScraperProviderOptions();
+    if (!providers.length) {
+        container.innerHTML = '';
+        return;
+    }
     container.innerHTML = providers.map((item) => {
         const provider = normalizeProvider(item.provider);
         const active = provider === state.provider;
-        const configured = !!item.configured;
+        const configuredKnown = item.configuredKnown !== false && typeof item.configured === 'boolean';
+        const configured = configuredKnown ? !!item.configured : true;
+        const statusText = configuredKnown ? (configured ? '已配置' : '未配置') : '已启用';
         return `
             <button
                 type="button"
@@ -429,7 +510,7 @@ function renderProviderTabs() {
                 aria-pressed="${active ? 'true' : 'false'}"
             >
                 <span>${escapeHtml(item.label || getProviderLabel(provider))}</span>
-                <small>${configured ? '已配置' : '未配置'}</small>
+                <small>${statusText}</small>
             </button>
         `;
     }).join('');
@@ -438,14 +519,20 @@ function renderProviderTabs() {
 function renderProviderStatus() {
     const el = $('scraper-provider-status');
     if (!el) return;
+    const availableProviders = state.providers.length ? state.providers : getScraperProviderOptions();
+    if (!availableProviders.length) {
+        el.textContent = '未启用可浏览网盘。';
+        return;
+    }
     const providerLabel = getProviderLabel();
     if (!isProviderConfigured()) {
-        el.textContent = `${providerLabel} Cookie 未配置，文件管理和刮削执行暂不可用。`;
+        el.textContent = `${providerLabel} 认证信息未配置，文件管理和刮削执行暂不可用。`;
         return;
     }
     const folderCount = Number(state.summary.folder_count || 0);
     const fileCount = Number(state.summary.file_count || 0);
-    el.textContent = `${providerLabel} / 当前目录 ${folderCount} 个文件夹、${fileCount} 个文件`;
+    const scrapeNote = state.providersLoaded && !supportsProviderOperation('scrape') ? ' / 暂不支持刮削执行' : '';
+    el.textContent = `${providerLabel} / 当前目录 ${folderCount} 个文件夹、${fileCount} 个文件${scrapeNote}`;
 }
 
 function renderBreadcrumbs() {
@@ -514,12 +601,14 @@ function renderSelection() {
     const selectedInCurrent = state.entries.filter(item => state.selected.has(item.id)).length;
     const renameButton = document.querySelector('[data-scraper-action="rename-selected"]');
     if (renameButton) {
-        const canRename = selectedEntries.length === 1 && !hasPlan;
+        const canRename = supportsProviderOperation('rename') && selectedEntries.length === 1 && !hasPlan;
         renameButton.classList.remove('hidden');
         renameButton.disabled = state.loading || !canRename;
         renameButton.classList.toggle('btn-disabled', state.loading || !canRename);
         renameButton.textContent = '重命名';
-        renameButton.title = canRename ? '重命名选中的文件或文件夹' : '请选择一个文件或文件夹进行重命名';
+        renameButton.title = supportsProviderOperation('rename')
+            ? (canRename ? '重命名选中的文件或文件夹' : '请选择一个文件或文件夹进行重命名')
+            : `${getProviderLabel()} 暂不支持重命名`;
     }
     const clearIdentifyButton = document.querySelector('[data-scraper-action="clear-identify"]');
     if (clearIdentifyButton) {
@@ -534,10 +623,10 @@ function renderSelection() {
     }
     const actionRules = {
         'select-range': !hasPlan && selectedInCurrent >= 2,
-        'prepare-copy': hasSelection,
-        'prepare-move': hasSelection,
-        'delete-selected': hasSelection,
-        identify: hasSelection,
+        'prepare-copy': supportsProviderOperation('copy') && hasSelection,
+        'prepare-move': supportsProviderOperation('move') && hasSelection,
+        'delete-selected': supportsProviderOperation('delete') && hasSelection,
+        identify: supportsProviderOperation('scrape') && hasSelection,
     };
     Object.entries(actionRules).forEach(([action, enabled]) => {
         const button = document.querySelector(`[data-scraper-action="${action}"]`);
@@ -556,8 +645,9 @@ function renderSelection() {
     if (inlineExecuteBtn) {
         const showExecute = hasPlan;
         inlineExecuteBtn.classList.toggle('hidden', !showExecute);
-        inlineExecuteBtn.disabled = state.executeBusy || selectedReadyCount <= 0;
-        inlineExecuteBtn.classList.toggle('btn-disabled', state.executeBusy || selectedReadyCount <= 0);
+        const executeDisabled = state.executeBusy || selectedReadyCount <= 0 || !supportsProviderOperation('scrape');
+        inlineExecuteBtn.disabled = executeDisabled;
+        inlineExecuteBtn.classList.toggle('btn-disabled', executeDisabled);
         inlineExecuteBtn.textContent = state.executeBusy ? '提交中...' : `执行重命名 ${selectedReadyCount} 项`;
     }
     syncFolderScopedControls();
@@ -568,7 +658,7 @@ function syncBuildPlanControls() {
     const selectedEntries = getEffectiveSelectedEntries();
     const hasBinding = !!(state.tmdb && Number(state.tmdb.tmdb_id || state.tmdb.id || 0) > 0);
     const hasPlan = getPlanActions().length > 0;
-    const showBuild = selectedEntries.length > 0 && hasBinding && !hasPlan;
+    const showBuild = supportsProviderOperation('scrape') && selectedEntries.length > 0 && hasBinding && !hasPlan;
     const inlineBuildBtn = $('scraper-inline-build-plan-btn');
     if (inlineBuildBtn) {
         inlineBuildBtn.classList.toggle('hidden', !showBuild);
@@ -626,6 +716,13 @@ function renderEntries() {
         refreshBtn.disabled = !!state.loading;
         refreshBtn.classList.toggle('btn-disabled', !!state.loading);
     }
+    const canCreateFolder = isProviderConfigured() && supportsProviderOperation('create_folder');
+    document.querySelectorAll('[data-scraper-action="toggle-create-folder"], [data-scraper-action="create-folder"]').forEach((button) => {
+        const disabled = state.loading || !canCreateFolder;
+        button.disabled = disabled;
+        button.classList.toggle('btn-disabled', disabled);
+        button.title = canCreateFolder ? (button.title || '新建文件夹') : `${getProviderLabel()} 暂不支持新建文件夹`;
+    });
     const header = document.querySelector('.scraper-entry-header');
     const table = document.querySelector('.scraper-entry-table');
     const planActions = getPlanActions();
@@ -691,7 +788,11 @@ function renderEntries() {
         return;
     }
     if (!isProviderConfigured()) {
-        list.innerHTML = `<div class="scraper-empty-row">请先到参数配置填写 ${escapeHtml(getProviderLabel())} Cookie。</div>`;
+        list.innerHTML = `<div class="scraper-empty-row">请先到参数配置填写 ${escapeHtml(getProviderLabel())} 认证信息。</div>`;
+        return;
+    }
+    if (state.entryError) {
+        list.innerHTML = `<div class="scraper-empty-row">读取${escapeHtml(getProviderLabel())}目录失败：${escapeHtml(state.entryError)}</div>`;
         return;
     }
     if (!state.entries.length) {
@@ -1018,14 +1119,6 @@ function renderIdentify() {
             }).join('');
         }
     }
-    const manualInput = $('scraper-manual-query');
-    if (manualInput && !String(manualInput.value || '').trim() && identifyResult.query) {
-        manualInput.value = String(identifyResult.query || '');
-    }
-    const mediaSelect = $('scraper-manual-media-type');
-    if (mediaSelect && identifyResult.media_type) {
-        mediaSelect.value = identifyResult.media_type === 'tv' ? 'tv' : 'movie';
-    }
     syncSeasonControl();
     syncEpisodeModeControl();
     syncFileInfoControls();
@@ -1071,13 +1164,15 @@ function renderPlan() {
     if (inlineExecuteBtn) {
         const showExecute = getPlanActions().length > 0;
         inlineExecuteBtn.classList.toggle('hidden', !showExecute);
-        inlineExecuteBtn.disabled = state.executeBusy || selectedReadyCount <= 0;
-        inlineExecuteBtn.classList.toggle('btn-disabled', state.executeBusy || selectedReadyCount <= 0);
+        const executeDisabled = state.executeBusy || selectedReadyCount <= 0 || !supportsProviderOperation('scrape');
+        inlineExecuteBtn.disabled = executeDisabled;
+        inlineExecuteBtn.classList.toggle('btn-disabled', executeDisabled);
         inlineExecuteBtn.textContent = state.executeBusy ? '提交中...' : `执行重命名 ${selectedReadyCount} 项`;
     }
     if (executeBtn) {
-        executeBtn.disabled = state.executeBusy || selectedReadyCount <= 0;
-        executeBtn.classList.toggle('btn-disabled', state.executeBusy || selectedReadyCount <= 0);
+        const executeDisabled = state.executeBusy || selectedReadyCount <= 0 || !supportsProviderOperation('scrape');
+        executeBtn.disabled = executeDisabled;
+        executeBtn.classList.toggle('btn-disabled', executeDisabled);
         executeBtn.textContent = state.executeBusy ? '提交中...' : `执行重命名 ${selectedReadyCount} 项`;
     }
     if (!summary || !list) return;
@@ -1164,13 +1259,34 @@ function renderJobs() {
     }).join('');
 }
 
+function applyProvidersFromMeta() {
+    const providers = getScraperProviderOptions();
+    if (!providers.length) return false;
+    state.providers = providers;
+    const current = providers.find(item => normalizeProvider(item.provider) === state.provider);
+    if (!current) state.provider = normalizeProvider(providers[0].provider);
+    renderProviderTabs();
+    renderProviderStatus();
+    return true;
+}
+
 async function loadProviders() {
-    const data = await window.MediaHubApi.getJson('/scraper/providers');
-    state.providers = Array.isArray(data.providers) ? data.providers : [];
-    const current = state.providers.find(item => normalizeProvider(item.provider) === state.provider);
-    if (!current || !current.configured) {
-        const firstConfigured = state.providers.find(item => item.configured);
-        if (firstConfigured) state.provider = normalizeProvider(firstConfigured.provider);
+    applyProvidersFromMeta();
+    try {
+        const data = await window.MediaHubApi.getJson('/scraper/providers');
+        state.providersLoaded = true;
+        state.providers = (Array.isArray(data.providers) ? data.providers : []).map(item => ({
+            ...item,
+            configuredKnown: true,
+        }));
+        const current = state.providers.find(item => normalizeProvider(item.provider) === state.provider);
+        if (!current && state.providers.length) {
+            state.provider = normalizeProvider(state.providers[0].provider);
+        }
+    } catch (error) {
+        state.providersLoaded = false;
+        if (!state.providers.length) applyProvidersFromMeta();
+        showToast(`读取网盘列表失败：${error.message || '未知错误'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
     }
     renderProviderTabs();
     renderProviderStatus();
@@ -1178,6 +1294,7 @@ async function loadProviders() {
 
 async function loadEntries({ force = false, keepSearch = true } = {}) {
     state.loading = true;
+    state.entryError = '';
     renderEntries();
     try {
         const params = new URLSearchParams({ cid: state.cid });
@@ -1186,12 +1303,14 @@ async function loadEntries({ force = false, keepSearch = true } = {}) {
         const data = await window.MediaHubApi.getJson(`/scraper/${encodeURIComponent(state.provider)}/entries?${params.toString()}`);
         state.entries = (Array.isArray(data.entries) ? data.entries : []).map(enrichEntry);
         state.summary = data.summary || { folder_count: 0, file_count: 0 };
+        state.entryError = '';
         clearSelection();
         resetIdentifyContext({ resetInputs: true });
     } catch (error) {
         state.entries = [];
         state.summary = { folder_count: 0, file_count: 0 };
-        showToast(`读取目录失败：${error.message || '未知错误'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
+        state.entryError = error.message || '未知错误';
+        showToast(`读取目录失败：${state.entryError}`, { tone: 'error', duration: 3200, placement: 'top-center' });
     } finally {
         state.loading = false;
         renderEntries();
@@ -1478,10 +1597,7 @@ async function identifySelected() {
         state.identifyResult = data || {};
         state.tmdb = null;
         state.identifySelectionKey = selectionKey;
-        const manualInput = $('scraper-manual-query');
-        if (manualInput && data?.query) manualInput.value = String(data.query || '');
-        const mediaSelect = $('scraper-manual-media-type');
-        if (mediaSelect && data?.media_type) mediaSelect.value = data.media_type === 'tv' ? 'tv' : 'movie';
+        applyIdentifyManualSearchDefaults(data || {});
         showToast('已推荐关键词，请手动搜索并绑定 TMDB 条目', {
             tone: 'info',
             duration: 2600,
@@ -1513,6 +1629,7 @@ async function bindTmdbCandidate(item) {
         if (state.tmdb?.tmdb_media_type) {
             const mediaSelect = $('scraper-manual-media-type');
             if (mediaSelect) mediaSelect.value = state.tmdb.tmdb_media_type === 'tv' ? 'tv' : 'movie';
+            state.manualMediaTypeTouched = false;
             const seasonInput = $('scraper-season');
             if (seasonInput && state.tmdb.tmdb_media_type === 'tv') {
                 const maxSeason = getTmdbSeasonCount(state.tmdb);
@@ -1895,8 +2012,11 @@ function handleChange(event) {
         return;
     }
     if (event.target?.id === 'scraper-manual-media-type') {
+        state.manualMediaTypeTouched = true;
+        state.manualResults = [];
         syncSeasonControl();
         syncEpisodeModeControl();
+        renderIdentify();
         return;
     }
     if (event.target?.id === 'scraper-episode-mode') {

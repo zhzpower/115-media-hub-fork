@@ -1565,15 +1565,81 @@
             return { source: normalized, reason: '' };
         }
 
+        function unwrapResourceSourceImportValue(value) {
+            let text = String(value || '').trim();
+            text = text.replace(/^`+|`+$/g, '').trim();
+            if ((text.startsWith('\\"') && text.endsWith('\\"')) || (text.startsWith("\\'") && text.endsWith("\\'"))) {
+                text = text.slice(2, -2).trim();
+            }
+            if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+                text = text.slice(1, -1).trim();
+            }
+            return text.replace(/\\"/g, '"').replace(/\\'/g, "'");
+        }
+
+        function readQuotedResourceSourceImportValue(text, startIndex, quoteChar) {
+            let value = '';
+            for (let index = startIndex + 1; index < text.length; index += 1) {
+                const char = text[index];
+                if (char === '\\' && index + 1 < text.length) {
+                    value += text[index + 1];
+                    index += 1;
+                    continue;
+                }
+                if (char === quoteChar) return value;
+                value += char;
+            }
+            return value;
+        }
+
+        function extractPanSearchChannelsValue(text) {
+            const raw = String(text || '');
+            const assignmentPattern = /(^|[^\w])["']?CHANNELS["']?\s*[:=]\s*/ig;
+            let matched = null;
+            while ((matched = assignmentPattern.exec(raw)) !== null) {
+                let valueStart = matched.index + matched[0].length;
+                while (valueStart < raw.length && /\s/.test(raw[valueStart])) valueStart += 1;
+                const firstChar = raw[valueStart];
+                if (firstChar === '"' || firstChar === "'") {
+                    const value = readQuotedResourceSourceImportValue(raw, valueStart, firstChar).trim();
+                    if (value) return value;
+                    continue;
+                }
+
+                const lineEnd = raw.slice(valueStart).search(/[\r\n]/);
+                const valueEnd = lineEnd >= 0 ? valueStart + lineEnd : raw.length;
+                let value = raw.slice(valueStart, valueEnd).trim();
+                if (!value) continue;
+                value = value
+                    .replace(/\s+#.*$/g, '')
+                    .replace(/,\s*["']?[A-Z_][A-Z0-9_]*["']?\s*[:=].*$/g, '')
+                    .replace(/[;,]\s*$/g, '')
+                    .trim();
+                value = unwrapResourceSourceImportValue(value);
+                if (value) return value;
+            }
+            return '';
+        }
+
         function parsePanSearchResourceSourceImportText(text) {
-            const matched = String(text || '').match(/(?:^|\n)\s*(?:export\s+)?CHANNELS\s*=\s*([^\n\r]+)/i);
-            if (!matched) return null;
-            let value = String(matched[1] || '').trim();
-            value = value.replace(/^['"]|['"]$/g, '').trim();
-            const items = value
-                .split(',')
-                .map(item => item.trim())
-                .filter(Boolean);
+            const value = extractPanSearchChannelsValue(text);
+            if (!value) return null;
+            let items = null;
+            try {
+                const parsed = JSON.parse(value);
+                if (Array.isArray(parsed)) items = parsed.map(item => String(item || '').trim());
+            } catch (e) {
+                items = null;
+            }
+            if (!items) {
+                const listText = value.startsWith('[') && value.endsWith(']')
+                    ? value.slice(1, -1)
+                    : value;
+                items = listText
+                    .split(',')
+                    .map(item => unwrapResourceSourceImportValue(item).trim())
+                    .filter(Boolean);
+            }
             if (!items.length) throw new Error('盘搜 CHANNELS 格式中没有频道 ID');
             return items;
         }
@@ -1587,6 +1653,10 @@
         function parseResourceSourceImportText(rawText) {
             const text = String(rawText || '').trim();
             if (!text) throw new Error('请先粘贴频道源配置');
+            const hasPansouPluginsOnly = /\bENABLED_PLUGINS\b\s*[:=]/i.test(text) && !/\bCHANNELS\b\s*[:=]/i.test(text);
+            if (hasPansouPluginsOnly) {
+                throw new Error('检测到的是 PanSou 插件列表 ENABLED_PLUGINS，不是频道模板；请把这些值填到设置页的 PanSou 插件列表，频道导入需要包含 CHANNELS=...');
+            }
             let payload = null;
             let detectedFormat = '';
             let jsonError = null;
@@ -1599,10 +1669,10 @@
             if (!payload) {
                 try {
                     payload = parsePanSearchResourceSourceImportText(text);
-                    if (!payload) throw new Error('未找到 CHANNELS=...');
+                    if (!payload) throw new Error('未找到 CHANNELS 配置');
                     detectedFormat = '盘搜 CHANNELS';
                 } catch (e) {
-                    throw new Error(`无法识别频道格式：${e.message || jsonError?.message || '请粘贴 JSON 数组或 export CHANNELS=...'}`);
+                    throw new Error(`无法识别频道格式：${e.message || jsonError?.message || '请粘贴 JSON 数组或包含 CHANNELS 的盘搜模板'}`);
                 }
             }
             if (!Array.isArray(payload)) throw new Error('导入内容必须是频道数组');

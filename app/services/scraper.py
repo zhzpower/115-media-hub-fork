@@ -4,23 +4,8 @@ import unicodedata
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core import *  # noqa: F401,F403
-from ..providers.pan115 import (
-    copy_115_entries,
-    create_115_folder,
-    delete_115_entries,
-    invalidate_115_entries_cache,
-    list_115_entries_payload,
-    move_115_entries,
-    rename_115_entry,
-)
-from ..providers.quark import (
-    copy_quark_entries,
-    create_quark_folder,
-    delete_quark_entries,
-    list_quark_entries_payload,
-    move_quark_entries,
-    rename_quark_entry,
-)
+from ..providers.pan115 import invalidate_115_entries_cache
+from ..providers.registry import get_or_none as get_provider_or_none, list_enabled as list_enabled_providers
 from ..media_tags import media_tag_labels, remove_media_tags
 from ..services.subscription_episode import _extract_task_episodes_from_file_entry
 
@@ -119,17 +104,22 @@ SCRAPER_TRAILING_RELEASE_TOKENS = {
 }
 
 
+
+
 def normalize_scraper_provider(value: Any) -> str:
-    provider = str(value or "").strip().lower()
-    if provider in ("115", "pan115", "115pan"):
-        return "115"
-    if provider in ("quark", "夸克"):
-        return "quark"
+    name = str(value or "").strip().lower()
+    if not name:
+        return ""
+    p = get_provider_or_none(name)
+    if p and p.supports_folder_browse:
+        return p.name
     return ""
 
 
 def get_scraper_provider_label(provider: str) -> str:
-    return "夸克" if provider == "quark" else "115"
+    normalized = normalize_scraper_provider(provider)
+    p = get_provider_or_none(normalized) if normalized else None
+    return str(getattr(p, "label", "") or normalized or provider or "网盘")
 
 
 def normalize_scraper_job_clear_scope(value: Any) -> str:
@@ -143,32 +133,60 @@ def normalize_scraper_job_clear_scope(value: Any) -> str:
 
 def _get_provider_cookie(provider: str, cfg: Optional[Dict[str, Any]] = None) -> str:
     active_cfg = cfg or get_config()
-    return str(active_cfg.get("cookie_quark" if provider == "quark" else "cookie_115", "") or "").strip()
+    p = get_provider_or_none(normalize_scraper_provider(provider))
+    if not p:
+        return ""
+    return p.get_cookie(active_cfg)
+
+
+def _build_scraper_operations(provider: str) -> Dict[str, bool]:
+    normalized = normalize_scraper_provider(provider)
+    p = get_provider_or_none(normalized)
+    browse_supported = bool(p and p.supports_folder_browse)
+    rename_supported = bool(p and p.supports_rename)
+    move_supported = bool(p and p.supports_move)
+    copy_supported = bool(p and p.supports_copy)
+    delete_supported = bool(p and p.supports_delete)
+    scrape_supported = bool(browse_supported and rename_supported and move_supported)
+    return {
+        "browse": browse_supported,
+        "create_folder": browse_supported,
+        "rename": rename_supported,
+        "copy": copy_supported,
+        "move": move_supported,
+        "delete": delete_supported,
+        "scrape": scrape_supported,
+        "rollback": scrape_supported,
+    }
 
 
 def build_scraper_providers_payload(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     active_cfg = cfg or get_config()
     providers = []
-    for provider in ("115", "quark"):
-        cookie = _get_provider_cookie(provider, active_cfg)
+    for p in list_enabled_providers(active_cfg):
+        if not p.supports_folder_browse:
+            continue
+        provider = normalize_scraper_provider(p.name)
+        if not provider:
+            continue
         providers.append(
             {
                 "provider": provider,
-                "label": get_scraper_provider_label(provider),
-                "configured": bool(cookie),
-                "operations": {
-                    "browse": True,
-                    "create_folder": True,
-                    "rename": True,
-                    "copy": True,
-                    "move": True,
-                    "delete": True,
-                    "scrape": True,
-                    "rollback": True,
-                },
+                "label": p.label,
+                "configured": bool(p.is_configured(active_cfg)),
+                "operations": _build_scraper_operations(provider),
             }
         )
     return {"ok": True, "providers": providers}
+
+
+def _require_scraper_operation(provider: str, operation: str, label: str = "") -> None:
+    normalized = normalize_scraper_provider(provider)
+    operations = _build_scraper_operations(normalized)
+    if not operations.get(operation):
+        provider_label = get_scraper_provider_label(normalized)
+        operation_label = label or operation
+        raise RuntimeError(f"{provider_label} 暂不支持刮削{operation_label}")
 
 
 def _require_provider_cookie(provider: str) -> str:
@@ -177,7 +195,7 @@ def _require_provider_cookie(provider: str) -> str:
         raise RuntimeError("网盘类型无效")
     cookie = _get_provider_cookie(normalized)
     if not cookie:
-        raise RuntimeError(f"请先配置 {get_scraper_provider_label(normalized)} Cookie")
+        raise RuntimeError(f"请先配置 {get_scraper_provider_label(normalized)} 认证信息")
     return cookie
 
 
@@ -186,43 +204,44 @@ def _list_provider_entries_payload(
     cookie: str,
     cid: str = "0",
     *,
-    force_refresh: bool = False,
     folders_only: bool = False,
 ) -> Dict[str, Any]:
     target_id = str(cid or "0").strip() or "0"
-    if provider == "quark":
-        return list_quark_entries_payload(cookie, target_id, folders_only=folders_only)
-    return list_115_entries_payload(cookie, target_id, force_refresh=force_refresh, folders_only=folders_only)
+    p = get_provider_or_none(provider)
+    if not p:
+        raise RuntimeError("网盘类型无效")
+    return p.list_entries_payload(cookie, target_id, folders_only=folders_only)
 
 
 def _create_provider_folder(provider: str, cookie: str, cid: str, name: str) -> Dict[str, Any]:
-    if provider == "quark":
-        return create_quark_folder(cookie, cid, name)
-    return create_115_folder(cookie, cid, name)
+    p = get_provider_or_none(provider)
+    if not p:
+        raise RuntimeError("网盘类型无效")
+    return p.create_folder(cookie, cid, name)
 
 
 def _rename_provider_entry(provider: str, cookie: str, entry_id: str, new_name: str, parent_id: str = "") -> Dict[str, Any]:
-    if provider == "quark":
-        return rename_quark_entry(cookie, entry_id, new_name, parent_id)
-    return rename_115_entry(cookie, entry_id, new_name, parent_id)
+    _require_scraper_operation(provider, "rename", "重命名")
+    p = get_provider_or_none(provider)
+    return p.rename_entry(cookie, entry_id, new_name, parent_id)
 
 
 def _move_provider_entries(provider: str, cookie: str, entry_ids: List[str], target_id: str, source_id: str = "") -> Dict[str, Any]:
-    if provider == "quark":
-        return move_quark_entries(cookie, entry_ids, target_id, source_id)
-    return move_115_entries(cookie, entry_ids, target_id, source_id)
+    _require_scraper_operation(provider, "move", "移动")
+    p = get_provider_or_none(provider)
+    return p.move_entries(cookie, entry_ids, target_id, source_id)
 
 
 def _copy_provider_entries(provider: str, cookie: str, entry_ids: List[str], target_id: str, source_id: str = "") -> Dict[str, Any]:
-    if provider == "quark":
-        return copy_quark_entries(cookie, entry_ids, target_id, source_id)
-    return copy_115_entries(cookie, entry_ids, target_id, source_id)
+    _require_scraper_operation(provider, "copy", "复制")
+    p = get_provider_or_none(provider)
+    return p.copy_entries(cookie, entry_ids, target_id, source_id)
 
 
 def _delete_provider_entries(provider: str, cookie: str, entry_ids: List[str], parent_id: str = "") -> Dict[str, Any]:
-    if provider == "quark":
-        return delete_quark_entries(cookie, entry_ids, parent_id)
-    return delete_115_entries(cookie, entry_ids, parent_id)
+    _require_scraper_operation(provider, "delete", "删除")
+    p = get_provider_or_none(provider)
+    return p.delete_entries(cookie, entry_ids, parent_id)
 
 
 def _invalidate_provider_parent(provider: str, parent_id: str = "") -> None:
@@ -327,7 +346,9 @@ def list_scraper_entries(provider: str, cid: str = "0", force_refresh: bool = Fa
     normalized = normalize_scraper_provider(provider)
     cookie = _require_provider_cookie(normalized)
     target_id = str(cid or "0").strip() or "0"
-    payload = _list_provider_entries_payload(normalized, cookie, target_id, force_refresh=force_refresh, folders_only=False)
+    if force_refresh:
+        _invalidate_provider_parent(normalized, target_id)
+    payload = _list_provider_entries_payload(normalized, cookie, target_id, folders_only=False)
     entries = [
         compact
         for compact in (_compact_scraper_entry(item, target_id) for item in (payload.get("entries", []) if isinstance(payload, dict) else []))
@@ -1085,6 +1106,7 @@ def _expand_selected_scraper_entries(provider: str, cookie: str, selected: List[
 
 def build_scraper_rename_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     provider = normalize_scraper_provider(payload.get("provider", "115")) or "115"
+    _require_scraper_operation(provider, "scrape", "执行")
     cookie = _require_provider_cookie(provider)
     tmdb = payload.get("tmdb") if isinstance(payload.get("tmdb"), dict) else {}
     if max(0, parse_int(tmdb.get("tmdb_id") or tmdb.get("id") or 0, 0)) <= 0:
@@ -1324,6 +1346,7 @@ def _insert_scraper_job(provider: str, plan: Dict[str, Any], options: Dict[str, 
 def create_scraper_job_from_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
     provider = normalize_scraper_provider(plan.get("provider") or payload.get("provider", "115")) or "115"
+    _require_scraper_operation(provider, "scrape", "执行")
     actions = [item for item in plan.get("actions", []) if isinstance(item, dict)]
     if not actions:
         raise RuntimeError("没有可执行的改名计划")
@@ -1584,6 +1607,7 @@ def run_scraper_job(job_id: int) -> None:
     try:
         job, actions = _load_scraper_job(job_id)
         provider = normalize_scraper_provider(job.get("provider", "115")) or "115"
+        _require_scraper_operation(provider, "scrape", "执行")
         cookie = _require_provider_cookie(provider)
         plan = safe_json_loads(job.get("plan_json", "{}"), {})
         base_cid = str(plan.get("base_cid", "0") or "0").strip() or "0"
@@ -1646,6 +1670,7 @@ def rollback_scraper_job(job_id: int) -> None:
     try:
         job, actions = _load_scraper_job(job_id)
         provider = normalize_scraper_provider(job.get("provider", "115")) or "115"
+        _require_scraper_operation(provider, "rollback", "回退")
         cookie = _require_provider_cookie(provider)
     except Exception as exc:
         _update_scraper_job(job_id, status="rollback_failed", status_detail=str(exc), rollback_failed_actions=1, finished_at=now_text())

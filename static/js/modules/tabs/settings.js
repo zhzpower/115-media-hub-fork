@@ -2,6 +2,18 @@ export async function ensureTabData(context) {
     context.moduleVisitState.settings = true;
 }
 
+let latestCookieHealthState = {};
+const cookieHealthBusyProviders = new Set();
+
+function escapeHtml(value = '') {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function randomAlphaNumericSecret(length = 32) {
     const size = Math.max(8, Number(length || 32) || 32);
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
@@ -52,7 +64,48 @@ function parseFavoriteDirLines(value = '') {
         .slice(0, 12);
 }
 
+function formatFavoriteDirLines(items = []) {
+    return (Array.isArray(items) ? items : [])
+        .map((item) => {
+            const path = normalizeFavoriteDirPath(item?.path || item?.savepath || '');
+            if (!path) return '';
+            const name = String(item?.name || '').trim();
+            return name ? `${name}=${path}` : path;
+        })
+        .filter(Boolean)
+        .join('\n');
+}
+
+export function renderResourceFavoriteDirSettings(favoriteDirs = {}) {
+    const grid = document.getElementById('resource-favorite-dir-settings-grid');
+    if (!grid) return;
+    const meta = (window.providerMeta || []).filter(p => p.supports_folder_browse !== false);
+    const providers = meta.length ? meta : [
+        { name: '115', label: '115' },
+        { name: 'quark', label: 'Quark' },
+    ];
+    const source = favoriteDirs && typeof favoriteDirs === 'object' ? favoriteDirs : {};
+    grid.innerHTML = providers.map((p) => {
+        const providerName = String(p.name || '').trim();
+        const providerLabel = String(p.label || providerName).trim();
+        const textareaId = `resource_favorite_dirs_${providerName.replace(/[^A-Za-z0-9_-]/g, '_')}`;
+        return `
+            <label class="block">
+                <span class="text-xs text-slate-500">${escapeHtml(providerLabel)} 常用目录</span>
+                <textarea id="${escapeHtml(textareaId)}" data-resource-favorite-provider="${escapeHtml(providerName)}" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 min-h-[110px]" placeholder="电影=影视/电影&#10;电视剧=影视/电视剧">${escapeHtml(formatFavoriteDirLines(source[providerName] || []))}</textarea>
+            </label>
+        `;
+    }).join('');
+}
+
 function collectResourceFavoriteDirs() {
+    const result = {};
+    document.querySelectorAll('[data-resource-favorite-provider]').forEach((el) => {
+        const provider = String(el.getAttribute('data-resource-favorite-provider') || '').trim();
+        if (!provider) return;
+        result[provider] = parseFavoriteDirLines(el.value || '');
+    });
+    if (Object.keys(result).length) return result;
     return {
         '115': parseFavoriteDirLines(document.getElementById('resource_favorite_dirs_115')?.value || ''),
         quark: parseFavoriteDirLines(document.getElementById('resource_favorite_dirs_quark')?.value || ''),
@@ -69,8 +122,6 @@ function collectSettingsPayload({
         'api_115_rate_limit_seconds',
         'api_115_list_cache_ttl_seconds',
         'api_115_download_url_cache_ttl_seconds',
-        'cookie_115',
-        'cookie_quark',
         'sign115_cron_time',
         'tg_proxy_protocol',
         'tg_proxy_host',
@@ -115,6 +166,21 @@ function collectSettingsPayload({
     cfg.tmdb_enabled = !!document.getElementById('tmdb_enabled')?.checked;
     cfg.pansou_enabled = !!document.getElementById('pansou_enabled')?.checked;
     cfg.resource_favorite_dirs = collectResourceFavoriteDirs();
+
+    // Dynamically collect provider cookies
+    const meta = window.providerMeta || [];
+    const providerEnabled = {};
+    meta.forEach(p => {
+        const keys = Array.isArray(p.config_keys) && p.config_keys.length ? p.config_keys : ['cookie_' + p.name];
+        keys.forEach((key) => {
+            const el = document.getElementById(key);
+            if (el) cfg[key] = el.value;
+        });
+        const enabledEl = document.getElementById('provider_enabled_' + p.name);
+        providerEnabled[p.name] = enabledEl ? enabledEl.checked : p.enabled;
+    });
+    cfg.provider_enabled = providerEnabled;
+    cfg.default_magnet_provider = '115';
 
     const rawTmdbCacheTtl = parseInt(document.getElementById('tmdb_cache_ttl_hours')?.value || '', 10);
     cfg.tmdb_cache_ttl_hours = Math.min(720, Math.max(1, Number.isFinite(rawTmdbCacheTtl) ? rawTmdbCacheTtl : 24));
@@ -458,34 +524,24 @@ export async function refreshCookieHealthStatus({
 
 export async function checkCookiesNow({
     force = true,
+    providers = null,
     isBusy = false,
     setBusy,
     renderCookieHealthCards,
+    getCookieHealthState,
     applyCookieHealthState,
     showToast,
 } = {}) {
-    if (isBusy) return;
-    if (typeof setBusy === 'function') setBusy(true);
-    if (typeof renderCookieHealthCards === 'function') renderCookieHealthCards();
-    try {
-        const data = await window.MediaHubApi.postJson('/settings/cookies/check', {
-            providers: ['115', 'quark'],
-            force: !!force
-        });
-        if (data?.cookie_health && typeof applyCookieHealthState === 'function') {
-            applyCookieHealthState(data.cookie_health);
-        }
-        if (typeof showToast === 'function') {
-            showToast('Cookie 检测已完成', { tone: 'success', duration: 2200, placement: 'top-center' });
-        }
-    } catch (err) {
-        if (typeof showToast === 'function') {
-            showToast(`Cookie 检测失败：${err?.message || '请稍后重试'}`, { tone: 'error', duration: 3000, placement: 'top-center' });
-        }
-    } finally {
-        if (typeof setBusy === 'function') setBusy(false);
-        if (typeof renderCookieHealthCards === 'function') renderCookieHealthCards();
-    }
+    return checkCookieHealthProviders({
+        providers,
+        force,
+        isBusy,
+        setBusy,
+        renderCookieHealthCards,
+        getCookieHealthState,
+        applyCookieHealthState,
+        showToast,
+    });
 }
 
 export async function refreshSign115Status({
@@ -541,6 +597,168 @@ export function generateWebhookSecret({ showToast } = {}) {
     }
 }
 
+export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
+    const container = document.getElementById('settings-provider-auth-container');
+    if (!container) return;
+    const meta = window.providerMeta || [];
+    if (!meta.length) return;
+
+    const sm = sensitiveMeta && typeof sensitiveMeta === 'object' ? sensitiveMeta : {};
+
+    container.innerHTML = meta.map(p => {
+        const enabled = p.enabled;
+        const configKeys = Array.isArray(p.config_keys) && p.config_keys.length ? p.config_keys : ['cookie_' + p.name];
+        const cookieKey = configKeys[0] || 'cookie_' + p.name;
+        const passwordKey = configKeys[1] || '';
+        const mixedUsernameKey = configKeys[1] || '';
+        const mixedPasswordKey = configKeys[2] || '';
+        const isConfigured = p.auth_type === 'password'
+            ? (!!sm[cookieKey] && !!sm[passwordKey])
+            : p.auth_type === 'password_cookie'
+            ? ((!!sm[mixedUsernameKey] && !!sm[mixedPasswordKey]) || !!sm[cookieKey])
+            : !!sm[cookieKey];
+        const placeholder = p.auth_type === 'refresh_token'
+            ? '粘贴 refresh_token'
+            : p.auth_type === 'password'
+            ? '输入 ' + p.label + ' 账号'
+            : p.auth_type === 'password_cookie'
+            ? '粘贴 ' + p.label + ' Cookie（账号密码触发验证码时备用）'
+            : '粘贴 ' + p.label + ' Cookie';
+
+        let authHint = '';
+        if (p.auth_type === 'refresh_token') {
+            authHint = '<a href="https://aliyuntoken.vercel.app/" target="_blank" class="text-xs text-blue-400 hover:text-blue-300">获取 refresh_token（手机扫码）</a>';
+        } else if (p.auth_type === 'oauth2') {
+            authHint = '<span class="text-xs text-slate-500">Cookie + OAuth2 自动续期</span>';
+        } else if (p.auth_type === 'password') {
+            authHint = '<span class="text-xs text-slate-500">账号密码登录，自动获取 Token</span>';
+        } else if (p.auth_type === 'password_cookie') {
+            authHint = '<span class="text-xs text-slate-500">优先账号密码登录；如触发验证码/短信/设备锁，可保留 Cookie 备用</span>';
+        } else {
+            authHint = '<span class="text-xs text-slate-500">从浏览器复制 Cookie</span>';
+        }
+
+        const tags = [];
+        if (p.supports_share_receive) tags.push('分享转存');
+        if (p.supports_offline) tags.push('离线下载');
+        if (p.supports_strm) tags.push('STRM');
+        const tagsHtml = tags.length ? '<span class="text-xs text-slate-500 ml-2">' + tags.join(' · ') + '</span>' : '';
+
+        const statusDot = isConfigured
+            ? '<span class="w-2 h-2 rounded-full bg-emerald-400 inline-block ml-1" title="已配置"></span>'
+            : '<span class="w-2 h-2 rounded-full bg-slate-600 inline-block ml-1" title="未配置"></span>';
+
+        return '<div class="provider-auth-block mb-3 bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">' +
+            '<div class="flex items-center justify-between p-3 cursor-pointer" onclick="toggleProviderBlock(\'' + p.name + '\')">' +
+                '<div class="flex items-center gap-3">' +
+                    '<span class="text-sm text-slate-200">' + p.label + '</span>' +
+                    statusDot +
+                    tagsHtml +
+                '</div>' +
+                '<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation()">' +
+                    '<input type="checkbox" id="provider_enabled_' + p.name + '" ' + (enabled ? 'checked' : '') + ' onchange="toggleProviderEnabled(\'' + p.name + '\', this.checked)" class="sr-only peer">' +
+                    '<div class="w-9 h-5 bg-slate-600 rounded-full peer peer-checked:bg-emerald-500/70 peer-focus:ring-2 peer-focus:ring-emerald-400/30 after:content-[\'\'] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>' +
+                '</label>' +
+            '</div>' +
+            '<div id="provider-block-body-' + p.name + '" class="p-3 pt-0 border-t border-slate-700/50 hidden">' +
+                authHint +
+                (p.auth_type === 'password'
+                    ? ('<input id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="' + placeholder + '">' +
+                       '<input id="' + passwordKey + '" type="password" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 密码">')
+                    : p.auth_type === 'password_cookie'
+                    ? ('<input id="' + mixedUsernameKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 账号">' +
+                       '<input id="' + mixedPasswordKey + '" type="password" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 密码">' +
+                       '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>')
+                    : '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>') +
+                '<div class="mt-2 flex items-center gap-2">' +
+                    '<button type="button" onclick="testProviderCookie(\'' + p.name + '\')" class="text-xs text-slate-400 hover:text-slate-200 bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors">健康检查</button>' +
+                    '<span id="provider-health-' + p.name + '" class="text-xs text-slate-500"></span>' +
+                '</div>' +
+            '</div>' +
+        '</div>';
+    }).join('');
+}
+
+function toggleProviderBlock(name) {
+    const body = document.getElementById('provider-block-body-' + name);
+    if (body) body.classList.toggle('hidden');
+}
+
+function toggleProviderEnabled(name, checked) {
+    window._providerEnabledChanged = true;
+}
+
+async function testProviderCookie(name) {
+    const meta = window.providerMeta || [];
+    const p = meta.find(m => m.name === name);
+    if (!p) return;
+    const cookieKey = p.config_keys[0] || 'cookie_' + name;
+    const credentials = {};
+    (Array.isArray(p.config_keys) ? p.config_keys : [cookieKey]).forEach((key) => {
+        credentials[key] = String(document.getElementById(key)?.value || '').trim();
+    });
+    const cookie = String(credentials[cookieKey] || '').trim();
+    const hasCurrentInput = p.auth_type === 'password'
+        ? (Array.isArray(p.config_keys) ? p.config_keys : [cookieKey]).every(key => String(credentials[key] || '').trim())
+        : p.auth_type === 'password_cookie'
+        ? (!!cookie || (!!String(credentials[p.config_keys?.[1]] || '').trim() && !!String(credentials[p.config_keys?.[2]] || '').trim()))
+        : !!cookie;
+    const statusEl = document.getElementById('provider-health-' + name);
+    if (statusEl) { statusEl.textContent = '检测中...'; statusEl.className = 'text-xs text-slate-500'; }
+    if (!hasCurrentInput) {
+        let result = null;
+        if (typeof window.checkCookieHealthProvider === 'function') {
+            result = await window.checkCookieHealthProvider(name);
+        }
+        if (statusEl) {
+            const entry = latestCookieHealthState?.[name] || {};
+            const tone = getCookieHealthResultTone(entry);
+            const rawMessage = result && typeof result === 'object' && result.message
+                ? String(result.message)
+                : getCookieHealthResultText(entry, name);
+            const labelPrefix = `${getCookieHealthProviderLabel(name)}：`;
+            const message = rawMessage.startsWith(labelPrefix) ? rawMessage.slice(labelPrefix.length) : rawMessage;
+            statusEl.textContent = message;
+            statusEl.className = 'text-xs ' + (
+                tone === 'success' ? 'text-emerald-400' :
+                tone === 'error' ? 'text-red-400' :
+                tone === 'warn' ? 'text-amber-300' : 'text-slate-500'
+            );
+        }
+        return;
+    }
+    try {
+        const resp = await window.MediaHubApi.postJson('/test_provider_cookie', { provider: name, cookie: cookie, credentials });
+        if (statusEl) {
+            statusEl.textContent = resp && resp.ok ? '✓ ' + ((resp && resp.message) || '当前输入可用，保存后生效') : '✗ ' + ((resp && resp.error) || '连接失败');
+            statusEl.className = 'text-xs ' + (resp && resp.ok ? 'text-emerald-400' : 'text-red-400');
+        }
+    } catch (e) {
+        if (statusEl) { statusEl.textContent = '✗ 请求失败'; statusEl.className = 'text-xs text-red-400'; }
+    }
+}
+
+export function renderMagnetProviderSetting(cfg) {
+    const container = document.getElementById('settings-magnet-provider-container');
+    if (!container) return;
+    const meta = window.providerMeta || [];
+    const pan115 = meta.find(p => p.name === '115');
+    const label = pan115?.label || '115网盘';
+
+    container.innerHTML = `
+        <div class="provider-auth-block mb-3 bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">
+            <div class="flex items-center justify-between p-3">
+                <div class="flex items-center gap-3">
+                    <span class="text-sm text-slate-200">磁力下载网盘</span>
+                    <span class="text-xs text-slate-500">固定离线下载</span>
+                </div>
+                <input id="default_magnet_provider" type="hidden" value="115">
+                <span class="px-3 py-1.5 rounded-lg bg-slate-700 border border-slate-600 text-sm text-slate-200">${label}</span>
+            </div>
+        </div>
+    `;
+}
+
 export async function saveSettings({
     sensitiveSettingFields = [],
     getSensitiveConfigMeta,
@@ -591,4 +809,277 @@ export async function saveSettings({
         showToast(`保存失败：${data?.msg || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
     }
     return false;
+}
+
+function getCookieHealthDotColor(state) {
+    if (state === 'valid') return '#10b981';
+    if (state === 'invalid' || state === 'error') return '#ef4444';
+    if (state === 'checking') return '#0ea5e9';
+    if (state === 'missing') return '#f59e0b';
+    if (state === 'disabled') return '#64748b';
+    return '#64748b';
+}
+
+function getEnabledCookieHealthProviders(providers = null) {
+    const meta = window.providerMeta || [];
+    const enabledProviders = meta.filter(p => p.enabled !== false);
+    const explicitProviders = Array.isArray(providers) && providers.length;
+    const source = explicitProviders
+        ? providers
+        : enabledProviders.map(p => p.name);
+    const names = [];
+    source.forEach((item) => {
+        const name = String(item || '').trim();
+        if (!name || names.includes(name)) return;
+        const provider = meta.find(p => p.name === name);
+        if (provider && provider.enabled === false) return;
+        names.push(name);
+    });
+    if (names.length) return names;
+    return explicitProviders ? [] : ['115', 'quark'];
+}
+
+function getCookieHealthProviderLabel(name) {
+    const provider = (window.providerMeta || []).find(p => p.name === name);
+    return String(provider?.label || name || '').trim();
+}
+
+function getCookieHealthResultTone(entry) {
+    const state = String(entry?.state || '').trim().toLowerCase();
+    if (state === 'valid') return 'success';
+    if (state === 'invalid' || state === 'error') return 'error';
+    if (state === 'missing' || state === 'unknown') return 'warn';
+    return 'info';
+}
+
+function getCookieHealthResultText(entry, providerName) {
+    const label = getCookieHealthProviderLabel(providerName);
+    const source = entry && typeof entry === 'object' ? entry : {};
+    const message = String(source.message || '').trim();
+    if (message) return message;
+    const state = String(source.state || '').trim().toLowerCase();
+    if (state === 'valid') return `${label} 认证信息可用`;
+    if (state === 'invalid') return `${label} 认证信息可能已失效`;
+    if (state === 'error') return `${label} 认证检测异常`;
+    if (state === 'missing') return `未配置 ${label} 认证信息`;
+    if (state === 'checking') return `正在检测 ${label} 认证信息...`;
+    return `${label} 认证状态未知`;
+}
+
+function summarizeCookieHealthResults(cookieHealthState, providerNames) {
+    const state = cookieHealthState && typeof cookieHealthState === 'object' ? cookieHealthState : {};
+    const names = Array.isArray(providerNames) ? providerNames : [];
+    const results = names.map((name) => {
+        const entry = state[name] && typeof state[name] === 'object' ? state[name] : {};
+        return {
+            provider: name,
+            label: getCookieHealthProviderLabel(name),
+            state: String(entry.state || '').trim().toLowerCase(),
+            tone: getCookieHealthResultTone(entry),
+            message: getCookieHealthResultText(entry, name),
+        };
+    });
+    const failing = results.filter(item => item.tone === 'error');
+    const pending = results.filter(item => item.tone === 'warn');
+    const valid = results.filter(item => item.tone === 'success');
+    let tone = 'success';
+    if (failing.length) tone = 'error';
+    else if (pending.length) tone = 'warning';
+    const detailItems = failing.length ? failing : (pending.length ? pending : results);
+    const detail = detailItems
+        .slice(0, 3)
+        .map(item => item.message)
+        .filter(Boolean)
+        .join('；');
+    const prefix = names.length === 1
+        ? `${results[0]?.label || getCookieHealthProviderLabel(names[0])}：`
+        : `健康检查：${valid.length} 个可用，${pending.length} 个待处理，${failing.length} 个异常。`;
+    return {
+        ok: failing.length === 0,
+        tone,
+        results,
+        message: `${prefix}${detail}`,
+    };
+}
+
+function getCookieHealthChipTone(state, provider) {
+    if (provider?.enabled === false) return 'disabled';
+    if (state === 'valid') return 'valid';
+    if (state === 'invalid' || state === 'error') return 'error';
+    if (state === 'checking') return 'checking';
+    if (state === 'missing' || state === 'unknown') return 'pending';
+    return 'idle';
+}
+
+function buildCookieHealthCheckingState(sourceState, providers) {
+    const state = sourceState && typeof sourceState === 'object' ? sourceState : {};
+    const nextState = { ...state };
+    providers.forEach((name) => {
+        const entry = state[name] && typeof state[name] === 'object' ? state[name] : {};
+        const label = getCookieHealthProviderLabel(name);
+        nextState[name] = {
+            configured: !!entry.configured,
+            state: 'checking',
+            message: `正在检测 ${label} 认证信息...`,
+            last_checked_at: String(entry.last_checked_at || ''),
+            last_success_at: String(entry.last_success_at || ''),
+            trigger: 'manual_check',
+            fail_count: Math.max(0, Number(entry.fail_count || 0) || 0),
+        };
+    });
+    return nextState;
+}
+
+export async function checkCookieHealthProviders({
+    providers = null,
+    force = true,
+    isBusy = false,
+    setBusy,
+    renderCookieHealthCards,
+    getCookieHealthState,
+    applyCookieHealthState,
+    showToast,
+} = {}) {
+    if (isBusy || cookieHealthBusyProviders.size > 0) return false;
+    const providerNames = getEnabledCookieHealthProviders(providers);
+    if (!providerNames.length) return false;
+    providerNames.forEach(name => cookieHealthBusyProviders.add(name));
+    const previousState = typeof getCookieHealthState === 'function'
+        ? getCookieHealthState()
+        : latestCookieHealthState;
+    const checkingState = buildCookieHealthCheckingState(previousState, providerNames);
+    if (typeof setBusy === 'function') setBusy(true);
+    if (typeof applyCookieHealthState === 'function') applyCookieHealthState(checkingState);
+    else updateCookieHealthBar(checkingState);
+    if (typeof renderCookieHealthCards === 'function') renderCookieHealthCards();
+
+    try {
+        const data = await window.MediaHubApi.postJson('/settings/cookies/check', {
+            providers: providerNames,
+            force: !!force
+        });
+        const nextState = data?.cookie_health && typeof data.cookie_health === 'object'
+            ? data.cookie_health
+            : previousState;
+        if (data?.cookie_health && typeof applyCookieHealthState === 'function') {
+            applyCookieHealthState(data.cookie_health);
+        } else if (data?.cookie_health) {
+            updateCookieHealthBar(data.cookie_health);
+        }
+        const summary = summarizeCookieHealthResults(nextState, providerNames);
+        if (typeof showToast === 'function') {
+            showToast(summary.message, { tone: summary.tone, duration: summary.ok ? 2600 : 4200, placement: 'top-center' });
+        }
+        return { ...summary, cookie_health: nextState };
+    } catch (err) {
+        if (typeof applyCookieHealthState === 'function') applyCookieHealthState(previousState);
+        else updateCookieHealthBar(previousState);
+        if (typeof showToast === 'function') {
+            showToast(`健康检查失败：${err?.message || '请稍后重试'}`, { tone: 'error', duration: 3000, placement: 'top-center' });
+        }
+        return {
+            ok: false,
+            tone: 'error',
+            results: [],
+            message: err?.message || '健康检查失败',
+            cookie_health: previousState,
+        };
+    } finally {
+        providerNames.forEach(name => cookieHealthBusyProviders.delete(name));
+        if (typeof setBusy === 'function') setBusy(false);
+        if (typeof renderCookieHealthCards === 'function') renderCookieHealthCards();
+        updateCookieHealthBar(latestCookieHealthState);
+    }
+}
+
+export function renderCookieHealthBar(cookieHealthState) {
+    const container = document.getElementById('settings-provider-auth-container');
+    if (!container) return;
+    const meta = window.providerMeta || [];
+    if (!meta.length) return;
+    let bar = document.getElementById('cookie-health-bar');
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'cookie-health-bar';
+        bar.className = 'cookie-health-bar';
+        bar.innerHTML = '<div id="cookie-health-dots" class="cookie-health-chips"></div>' +
+            '<button id="cookie-health-check-all-btn" type="button" class="cookie-health-check-all-btn">健康检查</button>';
+        container.insertBefore(bar, container.firstChild);
+        const chipsContainer = bar.querySelector('#cookie-health-dots');
+        if (chipsContainer) {
+            chipsContainer.addEventListener('click', (event) => {
+                const chip = event.target.closest('[data-cookie-health-provider]');
+                if (!chip || chip.disabled) return;
+                const provider = chip.getAttribute('data-cookie-health-provider');
+                if (typeof window.checkCookieHealthProvider === 'function') {
+                    window.checkCookieHealthProvider(provider);
+                }
+            });
+        }
+        const checkBtn = bar.querySelector('#cookie-health-check-all-btn');
+        if (checkBtn) {
+            checkBtn.addEventListener('click', () => {
+                if (typeof window.checkAllCookiesHealth === 'function') {
+                    window.checkAllCookiesHealth();
+                }
+            });
+        }
+    }
+    updateCookieHealthBar(cookieHealthState);
+}
+
+export function updateCookieHealthBar(cookieHealthState) {
+    const dotsContainer = document.getElementById('cookie-health-dots');
+    const checkBtn = document.getElementById('cookie-health-check-all-btn');
+    if (!dotsContainer) return;
+    const state = cookieHealthState && typeof cookieHealthState === 'object' ? cookieHealthState : {};
+    latestCookieHealthState = state;
+    const meta = window.providerMeta || [];
+    let busy = false;
+    dotsContainer.innerHTML = meta.map(p => {
+        const entry = state[p.name] || {};
+        const dotState = cookieHealthBusyProviders.has(p.name)
+            ? 'checking'
+            : (entry.state || (entry.configured ? 'unknown' : 'missing'));
+        const color = getCookieHealthDotColor(dotState);
+        const tone = getCookieHealthChipTone(dotState, p);
+        if (dotState === 'checking') busy = true;
+        const label = escapeHtml(p.label || p.name);
+        const title = escapeHtml(entry.message || (p.enabled === false ? `${p.label || p.name} 未启用` : '点击检查'));
+        const disabled = p.enabled === false || cookieHealthBusyProviders.size > 0;
+        return '<button type="button" class="cookie-health-chip cookie-health-chip--' + tone + '" ' +
+            'data-cookie-health-provider="' + escapeHtml(p.name) + '" ' +
+            'title="' + title + '" ' +
+            'aria-label="检查 ' + label + ' 健康状态" ' +
+            (disabled ? 'disabled' : '') + '>' +
+            '<span class="cookie-health-chip-dot" style="background:' + color + ';' + (dotState === 'checking' ? 'animation:cookie-dot-pulse 1s ease-in-out infinite' : '') + '"></span>' +
+            '<span class="cookie-health-chip-label">' + label + '</span>' +
+            '</button>';
+    }).join('');
+    if (checkBtn) {
+        checkBtn.disabled = busy;
+        checkBtn.classList.toggle('is-busy', busy);
+        checkBtn.innerText = busy ? '检查中…' : '健康检查';
+    }
+}
+
+// Register functions to global scope for boot.js
+if (typeof window !== 'undefined') {
+    window.renderProviderAuthBlocks = renderProviderAuthBlocks;
+    window.renderMagnetProviderSetting = renderMagnetProviderSetting;
+    window.renderResourceFavoriteDirSettings = renderResourceFavoriteDirSettings;
+    window.toggleProviderBlock = toggleProviderBlock;
+    window.toggleProviderEnabled = toggleProviderEnabled;
+    window.testProviderCookie = testProviderCookie;
+    window.renderCookieHealthBar = renderCookieHealthBar;
+    window.updateCookieHealthBar = updateCookieHealthBar;
+    window.checkCookieHealthProviders = checkCookieHealthProviders;
+    window.checkAllCookiesHealth = async function() {
+        if (typeof window.checkCookiesNow === 'function') return window.checkCookiesNow(true);
+        return checkCookieHealthProviders();
+    };
+    window.checkCookieHealthProvider = async function(provider) {
+        if (typeof window.checkCookiesNow === 'function') return window.checkCookiesNow(true, [provider]);
+        return checkCookieHealthProviders({ providers: [provider] });
+    };
 }

@@ -3,21 +3,60 @@ from .core import *  # noqa: F401,F403
 def normalize_share_selection_entry(item: Any) -> Dict[str, Any]:
     if not isinstance(item, dict):
         return {}
-    entry_id = str(item.get("id", "") or item.get("select_id", "")).strip()
-    name = normalize_relative_path(item.get("name", ""))
+    entry_id = str(
+        item.get("id", "")
+        or item.get("select_id", "")
+        or item.get("fileId", "")
+        or item.get("fileID", "")
+        or item.get("FileId", "")
+        or item.get("FileID", "")
+    ).strip()
+    name = normalize_relative_path(item.get("name", "") or item.get("fileName", "") or item.get("FileName", ""))
     if not entry_id or not name:
         return {}
-    is_dir = bool(item.get("is_dir"))
+    raw_type = item.get("type", item.get("Type", ""))
+    try:
+        is_dir = bool(item.get("is_dir")) or int(raw_type or 0) == 1
+    except (TypeError, ValueError):
+        is_dir = bool(item.get("is_dir")) or str(raw_type or "").strip().lower() in {"folder", "dir", "directory"}
     parent_id = str(item.get("parent_id", "0") or "0").strip() or "0"
-    return {
+    normalized = {
         "id": entry_id,
         "name": name,
+        "type": "folder" if is_dir else "file",
         "is_dir": is_dir,
         "parent_id": parent_id,
         "cid": str(item.get("cid", "") or "").strip() if is_dir else "",
         "fid": str(item.get("fid", "") or "").strip() if not is_dir else "",
         "fid_token": str(item.get("fid_token", "") or item.get("share_fid_token", "") or "").strip(),
     }
+    for source_key, target_key in (
+        ("size", "size"),
+        ("Size", "size"),
+        ("fileSize", "size"),
+        ("FileSize", "size"),
+        ("etag", "etag"),
+        ("Etag", "etag"),
+        ("ETag", "etag"),
+        ("s3key_flag", "s3key_flag"),
+        ("s3keyFlag", "s3key_flag"),
+        ("S3KeyFlag", "s3key_flag"),
+        ("drive_id", "drive_id"),
+        ("driveId", "drive_id"),
+        ("DriveId", "drive_id"),
+        ("driveID", "drive_id"),
+        ("DriveID", "drive_id"),
+    ):
+        if source_key not in item or item.get(source_key) in (None, ""):
+            continue
+        if target_key == "size":
+            try:
+                normalized[target_key] = max(0, int(item.get(source_key) or 0))
+            except (TypeError, ValueError):
+                pass
+        elif target_key not in normalized:
+            normalized[target_key] = str(item.get(source_key, "") or "").strip()
+    return normalized
 
 def normalize_share_selection_meta(raw: Any) -> Dict[str, Any]:
     data = raw if isinstance(raw, dict) else {}

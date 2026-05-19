@@ -1349,12 +1349,28 @@ async def _scan_subscription_share_tree_snapshot(
                     {
                         "id": entry_id,
                         "name": full_name or rel_name,
+                        "type": "file",
                         "is_dir": False,
                         "parent_id": str(entry.get("parent_id", normalized_cid) or normalized_cid).strip() or "0",
                         "cid": "",
                         "fid": str(entry.get("fid", "") or entry_id).strip(),
                         "fid_token": str(entry.get("fid_token", "") or "").strip(),
                         "size": entry_size,
+                        "etag": str(entry.get("etag", "") or entry.get("Etag", "") or entry.get("ETag", "") or "").strip(),
+                        "s3key_flag": str(
+                            entry.get("s3key_flag", "")
+                            or entry.get("s3keyFlag", "")
+                            or entry.get("S3KeyFlag", "")
+                            or ""
+                        ).strip(),
+                        "drive_id": str(
+                            entry.get("drive_id", "")
+                            or entry.get("driveId", "")
+                            or entry.get("DriveId", "")
+                            or entry.get("driveID", "")
+                            or entry.get("DriveID", "")
+                            or ""
+                        ).strip(),
                         "modified_at": str(entry.get("modified_at", "") or "").strip(),
                         "episodes": matched_episodes,
                     }

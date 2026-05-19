@@ -4,6 +4,8 @@ import logging
 import requests
 
 from .common import parse_int
+from .base import CloudProvider
+from .registry import register
 from ..share_selection import normalize_share_selection_meta
 from ..core import *  # noqa: F401,F403
 from ..core import (
@@ -467,6 +469,14 @@ def _validate_115_entry_name(value: str) -> str:
     return normalized_name
 
 
+def _build_115_indexed_fid_payload(ids: List[str]) -> Dict[str, str]:
+    return {
+        f"fid[{index}]": str(entry_id).strip()
+        for index, entry_id in enumerate(ids)
+        if str(entry_id or "").strip()
+    }
+
+
 def rename_115_entry(cookie: str, entry_id: str, new_name: str, parent_cid: str = "") -> Dict[str, Any]:
     normalized_cookie = str(cookie or "").strip()
     if not normalized_cookie:
@@ -523,8 +533,7 @@ def move_115_entries(cookie: str, entry_ids: List[str], target_cid: str, source_
             "User-Agent": "Mozilla/5.0 115-media-hub",
         }
         payload = {"pid": target_id}
-        for index, entry_id in enumerate(ids):
-            payload[f"fid[{index}]"] = entry_id
+        payload.update(_build_115_indexed_fid_payload(ids))
         response = http_request_form_json(
             "https://webapi.115.com/files/move",
             payload,
@@ -566,8 +575,7 @@ def copy_115_entries(cookie: str, entry_ids: List[str], target_cid: str, source_
             "User-Agent": "Mozilla/5.0 115-media-hub",
         }
         payload = {"pid": target_id}
-        for index, entry_id in enumerate(ids):
-            payload[f"fid[{index}]"] = entry_id
+        payload.update(_build_115_indexed_fid_payload(ids))
         response = http_request_form_json(
             "https://webapi.115.com/files/copy",
             payload,
@@ -625,18 +633,20 @@ def _request_115_delete_payload(
         "Origin": "https://115.com",
         "User-Agent": "Mozilla/5.0 115-media-hub",
     }
-    id_field = "file_ids" if use_app_endpoint else "fid"
-    payload = {id_field: ",".join(ids)}
-    if parent_cid:
-        payload["pid"] = parent_cid
     if use_app_endpoint:
-        payload["user_id"] = ""
+        payload = {"file_ids": ",".join(ids), "user_id": ""}
+        if parent_cid:
+            payload["pid"] = parent_cid
         return http_request_form_json(
             "https://proapi.115.com/android/rb/delete",
             payload,
             timeout=60,
             extra_headers=headers,
         )
+    payload = _build_115_indexed_fid_payload(ids)
+    payload["ignore_warn"] = "1"
+    if parent_cid:
+        payload["pid"] = parent_cid
     return http_request_form_json(
         "https://webapi.115.com/rb/delete",
         payload,
@@ -1374,3 +1384,117 @@ def submit_115_share_receive(
         }
     except Exception:
         raise
+
+
+class Pan115Provider(CloudProvider):
+    name = "115"
+    label = "115网盘"
+    link_type = "115share"
+    auth_type = "cookie"
+    config_keys = ["cookie_115"]
+    supports_subscription = True
+    supports_offline = True
+    supports_fixed_share_link = True
+    supports_strm = True
+    supports_monitor = True
+    supports_rename = True
+    supports_move = True
+    supports_copy = True
+    supports_delete = True
+    rate_limit_seconds = 0.35
+
+    def list_entries_payload(self, cookie, cid="0", folders_only=False):
+        return list_115_entries_payload(cookie, cid, False, folders_only)
+
+    def list_entries(self, cookie, cid="0"):
+        return list_115_entries(cookie, cid)
+
+    def create_folder(self, cookie, cid="0", folder_name=""):
+        return create_115_folder(cookie, cid, folder_name)
+
+    def resolve_folder_id_by_path(self, cookie, relative_path):
+        return resolve_115_folder_id_by_path(cookie, relative_path)
+
+    def ensure_folder_id_by_path(self, cookie, relative_path):
+        return ensure_115_folder_id_by_path(cookie, relative_path)
+
+    def resolve_share_payload(self, cookie, share_url, raw_text="", receive_code=""):
+        payload = resolve_115_share_payload(cookie, share_url, raw_text, receive_code)
+        payload["raw_text"] = str(raw_text or "")
+        return payload
+
+    def list_share_entries(self, cookie, share_payload, cid="0", offset=0, limit=200):
+        payload = share_payload if isinstance(share_payload, dict) else {}
+        return list_115_share_entries(
+            cookie,
+            str(payload.get("url", "") or payload.get("share_url", "") or "").strip(),
+            str(payload.get("raw_text", "") or ""),
+            cid,
+            str(payload.get("receive_code", "") or "").strip(),
+            False,
+            45,
+            0,
+            1,
+            max(0, int(offset or 0)),
+            max(20, min(int(limit or 200), 400)),
+            1,
+            False,
+        )
+
+    def prepare_share_receive(self, cookie, share_payload, cid="0"):
+        payload = share_payload if isinstance(share_payload, dict) else {}
+        selected_ids = payload.get("selected_ids", []) if isinstance(payload.get("selected_ids"), list) else []
+        prepared = prepare_115_share_receive(
+            cookie,
+            str(payload.get("url", "") or payload.get("share_url", "") or "").strip(),
+            str(payload.get("raw_text", "") or ""),
+            selected_ids,
+            str(payload.get("receive_code", "") or "").strip(),
+        )
+        return {**payload, **prepared, "target_cid": str(cid or "0").strip() or "0"}
+
+    def submit_share_receive(self, cookie, receive_payload, files):
+        payload = receive_payload if isinstance(receive_payload, dict) else {}
+        selected_ids = payload.get("selected_ids", []) if isinstance(payload.get("selected_ids"), list) else []
+        if not selected_ids:
+            selected_ids = [
+                str(item.get("id", "")).strip()
+                for item in (files or [])
+                if isinstance(item, dict) and str(item.get("id", "")).strip()
+            ]
+        return submit_115_share_receive(
+            cookie,
+            str(payload.get("url", "") or payload.get("share_url", "") or "").strip(),
+            str(payload.get("target_cid", "") or payload.get("folder_id", "") or "0").strip() or "0",
+            str(payload.get("raw_text", "") or ""),
+            selected_ids,
+            str(payload.get("receive_code", "") or "").strip(),
+        )
+
+    def submit_offline_task(self, cookie, resource_url, folder_id="0"):
+        return submit_115_offline_task(cookie, resource_url, folder_id)
+
+    def probe_connectivity(self, cookie):
+        try:
+            list_115_entries_payload(cookie, "0", folders_only=True)
+            return True
+        except Exception:
+            return False
+
+    def resolve_download_url(self, cookie, file_id):
+        raise NotImplementedError  # STRM 后续实现
+
+    def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
+        return rename_115_entry(cookie, entry_id, new_name, parent_id)
+
+    def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+        return move_115_entries(cookie, entry_ids, target_id, source_id)
+
+    def copy_entries(self, cookie, entry_ids, target_id, source_id=""):
+        return copy_115_entries(cookie, entry_ids, target_id, source_id)
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        return delete_115_entries(cookie, entry_ids, parent_id)
+
+
+register(Pan115Provider())

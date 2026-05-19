@@ -99,7 +99,40 @@
         async function init() {
             try {
                 const cfg = await window.MediaHubApi.getJson('/get_settings');
+                // Load provider capabilities for dynamic UI
+                try {
+                    const providerList = await window.MediaHubApi.getJson('/api/providers');
+                    window.providerMeta = providerList || [];
+                    if (typeof setProviderMeta === 'function') {
+                        setProviderMeta(window.providerMeta);
+                    }
+                } catch (e) {
+                    console.warn('Failed to load provider list, using defaults', e);
+                    window.providerMeta = [];
+                }
+                if (typeof renderProviderFilterButtons === 'function') {
+                    renderProviderFilterButtons();
+                }
+                if (typeof populateSubscriptionProviderSelect === 'function') {
+                    populateSubscriptionProviderSelect();
+                }
+                // 复用带 asset_version 的 tab 模块加载器，避免浏览器命中旧 settings.js 缓存后覆盖新 UI。
+                try {
+                    await loadSettingsTabModule();
+                } catch (_) { /* settings module may load via other path */ }
                 const sensitiveMeta = normalizeSensitiveConfigMeta(cfg.sensitive_configured || {});
+                if (typeof renderProviderAuthBlocks === 'function') {
+                    renderProviderAuthBlocks(cfg, sensitiveMeta);
+                }
+                if (typeof renderMagnetProviderSetting === 'function') {
+                    renderMagnetProviderSetting(cfg);
+                }
+                if (typeof renderResourceFavoriteDirSettings === 'function') {
+                    renderResourceFavoriteDirSettings(cfg.resource_favorite_dirs || {});
+                }
+                if (typeof renderCookieHealthBar === 'function') {
+                    renderCookieHealthBar(cfg.cookie_health || {});
+                }
                 if (typeof setAppMountPoints === 'function') {
                     setAppMountPoints(cfg.mount_points || []);
                 }
@@ -131,18 +164,38 @@
 
                 applyMonitorState({ ...monitorState, tasks: cfg.monitor_tasks || [] }, { forceRender: true });
                 applySubscriptionState({ ...subscriptionState, tasks: cfg.subscription_tasks || [] }, { forceRender: true });
-                applyResourceState({
+                const dynamicFavDirs = { '115': [], quark: [] };
+                const dynamicCookieConfigured = {};
+                const meta = window.providerMeta || [];
+                meta.forEach(p => {
+                    dynamicFavDirs[p.name] = [];
+                    const configKeys = Array.isArray(p.config_keys) && p.config_keys.length ? p.config_keys : ['cookie_' + p.name];
+                    const cookieKey = configKeys[0] || ('cookie_' + p.name);
+                    if (p.auth_type === 'password') {
+                        dynamicCookieConfigured['cookie_configured_' + p.name] = configKeys.every((key) => !!sensitiveMeta[key]);
+                    } else if (p.auth_type === 'password_cookie') {
+                        const usernameKey = configKeys[1] || '';
+                        const passwordKey = configKeys[2] || '';
+                        dynamicCookieConfigured['cookie_configured_' + p.name] = !!sensitiveMeta[cookieKey] || (!!sensitiveMeta[usernameKey] && !!sensitiveMeta[passwordKey]);
+                    } else {
+                        dynamicCookieConfigured['cookie_configured_' + p.name] = !!sensitiveMeta[cookieKey];
+                    }
+                });
+                const resourceStateUpdates = {
                     ...resourceState,
                     sources: cfg.resource_sources || [],
                     quick_links: cfg.resource_quick_links || [],
-                    favorite_dirs: cfg.resource_favorite_dirs || { '115': [], quark: [] },
+                    favorite_dirs: cfg.resource_favorite_dirs || dynamicFavDirs,
                     monitor_tasks: cfg.monitor_tasks || [],
                     cookie_configured: !!sensitiveMeta.cookie_115,
                     quark_cookie_configured: !!sensitiveMeta.cookie_quark,
                     cookie_health: cfg.cookie_health && typeof cfg.cookie_health === 'object'
                         ? cfg.cookie_health
-                        : (resourceState.cookie_health || null)
-                });
+                        : (resourceState.cookie_health || null),
+                    default_magnet_provider: cfg.default_magnet_provider || resourceState.default_magnet_provider || '115'
+                };
+                Object.assign(resourceStateUpdates, dynamicCookieConfigured);
+                applyResourceState(resourceStateUpdates);
                 applySign115State({
                     ...sign115State,
                     enabled: !!cfg.sign115_enabled,
@@ -534,6 +587,11 @@
             const action = btn.dataset.monitorAction || '';
             const name = decodeURIComponent(btn.dataset.taskName || '');
             if (!name) return;
+            if (action === 'toggle-run') {
+                if (btn.dataset.monitorRunAction === 'stop') await stopMonitorTask(name);
+                else await startMonitorTask(name);
+                return;
+            }
             if (action === 'start') await startMonitorTask(name);
             if (action === 'stop') await stopMonitorTask(name);
             if (action === 'edit') editMonitorTask(name);

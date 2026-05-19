@@ -768,6 +768,71 @@ def _pick_best_tv_share_files_by_episode_bucket(
     }
 
 
+def _scan_provider_existing_tv_episodes(
+    p,
+    cookie: str,
+    root_folder_id: str,
+    task: Dict[str, Any],
+    max_depth: int = 3,
+    max_dirs: int = 120,
+    max_entries: int = 3000,
+) -> Dict[str, Any]:
+    """通用网盘剧集扫描，通过 provider 对象调用 list_entries"""
+    normalized_cookie = str(cookie or "").strip()
+    if not normalized_cookie:
+        raise RuntimeError(f"{p.label} Cookie 未配置")
+
+    start_cid = str(root_folder_id or "0").strip() or "0"
+    queue: List[Tuple[str, int, str]] = [(start_cid, 0, "")]
+    visited: Set[str] = set()
+    episodes: Set[int] = set()
+    scanned_dirs = 0
+    scanned_entries = 0
+    failed_dirs = 0
+
+    while queue and scanned_dirs < max_dirs and scanned_entries < max_entries:
+        cid, depth, parent_path = queue.pop(0)
+        if cid in visited:
+            continue
+        visited.add(cid)
+        try:
+            entries = p.list_entries(normalized_cookie, cid)
+        except Exception:
+            failed_dirs += 1
+            continue
+
+        scanned_dirs += 1
+        for entry in entries:
+            if scanned_entries >= max_entries:
+                break
+            scanned_entries += 1
+            name = str(entry.get("name", "") or "").strip()
+            if not name:
+                continue
+            rel_name = normalize_relative_path(name)
+            is_dir = bool(entry.get("is_dir"))
+            if is_dir and depth < max_depth:
+                child_cid = str(entry.get("id", "") or entry.get("cid", "") or "").strip()
+                if child_cid and child_cid not in visited:
+                    child_path = normalize_relative_path(join_relative_path(parent_path, rel_name))
+                    queue.append((child_cid, depth + 1, child_path or rel_name))
+            if is_dir:
+                continue
+            parsed_episodes = _extract_task_episodes_from_file_entry(task, rel_name or name, parent_path)
+            if parsed_episodes:
+                episodes.update(parsed_episodes)
+
+    sorted_episodes = sorted(episodes)
+    return {
+        "episodes": sorted_episodes,
+        "max_episode": sorted_episodes[-1] if sorted_episodes else 0,
+        "scanned_dirs": scanned_dirs,
+        "scanned_entries": scanned_entries,
+        "failed_dirs": failed_dirs,
+        "truncated": bool(queue) or scanned_dirs >= max_dirs or scanned_entries >= max_entries,
+    }
+
+
 def _scan_115_existing_tv_episodes(
     cookie: str,
     root_folder_id: str,
@@ -1127,6 +1192,7 @@ __all__ = [
     "_build_subscription_episode_bucket_key",
     "_build_subscription_share_file_quality_rank",
     "_pick_best_tv_share_files_by_episode_bucket",
+    "_scan_provider_existing_tv_episodes",
     "_scan_115_existing_tv_episodes",
     "_scan_quark_existing_tv_episodes",
     "_format_episode_preview",
