@@ -1,10 +1,8 @@
 {
-  "version": "0.4.0",
+  "version": "0.4.1",
   "buildDate": "2026-05-19T00:00:00+08:00",
   "notes": [
-    "安全加固：全局 API 认证中间件、Session Secret 动态生成、密码哈希存储",
-    "修复数据库连接泄漏、并发竞态、静默吞异常等稳定性问题",
-    "新增 CSRF 防护、CORS 收紧、登录失败限流等安全机制"
+    "修复资源中心筛选栏在窄屏幕下被压缩导致背景和文字异常的问题"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

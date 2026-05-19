@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-19
+- 修复资源中心筛选栏在窄屏幕下被压缩导致背景和文字显示异常的问题，添加 `flex-shrink: 0` 保持按钮组自然宽度。
+
 ## [0.4.0] - 2026-05-19
 - 全局 API 认证中间件：所有接口（除登录、favicon、userscript）需登录后才能访问，未认证请求自动跳转登录页。
 - Session Secret Key 改为首次启动自动生成随机值并持久化，不再硬编码。
