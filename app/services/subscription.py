@@ -195,17 +195,14 @@ def _build_subscription_stage_timing_log_lines(timer: Optional[Dict[str, Any]]) 
 
 
 def _collect_subscription_batch_success_jobs(created_job_ids: Set[int]) -> List[Dict[str, Any]]:
-    success_jobs: List[Dict[str, Any]] = []
     unique_job_ids = sorted({max(0, int(job_id or 0)) for job_id in created_job_ids if int(job_id or 0) > 0})
-    for job_id in unique_job_ids:
-        job = get_resource_job(job_id, include_private=True)
-        if not job:
-            continue
-        status = str(job.get("status", "") or "").strip().lower()
-        if status not in ("submitted", "completed"):
-            continue
-        success_jobs.append(job)
-    return success_jobs
+    if not unique_job_ids:
+        return []
+    all_jobs = get_resource_jobs_by_ids(unique_job_ids, include_private=True)
+    return [
+        job for job in all_jobs
+        if str(job.get("status", "") or "").strip().lower() in ("submitted", "completed")
+    ]
 
 
 def _recover_subscription_submitted_jobs(limit: int = 160) -> Dict[str, int]:

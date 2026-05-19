@@ -109,6 +109,18 @@ def get_resource_job(job_id: int, include_private: bool = False) -> Dict[str, An
         row = cursor.fetchone()
     return serialize_resource_job_row(row, include_private=include_private)
 
+
+def get_resource_jobs_by_ids(job_ids: List[int], include_private: bool = False) -> List[Dict[str, Any]]:
+    if not job_ids:
+        return []
+    ensure_db()
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for _ in job_ids)
+        cursor.execute(f"SELECT * FROM resource_jobs WHERE id IN ({placeholders})", job_ids)
+        rows = cursor.fetchall()
+    return [serialize_resource_job_row(row, include_private=include_private) for row in rows]
+
 def count_resource_jobs(status: str = "") -> int:
     ensure_db()
     with db_connection() as conn:

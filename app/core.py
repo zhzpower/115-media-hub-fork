@@ -6517,6 +6517,7 @@ from .resource_jobs import (
     delete_resource_item,
     find_existing_resource_job,
     get_resource_job,
+    get_resource_jobs_by_ids,
     list_resource_jobs,
     list_resource_jobs_page,
     list_resource_jobs_by_source,

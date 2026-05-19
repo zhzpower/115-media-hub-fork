@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import threading
@@ -87,7 +88,7 @@ def _read_template(name: str, seen: Optional[Set[str]] = None) -> str:
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request) -> str:
-    return _read_template("login.html")
+    return await asyncio.to_thread(_read_template, "login.html")
 
 
 @router.post("/login")
@@ -120,7 +121,7 @@ async def do_login(request: Request) -> JSONResponse:
 async def index(request: Request) -> HTMLResponse:
     if not request.session.get("logged_in"):
         return RedirectResponse(url="/login")
-    return HTMLResponse(_read_template("index.html"))
+    return HTMLResponse(await asyncio.to_thread(_read_template, "index.html"))
 
 
 @router.get("/favicon.ico", include_in_schema=False)
@@ -142,8 +143,12 @@ async def install_magnet_userscript(request: Request):
     }
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/javascript; charset=utf-8", headers=headers)
-    with open(USERSCRIPT_MAGNET_HELPER_PATH, "r", encoding="utf-8") as f:
-        script_text = f.read()
+
+    def _read_userscript() -> str:
+        with open(USERSCRIPT_MAGNET_HELPER_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+
+    script_text = await asyncio.to_thread(_read_userscript)
     return Response(
         content=script_text,
         media_type="application/javascript; charset=utf-8",

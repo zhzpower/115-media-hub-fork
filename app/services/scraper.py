@@ -1423,12 +1423,22 @@ def get_scraper_jobs_state(limit: int = SCRAPER_JOB_LIMIT_DEFAULT, job_id: int =
                 (max(1, min(100, int(limit or SCRAPER_JOB_LIMIT_DEFAULT))),),
             )
             rows = cursor.fetchall()
+        job_ids = [int(row["id"] or 0) for row in rows]
+        actions_by_job: Dict[int, List[Dict[str, Any]]] = {jid: [] for jid in job_ids}
+        if job_ids:
+            placeholders = ",".join("?" for _ in job_ids)
+            cursor.execute(
+                f"SELECT * FROM scraper_job_actions WHERE job_id IN ({placeholders}) ORDER BY action_index ASC",
+                job_ids,
+            )
+            for action_row in cursor.fetchall():
+                action = _serialize_scraper_action_row(action_row)
+                jid = int(action.get("job_id", 0) or 0)
+                actions_by_job.setdefault(jid, []).append(action)
         jobs: List[Dict[str, Any]] = []
         for row in rows:
             row_id = int(row["id"] or 0)
-            cursor.execute("SELECT * FROM scraper_job_actions WHERE job_id = ? ORDER BY action_index ASC", (row_id,))
-            actions = [_serialize_scraper_action_row(action_row) for action_row in cursor.fetchall()]
-            jobs.append(_serialize_scraper_job_row(row, actions))
+            jobs.append(_serialize_scraper_job_row(row, actions_by_job.get(row_id, [])))
         cursor.execute("SELECT status, COUNT(1) AS count FROM scraper_jobs GROUP BY status")
         status_counts = {str(row["status"] or ""): int(row["count"] or 0) for row in cursor.fetchall()}
     counts = {
@@ -1507,7 +1517,7 @@ def _load_scraper_job(job_id: int) -> Tuple[Dict[str, Any], List[Dict[str, Any]]
     return job, actions
 
 
-def _update_scraper_job(job_id: int, **fields: Any) -> None:
+def _update_scraper_job(job_id: int, _conn: Optional[Any] = None, **fields: Any) -> None:
     if not fields:
         return
     ensure_db()
@@ -1527,12 +1537,15 @@ def _update_scraper_job(job_id: int, **fields: Any) -> None:
     payload["updated_at"] = now_text()
     sets = ", ".join(f"{key} = ?" for key in payload.keys())
     values = list(payload.values()) + [int(job_id)]
-    with db_connection() as conn:
-        conn.execute(f"UPDATE scraper_jobs SET {sets} WHERE id = ?", values)
-        conn.commit()
+    if _conn is not None:
+        _conn.execute(f"UPDATE scraper_jobs SET {sets} WHERE id = ?", values)
+    else:
+        with db_connection() as conn:
+            conn.execute(f"UPDATE scraper_jobs SET {sets} WHERE id = ?", values)
+            conn.commit()
 
 
-def _update_scraper_action(action_id: int, **fields: Any) -> None:
+def _update_scraper_action(action_id: int, _conn: Optional[Any] = None, **fields: Any) -> None:
     if not fields:
         return
     allowed = {"new_parent_id", "status", "status_detail", "rollback_status", "rollback_detail", "response_json"}
@@ -1542,9 +1555,12 @@ def _update_scraper_action(action_id: int, **fields: Any) -> None:
     payload["updated_at"] = now_text()
     sets = ", ".join(f"{key} = ?" for key in payload.keys())
     values = list(payload.values()) + [int(action_id)]
-    with db_connection() as conn:
-        conn.execute(f"UPDATE scraper_job_actions SET {sets} WHERE id = ?", values)
-        conn.commit()
+    if _conn is not None:
+        _conn.execute(f"UPDATE scraper_job_actions SET {sets} WHERE id = ?", values)
+    else:
+        with db_connection() as conn:
+            conn.execute(f"UPDATE scraper_job_actions SET {sets} WHERE id = ?", values)
+            conn.commit()
 
 
 def _build_temp_name(action_id: int, entry_id: str, original_name: str) -> str:
@@ -1608,56 +1624,64 @@ def run_scraper_job(job_id: int) -> None:
     except Exception as exc:
         _update_scraper_job(job_id, status="failed", status_detail=str(exc), failed_actions=1, finished_at=now_text())
         return
-    _update_scraper_job(job_id, status="running", status_detail="正在执行刮削改名", started_at=now_text(), finished_at="")
-    succeeded = 0
-    failed = 0
-    for action in actions:
-        action_id = int(action.get("id", 0) or 0)
-        _update_scraper_action(action_id, status="running", status_detail="正在处理")
-        try:
-            target_parent_path = str(action.get("target_parent_path", "") or "")
-            target_parent_id = str(action.get("new_parent_id", "") or "").strip()
-            if not target_parent_id:
-                target_parent_id = _ensure_folder_from_base(provider, cookie, base_cid, target_parent_path)
-                _update_scraper_action(action_id, new_parent_id=target_parent_id)
-                action["new_parent_id"] = target_parent_id
-            result = _execute_move_rename(provider, cookie, action, target_parent_id)
-            status = "skipped" if result.get("skipped") else "completed"
-            detail = str(result.get("detail") or "已完成")
-            _update_scraper_action(action_id, status=status, status_detail=detail, response_json=safe_json_dumps(result))
-            succeeded += 1
-            _update_scraper_job(
-                job_id,
-                status_detail=f"正在执行刮削改名：成功 {succeeded}，失败 {failed}",
-                succeeded_actions=succeeded,
-                failed_actions=failed,
-            )
-        except Exception as exc:
-            failed += 1
-            _update_scraper_action(action_id, status="failed", status_detail=str(exc))
-            _update_scraper_job(
-                job_id,
-                status_detail=f"正在执行刮削改名：成功 {succeeded}，失败 {failed}",
-                succeeded_actions=succeeded,
-                failed_actions=failed,
-            )
-    if failed > 0 and succeeded > 0:
-        status = "partial"
-        detail = f"部分完成：成功 {succeeded}，失败 {failed}"
-    elif failed > 0:
-        status = "failed"
-        detail = f"执行失败：失败 {failed}"
-    else:
-        status = "completed"
-        detail = f"执行完成：{succeeded} 项"
-    _update_scraper_job(
-        job_id,
-        status=status,
-        status_detail=detail,
-        succeeded_actions=succeeded,
-        failed_actions=failed,
-        finished_at=now_text(),
-    )
+    ensure_db()
+    with db_connection() as conn:
+        _update_scraper_job(job_id, _conn=conn, status="running", status_detail="正在执行刮削改名", started_at=now_text(), finished_at="")
+        conn.commit()
+        succeeded = 0
+        failed = 0
+        for action in actions:
+            action_id = int(action.get("id", 0) or 0)
+            _update_scraper_action(action_id, _conn=conn, status="running", status_detail="正在处理")
+            try:
+                target_parent_path = str(action.get("target_parent_path", "") or "")
+                target_parent_id = str(action.get("new_parent_id", "") or "").strip()
+                if not target_parent_id:
+                    target_parent_id = _ensure_folder_from_base(provider, cookie, base_cid, target_parent_path)
+                    _update_scraper_action(action_id, _conn=conn, new_parent_id=target_parent_id)
+                    action["new_parent_id"] = target_parent_id
+                result = _execute_move_rename(provider, cookie, action, target_parent_id)
+                action_status = "skipped" if result.get("skipped") else "completed"
+                detail = str(result.get("detail") or "已完成")
+                _update_scraper_action(action_id, _conn=conn, status=action_status, status_detail=detail, response_json=safe_json_dumps(result))
+                succeeded += 1
+                _update_scraper_job(
+                    job_id,
+                    _conn=conn,
+                    status_detail=f"正在执行刮削改名：成功 {succeeded}，失败 {failed}",
+                    succeeded_actions=succeeded,
+                    failed_actions=failed,
+                )
+            except Exception as exc:
+                failed += 1
+                _update_scraper_action(action_id, _conn=conn, status="failed", status_detail=str(exc))
+                _update_scraper_job(
+                    job_id,
+                    _conn=conn,
+                    status_detail=f"正在执行刮削改名：成功 {succeeded}，失败 {failed}",
+                    succeeded_actions=succeeded,
+                    failed_actions=failed,
+                )
+            conn.commit()
+        if failed > 0 and succeeded > 0:
+            status = "partial"
+            detail = f"部分完成：成功 {succeeded}，失败 {failed}"
+        elif failed > 0:
+            status = "failed"
+            detail = f"执行失败：失败 {failed}"
+        else:
+            status = "completed"
+            detail = f"执行完成：{succeeded} 项"
+        _update_scraper_job(
+            job_id,
+            _conn=conn,
+            status=status,
+            status_detail=detail,
+            succeeded_actions=succeeded,
+            failed_actions=failed,
+            finished_at=now_text(),
+        )
+        conn.commit()
 
 
 def rollback_scraper_job(job_id: int) -> None:
@@ -1670,53 +1694,63 @@ def rollback_scraper_job(job_id: int) -> None:
         _update_scraper_job(job_id, status="rollback_failed", status_detail=str(exc), rollback_failed_actions=1, finished_at=now_text())
         return
     successful_actions = [item for item in actions if str(item.get("status", "") or "") in {"completed", "skipped"}]
-    _update_scraper_job(job_id, status="rollback_running", status_detail="正在回退刮削任务", finished_at="")
-    succeeded = 0
-    failed = 0
-    for action in reversed(successful_actions):
-        action_id = int(action.get("id", 0) or 0)
-        try:
-            if str(action.get("status", "") or "") == "skipped":
-                _update_scraper_action(action_id, rollback_status="skipped", rollback_detail="原动作未产生变化")
+    ensure_db()
+    with db_connection() as conn:
+        _update_scraper_job(job_id, _conn=conn, status="rollback_running", status_detail="正在回退刮削任务", finished_at="")
+        conn.commit()
+        succeeded = 0
+        failed = 0
+        for action in reversed(successful_actions):
+            action_id = int(action.get("id", 0) or 0)
+            try:
+                if str(action.get("status", "") or "") == "skipped":
+                    _update_scraper_action(action_id, _conn=conn, rollback_status="skipped", rollback_detail="原动作未产生变化")
+                    succeeded += 1
+                    _update_scraper_job(
+                        job_id,
+                        _conn=conn,
+                        status_detail=f"正在回退刮削任务：成功 {succeeded}，失败 {failed}",
+                        rollback_succeeded_actions=succeeded,
+                        rollback_failed_actions=failed,
+                    )
+                    conn.commit()
+                    continue
+                result = _execute_move_rename(
+                    provider,
+                    cookie,
+                    action,
+                    str(action.get("old_parent_id", "") or "0"),
+                    reverse=True,
+                )
+                _update_scraper_action(action_id, _conn=conn, rollback_status="completed", rollback_detail="已回退", response_json=safe_json_dumps(result))
                 succeeded += 1
                 _update_scraper_job(
                     job_id,
+                    _conn=conn,
                     status_detail=f"正在回退刮削任务：成功 {succeeded}，失败 {failed}",
                     rollback_succeeded_actions=succeeded,
                     rollback_failed_actions=failed,
                 )
-                continue
-            result = _execute_move_rename(
-                provider,
-                cookie,
-                action,
-                str(action.get("old_parent_id", "") or "0"),
-                reverse=True,
-            )
-            _update_scraper_action(action_id, rollback_status="completed", rollback_detail="已回退", response_json=safe_json_dumps(result))
-            succeeded += 1
-            _update_scraper_job(
-                job_id,
-                status_detail=f"正在回退刮削任务：成功 {succeeded}，失败 {failed}",
-                rollback_succeeded_actions=succeeded,
-                rollback_failed_actions=failed,
-            )
-        except Exception as exc:
-            failed += 1
-            _update_scraper_action(action_id, rollback_status="failed", rollback_detail=str(exc))
-            _update_scraper_job(
-                job_id,
-                status_detail=f"正在回退刮削任务：成功 {succeeded}，失败 {failed}",
-                rollback_succeeded_actions=succeeded,
-                rollback_failed_actions=failed,
-            )
-    status = "rolled_back" if failed <= 0 else "rollback_failed"
-    detail = f"回退完成：成功 {succeeded}" if failed <= 0 else f"回退部分失败：成功 {succeeded}，失败 {failed}"
-    _update_scraper_job(
-        job_id,
-        status=status,
-        status_detail=detail,
-        rollback_succeeded_actions=succeeded,
-        rollback_failed_actions=failed,
-        finished_at=now_text(),
-    )
+            except Exception as exc:
+                failed += 1
+                _update_scraper_action(action_id, _conn=conn, rollback_status="failed", rollback_detail=str(exc))
+                _update_scraper_job(
+                    job_id,
+                    _conn=conn,
+                    status_detail=f"正在回退刮削任务：成功 {succeeded}，失败 {failed}",
+                    rollback_succeeded_actions=succeeded,
+                    rollback_failed_actions=failed,
+                )
+            conn.commit()
+        status = "rolled_back" if failed <= 0 else "rollback_failed"
+        detail = f"回退完成：成功 {succeeded}" if failed <= 0 else f"回退部分失败：成功 {succeeded}，失败 {failed}"
+        _update_scraper_job(
+            job_id,
+            _conn=conn,
+            status=status,
+            status_detail=detail,
+            rollback_succeeded_actions=succeeded,
+            rollback_failed_actions=failed,
+            finished_at=now_text(),
+        )
+        conn.commit()
