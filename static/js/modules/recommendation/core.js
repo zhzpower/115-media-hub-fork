@@ -73,7 +73,16 @@ function buildPaginationHtml(page, totalPages) {
         }
     }
     html += '<button type="button" class="rec-page-btn" onclick="goToRecommendationPage(' + (page + 1) + ')"' + (page >= totalPages ? ' disabled' : '') + '>&#8250;</button>';
+    html += '<span class="rec-page-jump"><span class="rec-page-jump-label">跳至</span><input type="number" class="rec-page-jump-input" min="1" max="' + totalPages + '" placeholder="" value="" onkeydown="if(event.key===\'Enter\')jumpToRecommendationPage(this)"><span class="rec-page-jump-label">/ ' + totalPages + ' 页</span><button type="button" class="rec-page-btn rec-page-jump-btn" onclick="jumpToRecommendationPage(this.previousElementSibling.previousElementSibling)">确定</button></span>';
     return html;
+}
+
+function jumpToRecommendationPage(inputEl) {
+    if (!inputEl) return;
+    var val = parseInt(inputEl.value, 10);
+    if (isNaN(val) || val < 1 || val > recommendationPagination.totalPages) return;
+    goToRecommendationPage(val);
+    inputEl.value = '';
 }
 
 function updatePagination() {
@@ -495,10 +504,7 @@ async function removeFromWatchlist(itemId) {
 }
 
 function buildSearchKeyword(item) {
-    const parts = [];
-    if (item.title) parts.push(item.title);
-    if (item.year) parts.push(String(item.year));
-    return parts.join(' ') || item.title || item.original_title || '';
+    return item.title || item.original_title || '';
 }
 
 function searchResourceForRecommendation(index) {
