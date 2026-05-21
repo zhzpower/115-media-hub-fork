@@ -108,6 +108,7 @@
         let resourceSearchCancelRequested = false;
         let resourceRestartSearchAfterCancel = false;
         let resourceSyncBusy = false;
+        let resourceSyncCancelBusy = false;
         let resourceChannelExtraItems = {};
         let resourceChannelLoadingMore = {};
         let resourceChannelNextBefore = {};
@@ -173,6 +174,7 @@
         let pansouTestState = { loading: false, ok: null, message: '', latency_ms: 0, auth_enabled: false, auth_configured: false, auth_logged_in: false, plugin_count: 0, channels_count: 0 };
         let notifyTestState = { loading: false, ok: null, message: '', channel: '', target_desc: '', webhook_host: '', sent_at: '' };
         let resourceBoardHintText = '';
+        let resourceActiveSearchRuntime = null;
         let resourceTgHealthState = { visible: false, tone: 'loading', title: '', meta: '', note: '' };
         let resourceTgLastLatencyMs = 0;
         let lastLogSignature = '';
@@ -1646,6 +1648,8 @@
             return {
                 submitted: !!source.submitted,
                 running: !!source.running,
+                cancel_requested: !!source.cancel_requested,
+                cancelled: !!source.cancelled,
                 started_at: String(source.started_at || ''),
                 started_ts: Number(source.started_ts || 0) || 0,
                 finished_at: String(source.finished_at || ''),
@@ -1671,12 +1675,12 @@
                 if (currentTab === 'resource' && !document.hidden) {
                     scheduleResourcePolling(RESOURCE_SYNC_POLL_INTERVAL);
                 }
-                if (!resourceSyncBusy) {
+                if (!resourceSyncBusy && !resourceSyncCancelBusy) {
                     setResourceTgHealthState({
                         visible: true,
                         tone: 'loading',
-                        title: '频道同步后台运行中',
-                        meta: '',
+                        title: next.cancel_requested ? '频道同步停止中' : '频道同步后台运行中',
+                        meta: next.cancel_requested ? '等待当前批次收尾' : '',
                         note: '',
                     });
                 }
@@ -1687,7 +1691,13 @@
 
             const result = next.last_result && typeof next.last_result === 'object' ? next.last_result : {};
             const durationMs = Math.max(0, Number(next.duration_ms || result.duration_ms || 0) || 0);
-            if (next.last_error) {
+            if (next.cancelled || result.cancelled) {
+                applyResourceTgHealthFromSyncResult(
+                    { ...result, queued: false, cancelled: true },
+                    durationMs,
+                    resourceTgLastLatencyMs,
+                );
+            } else if (next.last_error) {
                 setResourceTgHealthResult({
                     tone: 'error',
                     title: '频道同步失败',
@@ -1715,6 +1725,11 @@
             const next = normalizeResourceChannelSyncState(payload);
             resourceState = { ...resourceState, channel_sync: next };
             handleResourceChannelSyncStateChange(previous, next, options);
+            if (typeof window.syncResourceActionButtons === 'function') {
+                window.syncResourceActionButtons();
+            } else if (typeof window.renderResourceBoardHint === 'function') {
+                window.renderResourceBoardHint();
+            }
         }
 
         function normalizeResourceItemStatusFromJob(status) {
@@ -3217,6 +3232,14 @@
             if (!hint) return;
             const keyword = String(document.getElementById('resource-search-input')?.value || resourceState.search || '').trim();
             const directImport = isDirectImportInput(keyword);
+            const channelSyncState = typeof normalizeResourceChannelSyncState === 'function'
+                ? normalizeResourceChannelSyncState(resourceState.channel_sync)
+                : (resourceState.channel_sync || {});
+            const channelSyncActive = !resourceSyncBusy && (
+                typeof isResourceChannelSyncActive === 'function'
+                    ? isResourceChannelSyncActive(channelSyncState)
+                    : (!!channelSyncState.submitted || !!channelSyncState.running)
+            );
             const tone = ['loading', 'success', 'warning', 'error'].includes(resourceTgHealthState.tone)
                 ? resourceTgHealthState.tone
                 : 'loading';
@@ -3224,37 +3247,62 @@
             let text = String(resourceBoardHintText || '').trim();
 
             if (resourceSearchBusy) {
-                if (!text) {
+                const tgProgressText = String(resourceTgHealthState.meta || '').trim();
+                if (typeof getResourceSearchRunningHintText === 'function') {
+                    text = getResourceSearchRunningHintText({
+                        keyword,
+                        source: resourceSearchSource,
+                        providerFilter: resourceProviderFilter,
+                        latencyMs: resourceSearchSource === 'pansou' ? 0 : resourceTgLastLatencyMs,
+                        latencyText: resourceSearchSource === 'pansou' ? '' : tgProgressText,
+                        directImportMode: directImport,
+                    });
+                } else if (!text) {
                     if (directImport) {
                         text = `资源识别执行中 · 关键词「${keyword || '...'}」 · 已开始`;
                     } else {
-                        const sourceLabel = resourceSearchSource === 'pansou' ? '盘搜' : '频道搜索';
-                        const typeLabel = resourceProviderFilter === '115'
-                            ? '115'
-                            : (resourceProviderFilter === 'magnet' ? '磁力' : (resourceProviderFilter === 'quark' ? '夸克' : '全部'));
-                        const latencyText = resourceSearchSource === 'pansou'
-                            ? '已开始'
-                            : (tgText || 'TG 延迟检测中');
-                        text = `${sourceLabel}执行中 · 关键词「${keyword || '...'}」 · 类型 ${typeLabel} · ${latencyText}`;
+                        if (typeof buildResourceSearchStatusText === 'function') {
+                            text = buildResourceSearchStatusText({
+                                phase: 'running',
+                                source: resourceSearchSource,
+                                keyword,
+                                providerFilter: resourceProviderFilter,
+                                latencyMs: resourceSearchSource === 'pansou' ? 0 : resourceTgLastLatencyMs,
+                                latencyText: resourceSearchSource === 'pansou' ? '' : tgProgressText,
+                            });
+                        } else {
+                            const sourceLabel = resourceSearchSource === 'pansou' ? '盘搜中' : '频道搜索中';
+                            const latencyText = resourceSearchSource === 'pansou'
+                                ? '已开始'
+                                : (tgProgressText || 'TG 延迟检测中');
+                            text = `${sourceLabel} · 关键词「${keyword || '...'}」 · ${latencyText}`;
+                        }
                     }
                 }
             } else if (resourceSyncBusy) {
                 text = tgText || '频道同步提交中 · 正在检测 TG 代理延迟';
+            } else if (channelSyncActive && !text) {
+                text = tgText || (
+                    channelSyncState.cancel_requested
+                        ? '频道同步停止中 · 等待当前批次收尾'
+                        : '频道同步后台运行中'
+                );
             } else if (tgText && !text) {
                 text = text ? `${text} ｜ ${tgText}` : tgText;
             }
 
             const hasText = !!text;
-            const channelSyncActive = !resourceSyncBusy && isResourceChannelSyncActive();
             hint.classList.toggle('hidden', !hasText);
-            hint.classList.toggle('is-loading', hasText && (resourceSearchBusy || resourceSyncBusy || channelSyncActive));
+            hint.classList.toggle('is-loading', hasText && (resourceSearchBusy || resourceSyncBusy || resourceSyncCancelBusy || channelSyncActive));
             hint.classList.remove(
                 'resource-search-sub--loading',
                 'resource-search-sub--success',
                 'resource-search-sub--warning',
                 'resource-search-sub--error'
             );
-            if (hasText && (tgText || resourceSearchBusy || resourceSyncBusy)) hint.classList.add(`resource-search-sub--${tone}`);
+            if (hasText && (tgText || resourceSearchBusy || resourceSyncBusy || resourceSyncCancelBusy || channelSyncActive)) {
+                hint.classList.add(`resource-search-sub--${tone}`);
+            }
             hint.innerText = hasText ? text : '';
         }
 
@@ -3308,7 +3356,7 @@
                 visible: true,
                 tone: 'loading',
                 title: 'TG 搜索中',
-                meta: 'TG 延迟检测中 · 耗时 --',
+                meta: 'TG 延迟检测中',
                 note: '',
             });
         }
@@ -3358,6 +3406,7 @@
             const skipped = Number(data?.skipped || 0);
             const inserted = Number(data?.items || 0);
             const pruned = Number(data?.cache_pruned || 0);
+            const cancelled = !!data?.cancelled;
 
             if (data?.queued) {
                 setResourceTgHealthResult({
@@ -3369,6 +3418,21 @@
                     durationLabel: '提交耗时',
                     latencyLabel: 'TG 代理延迟',
                     includeLatency: data.accepted !== false,
+                });
+                return;
+            }
+
+            if (cancelled) {
+                const detail = (synced > 0 || inserted > 0 || skipped > 0 || pruned > 0 || errors.length > 0)
+                    ? `频道 ${synced} · 新增 ${inserted} · 缓存 ${skipped} · 清理 ${pruned}`
+                    : '已按请求停止';
+                setResourceTgHealthResult({
+                    tone: 'warning',
+                    title: '频道同步已停止',
+                    detail,
+                    durationMs,
+                    includeLatency: false,
+                    detailFirst: true,
                 });
                 return;
             }

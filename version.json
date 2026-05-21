@@ -1,8 +1,8 @@
 {
-  "version": "0.4.4",
+  "version": "0.4.5",
   "buildDate": "2026-05-21T00:00:00+08:00",
   "notes": [
-    "优化大目录树 STRM 生成的内存峰值、批量写入性能和长任务结束后的内存释放"
+    "优化频道管理拖拽排序、资源搜索状态提示和资源页频道同步取消体验"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

@@ -3901,6 +3901,8 @@ resource_channel_sync_status_lock = threading.Lock()
 resource_channel_sync_status: Dict[str, Any] = {
     "submitted": False,
     "running": False,
+    "cancel_requested": False,
+    "cancelled": False,
     "started_at": "",
     "started_ts": 0.0,
     "finished_at": "",
@@ -3910,6 +3912,8 @@ resource_channel_sync_status: Dict[str, Any] = {
     "last_result": {},
     "last_error": "",
 }
+resource_channel_sync_control_lock = threading.Lock()
+resource_channel_sync_control = {"cancel": False}
 RESOURCE_JOB_RECOVERY_INTERVAL_SECONDS = max(
     5,
     min(300, int(os.environ.get("RESOURCE_JOB_RECOVERY_INTERVAL_SECONDS", 20) or 20)),
@@ -5630,6 +5634,39 @@ def build_resource_channel_sync_payload() -> Dict[str, Any]:
         return clone_jsonable(resource_channel_sync_status)
 
 
+class ResourceChannelSyncCancelled(asyncio.CancelledError):
+    def __init__(self, message: str = "频道同步已中断", result: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.message = str(message or "频道同步已中断")
+        self.result = clone_jsonable(result) if isinstance(result, dict) else {}
+
+
+def reset_resource_channel_sync_cancel_request() -> None:
+    with resource_channel_sync_control_lock:
+        resource_channel_sync_control["cancel"] = False
+
+
+def is_resource_channel_sync_cancel_requested() -> bool:
+    with resource_channel_sync_control_lock:
+        return bool(resource_channel_sync_control.get("cancel"))
+
+
+def request_resource_channel_sync_cancel() -> bool:
+    with resource_channel_sync_status_lock:
+        active = bool(resource_channel_sync_status.get("submitted")) or bool(resource_channel_sync_status.get("running"))
+    if not active:
+        return False
+    with resource_channel_sync_control_lock:
+        resource_channel_sync_control["cancel"] = True
+    set_resource_channel_sync_status(cancel_requested=True, cancelled=False)
+    return True
+
+
+def check_resource_channel_sync_cancelled(result: Optional[Dict[str, Any]] = None) -> None:
+    if is_resource_channel_sync_cancel_requested():
+        raise ResourceChannelSyncCancelled(result=result)
+
+
 def build_resource_jobs_state_payload(
     limit: int = 20,
     cfg: Optional[Dict[str, Any]] = None,
@@ -5996,151 +6033,178 @@ async def sync_telegram_channels(force: bool = False, limit_per_channel: Optiona
         limit_per_channel,
         fallback=get_tg_channel_sync_limit(cfg),
     )
-    sources = [
-        source
-        for source in (normalize_resource_source(raw_source or {}) for raw_source in cfg.get("resource_sources", []))
-        if is_resource_source_sync_enabled(source)
-    ]
-    if not sources:
-        ensure_db()
-        conn = open_db()
-        try:
-            governance_detail = run_resource_cache_governance(conn, [])
-            cache_prune_detail = {
-                "per_channel": 0,
-                "inactive": int(governance_detail.get("inactive", 0) or 0),
-                "expired": int(governance_detail.get("expired", 0) or 0),
-                "global": int(governance_detail.get("global", 0) or 0),
-                "active_channels": 0,
-            }
-            cache_pruned = (
-                cache_prune_detail["inactive"]
-                + cache_prune_detail["expired"]
-                + cache_prune_detail["global"]
-            )
-            if cache_pruned > 0:
-                conn.commit()
-        finally:
-            conn.close()
-        return {
-            "ok": True,
-            "synced": 0,
-            "items": 0,
-            "skipped": 0,
-            "errors": [],
-            "cache_pruned": cache_pruned,
-            "cache_prune_detail": cache_prune_detail,
-            "limit_per_channel": tg_channel_sync_limit,
-        }
-
-    ensure_db()
-    tg_channel_threads = get_tg_channel_threads(cfg)
-    semaphore = asyncio.Semaphore(tg_channel_threads)
     synced_channels = 0
     upserted_items = 0
     skipped_channels = 0
     per_channel_pruned = 0
     errors: List[Dict[str, str]] = []
-    targets: List[Tuple[Dict[str, Any], str]] = []
-    for source in sources:
-        channel_id = normalize_telegram_channel_id_from_input(source.get("channel_id", ""))
-        if not channel_id:
-            continue
-        if not force and channel_id in resource_channel_last_sync and (time.time() - resource_channel_last_sync[channel_id]) < TG_SYNC_TTL_SECONDS:
-            skipped_channels += 1
-            continue
-        if channel_id in resource_channel_syncing:
-            skipped_channels += 1
-            continue
-        resource_channel_syncing.add(channel_id)
-        targets.append((source, channel_id))
+    cache_prune_detail = {
+        "per_channel": 0,
+        "inactive": 0,
+        "expired": 0,
+        "global": 0,
+        "active_channels": 0,
+    }
+    cache_pruned = 0
+    claimed_channel_ids: Set[str] = set()
 
-    async def fetch_one_source(source: Dict[str, Any], channel_id: str) -> Dict[str, Any]:
-        source_name = str(source.get("name", "") or channel_id).strip()
-        try:
-            async with semaphore:
-                sample_bundle = await asyncio.to_thread(
-                    fetch_telegram_channel_post_samples,
-                    cfg,
-                    source,
-                    max(tg_channel_sync_limit, RESOURCE_CHANNEL_TYPE_SAMPLE_SIZE),
-                    max(tg_channel_sync_limit, RESOURCE_CHANNEL_TYPE_PAGE_LIMIT),
-                    RESOURCE_CHANNEL_TYPE_MAX_PAGES,
-                )
-                posts = sample_bundle.get("posts", []) if isinstance(sample_bundle, dict) else []
-                if not posts:
-                    posts = await asyncio.to_thread(fetch_telegram_channel_posts, cfg, source, tg_channel_sync_limit)
-            return {"channel_id": channel_id, "name": source_name, "posts": posts}
-        except Exception as exc:
-            return {"channel_id": channel_id, "name": source_name, "error": str(exc)}
-        finally:
-            resource_channel_syncing.discard(channel_id)
+    def build_sync_result(*, cancelled: bool = False) -> Dict[str, Any]:
+        payload = {
+            "ok": not errors and not cancelled,
+            "synced": synced_channels,
+            "items": upserted_items,
+            "skipped": skipped_channels,
+            "errors": clone_jsonable(errors),
+            "cache_pruned": cache_pruned,
+            "cache_prune_detail": clone_jsonable(cache_prune_detail),
+            "limit_per_channel": tg_channel_sync_limit,
+        }
+        if cancelled:
+            payload["cancelled"] = True
+        return payload
 
-    results = await asyncio.gather(*(fetch_one_source(source, channel_id) for source, channel_id in targets))
-
-    conn = open_db()
+    sources = [
+        source
+        for source in (normalize_resource_source(raw_source or {}) for raw_source in cfg.get("resource_sources", []))
+        if is_resource_source_sync_enabled(source)
+    ]
     try:
-        for result in results:
-            channel_id = str(result.get("channel_id", "")).strip()
+        check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+        if not sources:
+            ensure_db()
+            conn = open_db()
+            try:
+                governance_detail = run_resource_cache_governance(conn, [])
+                cache_prune_detail = {
+                    "per_channel": 0,
+                    "inactive": int(governance_detail.get("inactive", 0) or 0),
+                    "expired": int(governance_detail.get("expired", 0) or 0),
+                    "global": int(governance_detail.get("global", 0) or 0),
+                    "active_channels": 0,
+                }
+                cache_pruned = (
+                    cache_prune_detail["inactive"]
+                    + cache_prune_detail["expired"]
+                    + cache_prune_detail["global"]
+                )
+                if cache_pruned > 0:
+                    conn.commit()
+            finally:
+                conn.close()
+            check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+            return build_sync_result()
+
+        ensure_db()
+        tg_channel_threads = get_tg_channel_threads(cfg)
+        semaphore = asyncio.Semaphore(tg_channel_threads)
+        targets: List[Tuple[Dict[str, Any], str]] = []
+        for source in sources:
+            check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+            channel_id = normalize_telegram_channel_id_from_input(source.get("channel_id", ""))
             if not channel_id:
                 continue
-            error_message = str(result.get("error", "")).strip()
-            if error_message:
-                resource_channel_last_error[channel_id] = error_message
-                errors.append(
-                    {
-                        "channel_id": channel_id,
-                        "name": str(result.get("name", "") or channel_id).strip(),
-                        "message": error_message,
-                    }
-                )
+            if not force and channel_id in resource_channel_last_sync and (time.time() - resource_channel_last_sync[channel_id]) < TG_SYNC_TTL_SECONDS:
+                skipped_channels += 1
                 continue
+            if channel_id in resource_channel_syncing:
+                skipped_channels += 1
+                continue
+            resource_channel_syncing.add(channel_id)
+            claimed_channel_ids.add(channel_id)
+            targets.append((source, channel_id))
 
-            posts = result.get("posts", []) if isinstance(result.get("posts"), list) else []
-            for post in posts:
-                _, created = upsert_resource_item(conn, post)
-                upserted_items += 1 if created else 0
-            resource_channel_profiles[channel_id] = build_resource_channel_profile(channel_id, posts)
-            per_channel_pruned += prune_resource_channel_cache(conn, channel_id, keep=tg_channel_sync_limit)
-            conn.commit()
-            resource_channel_last_sync[channel_id] = time.time()
-            resource_channel_last_error.pop(channel_id, None)
-            synced_channels += 1
-        governance_detail = run_resource_cache_governance(
-            conn,
-            sources,
-            active_min_keep=max(RESOURCE_CHANNEL_CACHE_ACTIVE_MIN_KEEP, tg_channel_sync_limit),
-        )
-        cache_prune_detail = {
-            "per_channel": per_channel_pruned,
-            "inactive": int(governance_detail.get("inactive", 0) or 0),
-            "expired": int(governance_detail.get("expired", 0) or 0),
-            "global": int(governance_detail.get("global", 0) or 0),
-            "active_channels": int(governance_detail.get("active_channels", 0) or 0),
-        }
-        cache_pruned = (
-            cache_prune_detail["per_channel"]
-            + cache_prune_detail["inactive"]
-            + cache_prune_detail["expired"]
-            + cache_prune_detail["global"]
-        )
-        if cache_pruned > 0:
-            conn.commit()
+        async def fetch_one_source(source: Dict[str, Any], channel_id: str) -> Dict[str, Any]:
+            source_name = str(source.get("name", "") or channel_id).strip()
+            check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+            try:
+                async with semaphore:
+                    check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+                    sample_bundle = await asyncio.to_thread(
+                        fetch_telegram_channel_post_samples,
+                        cfg,
+                        source,
+                        max(tg_channel_sync_limit, RESOURCE_CHANNEL_TYPE_SAMPLE_SIZE),
+                        max(tg_channel_sync_limit, RESOURCE_CHANNEL_TYPE_PAGE_LIMIT),
+                        RESOURCE_CHANNEL_TYPE_MAX_PAGES,
+                    )
+                    check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+                    posts = sample_bundle.get("posts", []) if isinstance(sample_bundle, dict) else []
+                    if not posts:
+                        posts = await asyncio.to_thread(fetch_telegram_channel_posts, cfg, source, tg_channel_sync_limit)
+                    check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+                return {"channel_id": channel_id, "name": source_name, "posts": posts}
+            except ResourceChannelSyncCancelled:
+                raise
+            except Exception as exc:
+                return {"channel_id": channel_id, "name": source_name, "error": str(exc)}
+            finally:
+                resource_channel_syncing.discard(channel_id)
+                claimed_channel_ids.discard(channel_id)
+
+        results = await asyncio.gather(*(fetch_one_source(source, channel_id) for source, channel_id in targets))
+        check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+
+        conn = open_db()
+        try:
+            for result in results:
+                check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+                channel_id = str(result.get("channel_id", "")).strip()
+                if not channel_id:
+                    continue
+                error_message = str(result.get("error", "")).strip()
+                if error_message:
+                    resource_channel_last_error[channel_id] = error_message
+                    errors.append(
+                        {
+                            "channel_id": channel_id,
+                            "name": str(result.get("name", "") or channel_id).strip(),
+                            "message": error_message,
+                        }
+                    )
+                    continue
+
+                posts = result.get("posts", []) if isinstance(result.get("posts"), list) else []
+                for post in posts:
+                    _, created = upsert_resource_item(conn, post)
+                    upserted_items += 1 if created else 0
+                resource_channel_profiles[channel_id] = build_resource_channel_profile(channel_id, posts)
+                per_channel_pruned += prune_resource_channel_cache(conn, channel_id, keep=tg_channel_sync_limit)
+                conn.commit()
+                resource_channel_last_sync[channel_id] = time.time()
+                resource_channel_last_error.pop(channel_id, None)
+                synced_channels += 1
+
+            check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+            governance_detail = run_resource_cache_governance(
+                conn,
+                sources,
+                active_min_keep=max(RESOURCE_CHANNEL_CACHE_ACTIVE_MIN_KEEP, tg_channel_sync_limit),
+            )
+            cache_prune_detail = {
+                "per_channel": per_channel_pruned,
+                "inactive": int(governance_detail.get("inactive", 0) or 0),
+                "expired": int(governance_detail.get("expired", 0) or 0),
+                "global": int(governance_detail.get("global", 0) or 0),
+                "active_channels": int(governance_detail.get("active_channels", 0) or 0),
+            }
+            cache_pruned = (
+                cache_prune_detail["per_channel"]
+                + cache_prune_detail["inactive"]
+                + cache_prune_detail["expired"]
+                + cache_prune_detail["global"]
+            )
+            if cache_pruned > 0:
+                conn.commit()
+            check_resource_channel_sync_cancelled(build_sync_result(cancelled=True))
+        finally:
+            conn.close()
+
+        if synced_channels > 0 or cache_pruned > 0:
+            invalidate_resource_state_snapshot("resource-channel-sync-result")
+        return build_sync_result()
     finally:
-        conn.close()
-
-    if synced_channels > 0 or cache_pruned > 0:
-        invalidate_resource_state_snapshot("resource-channel-sync-result")
-    return {
-        "ok": not errors,
-        "synced": synced_channels,
-        "items": upserted_items,
-        "skipped": skipped_channels,
-        "errors": errors,
-        "cache_pruned": cache_pruned,
-        "cache_prune_detail": cache_prune_detail,
-        "limit_per_channel": tg_channel_sync_limit,
-    }
+        for channel_id in list(claimed_channel_ids):
+            resource_channel_syncing.discard(channel_id)
 
 
 async def broadcast_ui_state(payload: str) -> None:

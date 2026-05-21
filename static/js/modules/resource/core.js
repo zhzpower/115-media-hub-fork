@@ -597,13 +597,13 @@
             if (resourceSearchBusy) {
                 const keyword = String(document.getElementById('resource-search-input')?.value || resourceState.search || '').trim();
                 const source = normalizeResourceSearchSource(resourceSearchSource || resourceState.search_source || 'tg');
-                resourceBoardHintText = buildResourceSearchStatusText({
-                    phase: 'running',
+                updateResourceActiveSearchRuntime({
                     source,
                     keyword,
                     providerFilter: next,
-                    latencyMs: source === 'tg' ? resourceTgLastLatencyMs : 0,
+                    latencyMs: source === 'tg' ? Number(resourceTgLastLatencyMs || 0) : 0,
                 });
+                resourceBoardHintText = getResourceSearchRunningHintText();
                 renderResourceBoardHint();
                 return;
             }
@@ -2183,6 +2183,71 @@
             return `TG 延迟 ${Math.max(1, Math.round(value))} ms`;
         }
 
+        function getResourceActiveSearchRuntime() {
+            return resourceActiveSearchRuntime && typeof resourceActiveSearchRuntime === 'object'
+                ? resourceActiveSearchRuntime
+                : null;
+        }
+
+        function updateResourceActiveSearchRuntime(nextState = {}) {
+            const current = getResourceActiveSearchRuntime() || {};
+            resourceActiveSearchRuntime = {
+                ...current,
+                ...(nextState && typeof nextState === 'object' ? nextState : {}),
+            };
+            return resourceActiveSearchRuntime;
+        }
+
+        function clearResourceActiveSearchRuntime(searchId = '') {
+            const active = getResourceActiveSearchRuntime();
+            if (!active) return;
+            const expectedSearchId = String(searchId || '').trim();
+            if (expectedSearchId && String(active.searchId || '').trim() && String(active.searchId || '').trim() !== expectedSearchId) return;
+            resourceActiveSearchRuntime = null;
+        }
+
+        function buildResourceSearchRunningStatusText({
+            source = resourceSearchSource,
+            keyword = '',
+            providerFilter = resourceProviderFilter,
+            latencyMs = 0,
+            latencyText = '',
+        } = {}) {
+            const normalizedSource = normalizeResourceSearchSource(source);
+            const keywordText = String(keyword || resourceState?.search || '').trim() || '...';
+            const normalizedProviderFilter = normalizeResourceProviderFilter(providerFilter);
+            const providerLabel = getResourceProviderFilterLabel(normalizedProviderFilter);
+            const parts = [
+                normalizedSource === 'pansou' ? '盘搜中' : '频道搜索中',
+                `关键词「${keywordText}」`,
+            ];
+            if (normalizedProviderFilter !== 'all') parts.push(`类型 ${providerLabel}`);
+            if (normalizedSource === 'tg') {
+                parts.push(String(latencyText || '').trim() || formatResourceSearchLatency(latencyMs));
+            } else {
+                parts.push('已开始');
+            }
+            return parts.join(' · ');
+        }
+
+        function getResourceSearchRunningHintText(fallback = {}) {
+            const active = {
+                ...(fallback && typeof fallback === 'object' ? fallback : {}),
+                ...(getResourceActiveSearchRuntime() || {}),
+            };
+            const keywordText = String(active.keyword || resourceState?.search || '').trim() || '...';
+            if (active.directImportMode) {
+                return `资源识别执行中 · 关键词「${keywordText}」 · 已开始`;
+            }
+            return buildResourceSearchRunningStatusText({
+                source: active.source || resourceSearchSource,
+                keyword: keywordText,
+                providerFilter: active.providerFilter || resourceProviderFilter,
+                latencyMs: Number(active.latencyMs || 0),
+                latencyText: String(active.latencyText || '').trim(),
+            });
+        }
+
         function getResourceSearchResultCount(state = resourceState, keyword = '') {
             const sections = Array.isArray(state?.search_sections) ? state.search_sections : [];
             return countResourceVisibleSectionItems(sections, keyword);
@@ -2196,6 +2261,7 @@
             state = resourceState,
             durationMs = 0,
             latencyMs = 0,
+            latencyText = '',
         } = {}) {
             const normalizedSource = normalizeResourceSearchSource(source);
             const meta = state?.search_meta && typeof state.search_meta === 'object' ? state.search_meta : {};
@@ -2209,16 +2275,22 @@
             const phaseLabel = normalizedPhase === 'running'
                 ? '执行中'
                 : (normalizedPhase === 'failed' ? '失败' : (normalizedPhase === 'cancelled' ? '已中断' : '完成'));
+
+            if (normalizedPhase === 'running') {
+                return buildResourceSearchRunningStatusText({
+                    source: normalizedSource,
+                    keyword: keywordText,
+                    providerFilter,
+                    latencyMs,
+                    latencyText,
+                });
+            }
+
             const parts = [
                 `${sourceLabel}${phaseLabel}`,
                 `关键词「${keywordText}」`,
                 `类型 ${providerLabel}`,
             ];
-
-            if (normalizedPhase === 'running') {
-                parts.push(normalizedSource === 'tg' ? formatResourceSearchLatency(latencyMs) : '已开始');
-                return parts.join(' · ');
-            }
 
             if (normalizedPhase === 'completed') parts.push(`命中 ${resultCount} 条`);
             if (normalizedSource === 'tg' && searchedSources > 0) parts.push(`检索 ${searchedSources} 个来源`);
@@ -2264,6 +2336,15 @@
         function renderResourceBoard() {
             const container = document.getElementById('resource-board');
             if (!container) return;
+            const runningKeyword = String(document.getElementById('resource-search-input')?.value || '').trim();
+            const runningHintText = resourceSearchBusy
+                ? getResourceSearchRunningHintText({
+                    keyword: runningKeyword || resourceState.search || '',
+                    source: resourceSearchSource || resourceState.search_source || 'tg',
+                    providerFilter: resourceProviderFilter || resourceState.provider_filter || 'all',
+                    latencyMs: Number(resourceTgLastLatencyMs || 0),
+                })
+                : '';
 
             if (!resourceStateHydrated) {
                 resourceBoardHintText = '';
@@ -2279,14 +2360,16 @@
             if (isSearchMode) {
                 const searchSections = getResourceVisibleSections(resourceState.search_sections || [], activeKeyword);
                 const searchErrors = Array.isArray(resourceState?.search_meta?.errors) ? resourceState.search_meta.errors : [];
-                resourceBoardHintText = buildResourceSearchStatusText({
-                    phase: resourceState?.search_meta?.client_phase || 'completed',
-                    source: resourceState.search_source || resourceSearchSource,
-                    keyword: activeKeyword,
-                    providerFilter: resourceProviderFilter || resourceState.provider_filter || 'all',
-                    durationMs: Number(resourceState?.search_meta?.client_elapsed_ms || 0),
-                    latencyMs: Number(resourceState?.search_meta?.tg_latency_ms || resourceTgLastLatencyMs || 0),
-                });
+                resourceBoardHintText = resourceSearchBusy
+                    ? runningHintText
+                    : buildResourceSearchStatusText({
+                        phase: resourceState?.search_meta?.client_phase || 'completed',
+                        source: resourceState.search_source || resourceSearchSource,
+                        keyword: activeKeyword,
+                        providerFilter: resourceProviderFilter || resourceState.provider_filter || 'all',
+                        durationMs: Number(resourceState?.search_meta?.client_elapsed_ms || 0),
+                        latencyMs: Number(resourceState?.search_meta?.tg_latency_ms || resourceTgLastLatencyMs || 0),
+                    });
                 if (!searchSections.length) {
                     const emptyCopy = normalizeResourceSearchSource(resourceState.search_source || resourceSearchSource) === 'pansou'
                         ? '盘搜没有返回当前类型的可导入结果。请检查 PanSou 配置，或换一个关键词再试。'
@@ -2303,7 +2386,7 @@
                 return;
             }
 
-            resourceBoardHintText = '';
+            resourceBoardHintText = resourceSearchBusy ? runningHintText : '';
             if (!sections.length) {
                 const hasAnyEnabledSection = (resourceState.channel_sections || []).some(section => section?.enabled !== false);
                 const emptyText = hasAnyEnabledSection && normalizeResourceProviderFilter(resourceProviderFilter || resourceState.provider_filter) !== 'all'
@@ -2600,9 +2683,16 @@
             const syncBtn = document.getElementById('resource-sync-btn');
             const keyword = String(input?.value || resourceState.search || '').trim();
             const directImport = isDirectImportInput(keyword);
+            const channelSyncState = typeof normalizeResourceChannelSyncState === 'function'
+                ? normalizeResourceChannelSyncState(resourceState.channel_sync)
+                : (resourceState.channel_sync || {});
+            const channelSyncActive = typeof isResourceChannelSyncActive === 'function'
+                ? isResourceChannelSyncActive(channelSyncState)
+                : (!!channelSyncState.submitted || !!channelSyncState.running);
+            const channelSyncCancelPending = channelSyncActive && !!channelSyncState.cancel_requested;
 
             if (searchBtn) {
-                const blocked = resourceSyncBusy;
+                const blocked = resourceSyncBusy || resourceSyncCancelBusy;
                 searchBtn.disabled = blocked;
                 searchBtn.classList.toggle('btn-disabled', blocked);
                 searchBtn.classList.toggle('is-loading', resourceSearchBusy);
@@ -2614,12 +2704,17 @@
             }
 
             if (syncBtn) {
-                const blocked = resourceSyncBusy || resourceSearchBusy;
+                const blocked = resourceSearchBusy || resourceSyncBusy || resourceSyncCancelBusy || channelSyncCancelPending;
                 syncBtn.disabled = blocked;
                 syncBtn.classList.toggle('btn-disabled', blocked);
-                syncBtn.classList.toggle('is-loading', resourceSyncBusy);
-                syncBtn.setAttribute('aria-busy', resourceSyncBusy ? 'true' : 'false');
-                syncBtn.textContent = resourceSyncBusy ? '同步中...' : '同步频道';
+                syncBtn.classList.toggle('is-loading', resourceSyncBusy || resourceSyncCancelBusy);
+                syncBtn.classList.toggle('resource-search-btn-cancel', channelSyncActive);
+                syncBtn.setAttribute('aria-busy', (resourceSyncBusy || resourceSyncCancelBusy) ? 'true' : 'false');
+                syncBtn.textContent = resourceSyncBusy
+                    ? '同步中...'
+                    : ((resourceSyncCancelBusy || channelSyncCancelPending)
+                        ? '停止中...'
+                        : (channelSyncActive ? '停止同步' : '同步频道'));
             }
             renderResourceBoardHint();
         }
@@ -2663,6 +2758,60 @@
             syncResourceActionButtons();
             renderResourceBoardHint();
             return true;
+        }
+
+        async function cancelActiveResourceChannelSync({ notify = true } = {}) {
+            const channelSyncState = typeof normalizeResourceChannelSyncState === 'function'
+                ? normalizeResourceChannelSyncState(resourceState.channel_sync)
+                : (resourceState.channel_sync || {});
+            const active = typeof isResourceChannelSyncActive === 'function'
+                ? isResourceChannelSyncActive(channelSyncState)
+                : (!!channelSyncState.submitted || !!channelSyncState.running);
+            if (!active || resourceSyncBusy || resourceSyncCancelBusy) return false;
+            resourceSyncCancelBusy = true;
+            setResourceTgHealthState({
+                visible: true,
+                tone: 'loading',
+                title: '频道同步停止中',
+                meta: '等待当前批次收尾',
+                note: '',
+            });
+            syncResourceActionButtons();
+            try {
+                const data = await window.MediaHubApi.postJson('/resource/channels/sync/cancel', {});
+                if (data?.channel_sync && typeof applyResourceChannelSyncState === 'function') {
+                    applyResourceChannelSyncState(data.channel_sync, { refreshOnComplete: false });
+                } else if (typeof scheduleResourcePolling === 'function') {
+                    scheduleResourcePolling(1000);
+                }
+                if (notify) {
+                    showToast(
+                        data?.cancelled === false ? '当前没有进行中的频道同步' : '已请求停止当前同步',
+                        {
+                            tone: data?.cancelled === false ? 'warn' : 'info',
+                            duration: 1800,
+                            placement: 'top-center',
+                        }
+                    );
+                }
+                return data;
+            } catch (e) {
+                if (active && !channelSyncState.cancel_requested) {
+                    setResourceTgHealthState({
+                        visible: true,
+                        tone: 'loading',
+                        title: '频道同步后台运行中',
+                        meta: '',
+                        note: '',
+                    });
+                }
+                showToast(`停止同步失败：${e?.message || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
+                return null;
+            } finally {
+                resourceSyncCancelBusy = false;
+                syncResourceActionButtons();
+                if (!resourceSearchBusy) renderResourceBoard();
+            }
         }
 
         async function refreshResourceState({ allowSearch = true, keywordOverride = null, searchId = '', signal = null, compact = false } = {}) {
@@ -2966,6 +3115,15 @@
             resourceSearchAbortController = new AbortController();
             resourceSearchCancelRequested = false;
             resourceSearchBusy = true;
+            updateResourceActiveSearchRuntime({
+                searchId: currentSearchId,
+                source: currentSearchSource,
+                keyword,
+                providerFilter: resourceProviderFilter,
+                directImportMode,
+                latencyMs: currentSearchSource === 'tg' ? Number(resourceTgLastLatencyMs || 0) : 0,
+                latencyText: currentSearchSource === 'pansou' ? '已开始' : '',
+            });
             let latencyProbePromise = null;
             if (!directImportMode && currentSearchSource === 'tg') {
                 showResourceTgHealthLoading('search');
@@ -2973,30 +3131,18 @@
                 latencyProbePromise.then((result) => {
                     const latencyMs = Number(result?.latency_ms || resourceTgLastLatencyMs || 0);
                     if (resourceSearchBusy && resourceActiveSearchId === currentSearchId && latencyMs > 0) {
-                        resourceBoardHintText = buildResourceSearchStatusText({
-                            phase: 'running',
-                            source: currentSearchSource,
-                            keyword,
-                            providerFilter: resourceProviderFilter,
+                        updateResourceActiveSearchRuntime({
                             latencyMs,
+                            latencyText: formatResourceSearchLatency(latencyMs),
                         });
+                        resourceBoardHintText = getResourceSearchRunningHintText();
                         renderResourceBoardHint();
                     }
                 }).catch(() => null);
             } else if (!directImportMode && currentSearchSource === 'pansou') {
                 setResourceTgHealthState({ visible: false, tone: 'loading', title: '', meta: '', note: '' });
             }
-            if (!directImportMode) {
-                resourceBoardHintText = buildResourceSearchStatusText({
-                    phase: 'running',
-                    source: currentSearchSource,
-                    keyword,
-                    providerFilter: resourceProviderFilter,
-                    latencyMs: currentSearchSource === 'tg' ? resourceTgLastLatencyMs : 0,
-                });
-            } else {
-                resourceBoardHintText = `资源识别执行中 · 关键词「${keyword || '...'}」 · 已开始`;
-            }
+            resourceBoardHintText = getResourceSearchRunningHintText();
             renderResourceBoardHint();
             syncResourceActionButtons();
             let finalHintText = '';
@@ -3123,6 +3269,7 @@
                     resourceSearchCancelRequested = false;
                 }
                 resourceSearchBusy = false;
+                clearResourceActiveSearchRuntime(currentSearchId);
                 syncResourceActionButtons();
                 if (!resourceSyncBusy) renderResourceBoard();
                 if (finalHintText) {
@@ -3139,7 +3286,16 @@
         }
 
         async function syncResourceChannels(force = false, { silent = false } = {}) {
-            if (resourceSyncBusy || resourceSearchBusy) return null;
+            if (resourceSearchBusy || resourceSyncBusy || resourceSyncCancelBusy) return null;
+            const channelSyncState = typeof normalizeResourceChannelSyncState === 'function'
+                ? normalizeResourceChannelSyncState(resourceState.channel_sync)
+                : (resourceState.channel_sync || {});
+            const channelSyncActive = typeof isResourceChannelSyncActive === 'function'
+                ? isResourceChannelSyncActive(channelSyncState)
+                : (!!channelSyncState.submitted || !!channelSyncState.running);
+            if (channelSyncActive) {
+                return cancelActiveResourceChannelSync({ notify: !silent });
+            }
             const startedAt = performance.now();
             resourceSyncBusy = true;
             let latencyProbePromise = null;
@@ -3151,12 +3307,12 @@
                     ? getCurrentTgChannelSyncLimit()
                     : 10;
                 const data = await window.MediaHubApi.postJson('/resource/channels/sync', { force, limit: syncLimit });
+                if (data?.channel_sync && typeof applyResourceChannelSyncState === 'function') {
+                    applyResourceChannelSyncState(data.channel_sync);
+                }
                 if (!data?.queued) {
                     await refreshResourceState();
                 } else if (typeof scheduleResourcePolling === 'function') {
-                    if (data.channel_sync && typeof applyResourceChannelSyncState === 'function') {
-                        applyResourceChannelSyncState(data.channel_sync);
-                    }
                     scheduleResourcePolling(3000);
                 }
                 if (!silent) {
@@ -3323,6 +3479,7 @@
             renderResourceImportStepper,
             renderResourceImportBehaviorHint,
             renderProviderFilterButtons,
+            syncResourceActionButtons,
             toggleResourceSection,
             loadMoreResourceChannelItems,
             findResourceItem,

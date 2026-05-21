@@ -87,6 +87,8 @@ async def _run_resource_channel_sync(force: bool, limit_per_channel: Optional[in
     set_resource_channel_sync_status(
         submitted=False,
         running=True,
+        cancel_requested=is_resource_channel_sync_cancel_requested(),
+        cancelled=False,
         started_at=now_text(),
         started_ts=started_ts,
         finished_at="",
@@ -104,6 +106,8 @@ async def _run_resource_channel_sync(force: bool, limit_per_channel: Optional[in
         set_resource_channel_sync_status(
             submitted=False,
             running=False,
+            cancel_requested=False,
+            cancelled=False,
             finished_at=now_text(),
             finished_ts=finished_ts,
             duration_ms=duration_ms,
@@ -111,11 +115,31 @@ async def _run_resource_channel_sync(force: bool, limit_per_channel: Optional[in
             last_error="",
         )
         return result
+    except ResourceChannelSyncCancelled as exc:
+        finished_ts = time.time()
+        duration_ms = max(1, int(round((finished_ts - started_ts) * 1000)))
+        result_payload = dict(exc.result) if isinstance(exc.result, dict) else {}
+        result_payload["cancelled"] = True
+        result_payload["duration_ms"] = duration_ms
+        set_resource_channel_sync_status(
+            submitted=False,
+            running=False,
+            cancel_requested=False,
+            cancelled=True,
+            finished_at=now_text(),
+            finished_ts=finished_ts,
+            duration_ms=duration_ms,
+            last_result=result_payload,
+            last_error="",
+        )
+        return result_payload
     except Exception as exc:
         finished_ts = time.time()
         set_resource_channel_sync_status(
             submitted=False,
             running=False,
+            cancel_requested=False,
+            cancelled=False,
             finished_at=now_text(),
             finished_ts=finished_ts,
             duration_ms=max(1, int(round((finished_ts - started_ts) * 1000))),
@@ -126,6 +150,7 @@ async def _run_resource_channel_sync(force: bool, limit_per_channel: Optional[in
     finally:
         with resource_channel_sync_submit_lock:
             resource_channel_sync_submitted = False
+        reset_resource_channel_sync_cancel_request()
         schedule_ui_state_push(0)
         release_process_memory("resource-channel-sync", force=True)
 
@@ -137,9 +162,12 @@ def submit_resource_channel_sync(force: bool, limit_per_channel: Optional[int] =
             schedule_ui_state_push(0)
             return False
         resource_channel_sync_submitted = True
+    reset_resource_channel_sync_cancel_request()
     set_resource_channel_sync_status(
         submitted=True,
         running=False,
+        cancel_requested=False,
+        cancelled=False,
         started_at="",
         started_ts=0.0,
         finished_at="",
@@ -158,12 +186,16 @@ def submit_resource_channel_sync(force: bool, limit_per_channel: Optional[int] =
     except Exception:
         with resource_channel_sync_submit_lock:
             resource_channel_sync_submitted = False
+        reset_resource_channel_sync_cancel_request()
         set_resource_channel_sync_status(
             submitted=False,
             running=False,
+            cancel_requested=False,
+            cancelled=False,
             finished_at=now_text(),
             finished_ts=time.time(),
             duration_ms=0,
+            last_result={},
             last_error="频道同步任务提交失败",
         )
         raise
@@ -723,6 +755,18 @@ async def sync_resource_channels_endpoint(request: Request) -> Dict[str, Any]:
         "limit_per_channel": limit_per_channel,
         "channel_sync": build_resource_channel_sync_payload(),
     }
+
+
+@router.post("/resource/channels/sync/cancel")
+async def cancel_resource_channels_sync_endpoint() -> JSONResponse:
+    cancelled = request_resource_channel_sync_cancel()
+    return JSONResponse(
+        content={
+            "ok": True,
+            "cancelled": cancelled,
+            "channel_sync": build_resource_channel_sync_payload(),
+        }
+    )
 
 
 @router.post("/resource/channels/classify")
