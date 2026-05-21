@@ -407,6 +407,115 @@
             resourceSourceManagerMobilePanel = normalizeResourceSourceManagerMobilePanel(panel);
         }
 
+        function stopResourceSourceSortAutoScroll() {
+            if (resourceSourceSortAutoScrollRafId) {
+                cancelAnimationFrame(resourceSourceSortAutoScrollRafId);
+                resourceSourceSortAutoScrollRafId = 0;
+            }
+        }
+
+        function getResourceSourceSortListElement() {
+            return document.getElementById('resource-source-manager-list');
+        }
+
+        function captureResourceSourceSortRowRects() {
+            const listEl = getResourceSourceSortListElement();
+            if (!listEl) return null;
+            const rects = new Map();
+            listEl.querySelectorAll('[data-resource-source-sort-index]').forEach((row) => {
+                const sourceIndex = parseInt(row?.dataset?.resourceSourceSortIndex || '-1', 10);
+                if (sourceIndex < 0) return;
+                rects.set(sourceIndex, row.getBoundingClientRect());
+            });
+            return rects;
+        }
+
+        function animateResourceSourceSortRows(previousRects) {
+            if (!(previousRects instanceof Map) || !previousRects.size) return;
+            const listEl = getResourceSourceSortListElement();
+            if (!listEl) return;
+            requestAnimationFrame(() => {
+                listEl.querySelectorAll('[data-resource-source-sort-index]').forEach((row) => {
+                    const sourceIndex = parseInt(row?.dataset?.resourceSourceSortIndex || '-1', 10);
+                    if (sourceIndex < 0) return;
+                    const previousRect = previousRects.get(sourceIndex);
+                    if (!previousRect) return;
+                    const nextRect = row.getBoundingClientRect();
+                    const deltaX = previousRect.left - nextRect.left;
+                    const deltaY = previousRect.top - nextRect.top;
+                    if (Math.abs(deltaX) < 1 && Math.abs(deltaY) < 1) return;
+                    try {
+                        row.getAnimations?.().forEach((animation) => animation.cancel());
+                        row.animate([
+                            { transform: `translate(${deltaX}px, ${deltaY}px)` },
+                            { transform: 'translate(0, 0)' },
+                        ], {
+                            duration: 180,
+                            easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+                        });
+                    } catch (err) {}
+                });
+            });
+        }
+
+        function ensureResourceSourceSortAutoScroll() {
+            if (resourceSourceSortAutoScrollRafId) return;
+            const tick = () => {
+                if (!resourceSourceSortPointerActive || !resourceSourceSortSessionActive) {
+                    stopResourceSourceSortAutoScroll();
+                    return;
+                }
+                const listEl = getResourceSourceSortListElement();
+                if (!listEl) {
+                    stopResourceSourceSortAutoScroll();
+                    return;
+                }
+                const rect = listEl.getBoundingClientRect();
+                const maxScrollTop = Math.max(0, listEl.scrollHeight - listEl.clientHeight);
+                const edge = Math.max(56, Math.min(96, rect.height * 0.18));
+                const pointerY = Number(resourceSourceSortPointerClientY || 0);
+                let delta = 0;
+                if (pointerY <= rect.top + edge) {
+                    const ratio = Math.max(0, Math.min(1, (rect.top + edge - pointerY) / edge));
+                    delta = -Math.ceil(8 + (ratio * 20));
+                } else if (pointerY >= rect.bottom - edge) {
+                    const ratio = Math.max(0, Math.min(1, (pointerY - (rect.bottom - edge)) / edge));
+                    delta = Math.ceil(8 + (ratio * 20));
+                }
+                if (delta !== 0 && maxScrollTop > 0) {
+                    const nextScrollTop = Math.max(0, Math.min(maxScrollTop, listEl.scrollTop + delta));
+                    if (nextScrollTop !== listEl.scrollTop) {
+                        listEl.scrollTop = nextScrollTop;
+                        updateResourceSourceSortPointerDrag(
+                            resourceSourceSortPointerClientX,
+                            resourceSourceSortPointerClientY
+                        );
+                    }
+                }
+                resourceSourceSortAutoScrollRafId = requestAnimationFrame(tick);
+            };
+            resourceSourceSortAutoScrollRafId = requestAnimationFrame(tick);
+        }
+
+        function getResourceSourceSortDropTarget(sourceIndex, clientY) {
+            const listEl = getResourceSourceSortListElement();
+            if (!listEl) return null;
+            const rows = Array.from(listEl.querySelectorAll('[data-resource-source-sort-index]'));
+            let fallback = null;
+            const pointerY = Number(clientY || 0);
+            for (const row of rows) {
+                const targetIndex = parseInt(row?.dataset?.resourceSourceSortIndex || '-1', 10);
+                if (targetIndex < 0 || targetIndex === sourceIndex) continue;
+                const rect = row.getBoundingClientRect();
+                const midpoint = rect.top + rect.height / 2;
+                if (pointerY <= midpoint) {
+                    return { targetIndex, after: false };
+                }
+                fallback = { targetIndex, after: true };
+            }
+            return fallback;
+        }
+
         function resetResourceSourceSortMode() {
             resourceSourceSortSessionActive = false;
             resourceSourceSortDraftIndexes = [];
@@ -414,6 +523,11 @@
             resourceSourceSortPointerActive = false;
             resourceSourceSortPointerId = null;
             resourceSourceSortPointerIndex = -1;
+            resourceSourceSortPointerClientX = 0;
+            resourceSourceSortPointerClientY = 0;
+            resourceSourceSortDropTargetIndex = -1;
+            resourceSourceSortDropAfter = false;
+            stopResourceSourceSortAutoScroll();
             document.body?.classList.remove('resource-source-sort-pointer-active');
             document.querySelectorAll('.resource-source-manager-sort-row-over').forEach(row => {
                 row.classList.remove('resource-source-manager-sort-row-over');
@@ -478,9 +592,10 @@
             const currentPosition = draft.indexOf(sourceIndex);
             const nextPosition = currentPosition + offset;
             if (currentPosition < 0 || nextPosition < 0 || nextPosition >= draft.length) return false;
+            const previousRects = captureResourceSourceSortRowRects();
             [draft[currentPosition], draft[nextPosition]] = [draft[nextPosition], draft[currentPosition]];
             resourceSourceSortDraftIndexes = draft;
-            renderResourceSourceManagerModal();
+            renderResourceSourceManagerModal({ sortAnimationRects: previousRects });
             return true;
         }
 
@@ -495,20 +610,26 @@
             nextDraft.splice(targetPosition, 0, sourceIndex);
             const changed = nextDraft.some((value, index) => value !== draft[index]);
             if (!changed) return false;
+            const previousRects = captureResourceSourceSortRowRects();
             resourceSourceSortDraftIndexes = nextDraft;
-            renderResourceSourceManagerModal();
+            renderResourceSourceManagerModal({ sortAnimationRects: previousRects });
             return true;
         }
 
-        function beginResourceSourceSortPointerDrag(sourceIndex, pointerId = null) {
+        function beginResourceSourceSortPointerDrag(sourceIndex, pointerId = null, clientX = 0, clientY = 0) {
             if (!resourceSourceSortSessionActive || sourceIndex < 0) return false;
             resourceSourceSortPointerActive = true;
             resourceSourceSortPointerId = pointerId;
             resourceSourceSortPointerIndex = sourceIndex;
+            resourceSourceSortPointerClientX = Number(clientX || 0);
+            resourceSourceSortPointerClientY = Number(clientY || 0);
+            resourceSourceSortDropTargetIndex = -1;
+            resourceSourceSortDropAfter = false;
             resourceSourceSortDragIndex = sourceIndex;
             document.body?.classList.add('resource-source-sort-pointer-active');
             const row = document.querySelector(`[data-resource-source-sort-index="${String(sourceIndex)}"]`);
             row?.classList.add('resource-source-manager-sort-row-dragging');
+            ensureResourceSourceSortAutoScroll();
             return true;
         }
 
@@ -516,18 +637,26 @@
             if (!resourceSourceSortPointerActive || !resourceSourceSortSessionActive) return false;
             const sourceIndex = Number(resourceSourceSortPointerIndex);
             if (!Number.isInteger(sourceIndex) || sourceIndex < 0) return false;
-            const hit = document.elementFromPoint(Number(clientX || 0), Number(clientY || 0));
-            const row = hit?.closest?.('[data-resource-source-sort-index]');
-            document.querySelectorAll('.resource-source-manager-sort-row-over').forEach(item => {
-                if (item !== row) item.classList.remove('resource-source-manager-sort-row-over');
-            });
-            if (!row) return false;
-            const targetIndex = parseInt(row.dataset.resourceSourceSortIndex || '-1', 10);
-            if (targetIndex < 0 || targetIndex === sourceIndex) return false;
-            row.classList.add('resource-source-manager-sort-row-over');
-            const rect = row.getBoundingClientRect();
-            const placeAfter = Number(clientY || 0) > rect.top + rect.height / 2;
-            return moveResourceSourceSortDraftRelative(sourceIndex, targetIndex, placeAfter);
+            resourceSourceSortPointerClientX = Number(clientX || 0);
+            resourceSourceSortPointerClientY = Number(clientY || 0);
+            ensureResourceSourceSortAutoScroll();
+            const dropTarget = getResourceSourceSortDropTarget(sourceIndex, clientY);
+            if (!dropTarget) {
+                const cleared = resourceSourceSortDropTargetIndex !== -1 || resourceSourceSortDropAfter;
+                resourceSourceSortDropTargetIndex = -1;
+                resourceSourceSortDropAfter = false;
+                if (cleared) renderResourceSourceManagerModal();
+                return false;
+            }
+            const { targetIndex, after } = dropTarget;
+            const markerChanged = resourceSourceSortDropTargetIndex !== targetIndex || resourceSourceSortDropAfter !== after;
+            resourceSourceSortDropTargetIndex = targetIndex;
+            resourceSourceSortDropAfter = after;
+            const moved = moveResourceSourceSortDraftRelative(sourceIndex, targetIndex, after);
+            if (!moved && markerChanged) {
+                renderResourceSourceManagerModal();
+            }
+            return moved || markerChanged;
         }
 
         function endResourceSourceSortPointerDrag() {
@@ -535,7 +664,12 @@
             resourceSourceSortPointerActive = false;
             resourceSourceSortPointerId = null;
             resourceSourceSortPointerIndex = -1;
+            resourceSourceSortPointerClientX = 0;
+            resourceSourceSortPointerClientY = 0;
+            resourceSourceSortDropTargetIndex = -1;
+            resourceSourceSortDropAfter = false;
             resourceSourceSortDragIndex = -1;
+            stopResourceSourceSortAutoScroll();
             document.body?.classList.remove('resource-source-sort-pointer-active');
             document.querySelectorAll('.resource-source-manager-sort-row-dragging, .resource-source-manager-sort-row-over').forEach(row => {
                 row.classList.remove('resource-source-manager-sort-row-dragging', 'resource-source-manager-sort-row-over');
@@ -549,12 +683,15 @@
             const presetEl = document.getElementById('resource-source-manager-sort-preset');
             const sortMode = String(mode || presetEl?.value || 'manual').trim().toLowerCase() || 'manual';
             const sectionIndex = getResourceSourceSectionIndex();
+            const previousRects = captureResourceSourceSortRowRects();
             resourceSourceSortDraftIndexes = sortResourceSourceViews(
                 getResourceSourceViewList(sources, sectionIndex),
                 sortMode
             ).map(view => view.index);
             resourceSourceSortDragIndex = -1;
-            renderResourceSourceManagerModal();
+            resourceSourceSortDropTargetIndex = -1;
+            resourceSourceSortDropAfter = false;
+            renderResourceSourceManagerModal({ sortAnimationRects: previousRects });
         }
 
         async function saveResourceSourceSortMode() {
@@ -872,9 +1009,10 @@
             }
         }
 
-        function renderResourceSourceManagerModal() {
+        function renderResourceSourceManagerModal(options = {}) {
             const modal = document.getElementById('resource-source-manager-modal');
             if (!modal || !resourceSourceManagerOpen) return;
+            const sortAnimationRects = options?.sortAnimationRects instanceof Map ? options.sortAnimationRects : null;
 
             const shell = modal.querySelector('.resource-source-manager-shell');
             const typeFiltersEl = document.getElementById('resource-source-manager-type-filters');
@@ -1047,9 +1185,14 @@
                     const typeBadges = renderResourceSourceTypeBadges(view.profile, view.sourceTypes);
                     const upDisabled = position <= 0 ? 'btn-disabled' : '';
                     const downDisabled = position >= draftViews.length - 1 ? 'btn-disabled' : '';
+                    const dragRow = resourceSourceSortDragIndex === view.index;
+                    const overRow = resourceSourceSortPointerActive && resourceSourceSortDropTargetIndex === view.index && !dragRow;
+                    const overClass = overRow
+                        ? `resource-source-manager-sort-row-over ${resourceSourceSortDropAfter ? 'resource-source-manager-sort-row-over-after' : 'resource-source-manager-sort-row-over-before'}`
+                        : '';
                     return `
                         <div
-                            class="resource-source-manager-row resource-source-manager-sort-row ${resourceSourceSortDragIndex === view.index ? 'resource-source-manager-sort-row-dragging' : ''}"
+                            class="resource-source-manager-row resource-source-manager-sort-row ${dragRow ? 'resource-source-manager-sort-row-dragging' : ''} ${overClass}"
                             data-resource-source-sort-index="${escapeHtml(String(view.index))}"
                         >
                             <button
@@ -1075,6 +1218,7 @@
                         </div>
                     `;
                 }).join('');
+                animateResourceSourceSortRows(sortAnimationRects);
                 return;
             }
 

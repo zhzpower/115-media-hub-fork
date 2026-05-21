@@ -431,7 +431,7 @@
             const sourceIndex = parseInt(row?.dataset.resourceSourceSortIndex || '-1', 10);
             if (sourceIndex < 0) return;
             e.preventDefault();
-            beginResourceSourceSortPointerDrag(sourceIndex, e.pointerId ?? null);
+            beginResourceSourceSortPointerDrag(sourceIndex, e.pointerId ?? null, e.clientX, e.clientY);
             try {
                 handle.setPointerCapture?.(e.pointerId);
             } catch (err) {}

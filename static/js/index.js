@@ -146,6 +146,11 @@
         let resourceSourceSortPointerActive = false;
         let resourceSourceSortPointerId = null;
         let resourceSourceSortPointerIndex = -1;
+        let resourceSourceSortPointerClientX = 0;
+        let resourceSourceSortPointerClientY = 0;
+        let resourceSourceSortDropTargetIndex = -1;
+        let resourceSourceSortDropAfter = false;
+        let resourceSourceSortAutoScrollRafId = 0;
         let resourceSourceBulkSelected = {};
         let resourceSourceManagerMobilePanel = 'list';
         let resourceSourcePersistToken = 0;
