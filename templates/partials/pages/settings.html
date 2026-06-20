@@ -182,12 +182,22 @@
                         </label>
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <label class="block">
-                                <span class="text-xs text-slate-500">TMDB API Key</span>
-                                <input id="tmdb_api_key" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="例如：xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+                                <span class="text-xs text-slate-500">TMDB API Key / Read Access Token</span>
+                                <input id="tmdb_api_key" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="v3 API Key 或 v4 Read Access Token（Bearer）">
                             </label>
                             <label class="block">
                                 <span class="text-xs text-slate-500">缓存时长（小时）</span>
                                 <input id="tmdb_cache_ttl_hours" type="number" min="1" max="720" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="24">
+                            </label>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <label class="block">
+                                <span class="text-xs text-slate-500">API 地址（可选，国内镜像）</span>
+                                <input id="tmdb_api_base_url" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="https://api.tmdb.org/3">
+                            </label>
+                            <label class="block">
+                                <span class="text-xs text-slate-500">图片地址（可选，国内镜像）</span>
+                                <input id="tmdb_image_base_url" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="https://tmdb.melonhu.cn/img/t/p">
                             </label>
                         </div>
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -201,7 +211,7 @@
                             </label>
                         </div>
                         <div class="text-xs text-slate-500 leading-6">
-                            推荐：`language=zh-CN`、`region=CN`。开启后可在订阅任务里绑定 TMDB，自动补充别名、年份、总集数与连载模式，降低重名误匹配。
+                            推荐：`language=zh-CN`、`region=CN`。国内访问不稳定时，可填写 TMDB 镜像地址（Vercel 代理常见格式：API 填 `https://你的域名/get`，图片填 `https://你的域名/img/t/p`）；留空则走官方地址，也可在「网络代理」里统一配置代理。
                         </div>
                     </div>
                 </div>

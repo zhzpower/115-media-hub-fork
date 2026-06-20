@@ -3,8 +3,7 @@ from collections import deque
 from datetime import datetime
 from typing import Any, Dict, List, Set
 
-
-LOG_DIR = "/app/logs"
+from .paths import LOG_DIR
 LOG_ROTATE_MAX_BYTES = max(
     1024 * 1024,
     int(os.environ.get("LOG_ROTATE_MAX_BYTES", 5 * 1024 * 1024) or (5 * 1024 * 1024)),

@@ -27,6 +27,7 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from .config_store import JsonConfigStore
+from .paths import CONFIG_PATH, SESSION_SECRET_PATH, STRM_ROOT, TREE_DIR
 from .db import (
     DB_PATH,
     db_connection,
@@ -250,7 +251,7 @@ def check_resource_search_cancelled(search_id: Any) -> None:
 
 
 def _resolve_session_secret() -> str:
-    secret_path = "/app/config/.session_secret"
+    secret_path = SESSION_SECRET_PATH
     try:
         if os.path.exists(secret_path):
             with open(secret_path, "r") as f:
@@ -379,9 +380,6 @@ if HTTP_TIMING_HEADER_ENABLED:
         response.headers["X-Server-Time-Ms"] = rounded_ms
         return response
 
-CONFIG_PATH = "/app/config/settings.json"
-TREE_DIR = "/app/config/trees"
-STRM_ROOT = "/app/strm"
 MAIN_LOG_PATH = os.path.join(LOG_DIR, "task.log")
 MONITOR_LOG_PATH = os.path.join(LOG_DIR, "monitor.log")
 SUBSCRIPTION_LOG_PATH = os.path.join(LOG_DIR, "subscription.log")
@@ -906,6 +904,8 @@ _SETTINGS_CONFIG_KEY_ORDER_AFTER_AUTH: Tuple[str, ...] = (
     # 8. TMDB 元数据增强
     "tmdb_enabled",
     "tmdb_api_key",
+    "tmdb_api_base_url",
+    "tmdb_image_base_url",
     "tmdb_cache_ttl_hours",
     "tmdb_language",
     "tmdb_region",
@@ -1008,6 +1008,8 @@ def default_config() -> Dict[str, Any]:
         "tg_channel_sync_limit": TG_CHANNEL_SYNC_LIMIT_DEFAULT,
         "tmdb_enabled": False,
         "tmdb_api_key": "",
+        "tmdb_api_base_url": "",
+        "tmdb_image_base_url": "",
         "tmdb_language": "zh-CN",
         "tmdb_region": "CN",
         "tmdb_cache_ttl_hours": 24,
@@ -2393,6 +2395,10 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         merged["tmdb_enabled"] = False
     if "tmdb_api_key" not in merged:
         merged["tmdb_api_key"] = ""
+    if "tmdb_api_base_url" not in merged:
+        merged["tmdb_api_base_url"] = ""
+    if "tmdb_image_base_url" not in merged:
+        merged["tmdb_image_base_url"] = ""
     if "tmdb_language" not in merged:
         merged["tmdb_language"] = "zh-CN"
     if "tmdb_region" not in merged:
@@ -2531,6 +2537,13 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     merged["notify_wecom_app_touser"] = str(merged.get("notify_wecom_app_touser", "")).strip()
     merged["tmdb_enabled"] = normalize_bool(merged.get("tmdb_enabled", False), default=False)
     merged["tmdb_api_key"] = str(merged.get("tmdb_api_key", "")).strip()
+    raw_tmdb_api_base = str(merged.get("tmdb_api_base_url", "") or "").strip().rstrip("/")
+    if raw_tmdb_api_base and not raw_tmdb_api_base.endswith("/3") and not raw_tmdb_api_base.endswith("/get"):
+        tmdb_api_host = urllib.parse.urlparse(raw_tmdb_api_base).netloc.lower()
+        if tmdb_api_host in ("api.themoviedb.org", "api.tmdb.org"):
+            raw_tmdb_api_base = f"{raw_tmdb_api_base}/3"
+    merged["tmdb_api_base_url"] = raw_tmdb_api_base
+    merged["tmdb_image_base_url"] = str(merged.get("tmdb_image_base_url", "")).strip().rstrip("/")
     tmdb_lang = str(merged.get("tmdb_language", "zh-CN") or "zh-CN").strip()
     merged["tmdb_language"] = tmdb_lang if re.fullmatch(r"[a-z]{2}-[A-Z]{2}", tmdb_lang) else "zh-CN"
     tmdb_region = str(merged.get("tmdb_region", "CN") or "CN").strip().upper()

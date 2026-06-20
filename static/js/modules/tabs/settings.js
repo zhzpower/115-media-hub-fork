@@ -133,6 +133,8 @@ function collectSettingsPayload({
         'notify_wecom_app_secret',
         'notify_wecom_app_touser',
         'tmdb_api_key',
+        'tmdb_api_base_url',
+        'tmdb_image_base_url',
         'tmdb_language',
         'tmdb_region',
         'pansou_base_url',

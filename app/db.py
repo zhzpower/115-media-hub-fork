@@ -6,8 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Generator, Optional
 
-
-DB_PATH = "/app/config/data.db"
+from .paths import DB_PATH
 _DB_ENSURED = False
 _DB_ENSURE_LOCK = threading.Lock()
 

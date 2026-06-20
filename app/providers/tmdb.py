@@ -1,6 +1,45 @@
 from .common import parse_int
 from ..core import *  # noqa: F401,F403
 
+TMDB_API_BASE_URL_DEFAULT = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE_URL_DEFAULT = "https://image.tmdb.org/t/p"
+
+
+def is_tmdb_bearer_token(value: Any) -> bool:
+    token = str(value or "").strip()
+    return token.startswith("eyJ") and token.count(".") >= 2
+
+
+def normalize_tmdb_api_base_url_value(raw: Any, fallback: str = TMDB_API_BASE_URL_DEFAULT) -> str:
+    base = str(raw or "").strip().rstrip("/")
+    if not base:
+        return fallback
+    if base.endswith("/3") or base.endswith("/get"):
+        return base
+    host = urllib.parse.urlparse(base).netloc.lower()
+    if host in ("api.themoviedb.org", "api.tmdb.org"):
+        return f"{base}/3"
+    return base
+
+
+def resolve_tmdb_api_base_url(cfg: Optional[Dict[str, Any]] = None) -> str:
+    env_value = str(os.environ.get("TMDB_API_BASE_URL", "") or "").strip().rstrip("/")
+    if env_value:
+        return normalize_tmdb_api_base_url_value(env_value)
+    active_cfg = cfg or get_config()
+    cfg_value = str(active_cfg.get("tmdb_api_base_url", "") or "").strip().rstrip("/")
+    return normalize_tmdb_api_base_url_value(cfg_value)
+
+
+def resolve_tmdb_image_base_url(cfg: Optional[Dict[str, Any]] = None) -> str:
+    env_value = str(os.environ.get("TMDB_IMAGE_BASE_URL", "") or "").strip().rstrip("/")
+    if env_value:
+        return env_value
+    active_cfg = cfg or get_config()
+    cfg_value = str(active_cfg.get("tmdb_image_base_url", "") or "").strip().rstrip("/")
+    return cfg_value or TMDB_IMAGE_BASE_URL_DEFAULT
+
+
 def get_tmdb_runtime_config(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg = cfg or get_config()
     enabled = bool(cfg.get("tmdb_enabled", False))
@@ -132,16 +171,21 @@ def tmdb_request_json(
         else:
             tmdb_cache_entries.pop(cache_key, None)
 
-    query_params = {**request_params, "api_key": runtime["api_key"]}
+    query_params = dict(request_params)
+    extra_headers: Dict[str, str] = {"Accept": "application/json"}
+    if is_tmdb_bearer_token(runtime["api_key"]):
+        extra_headers["Authorization"] = f"Bearer {runtime['api_key']}"
+    else:
+        query_params["api_key"] = runtime["api_key"]
     query = urllib.parse.urlencode(query_params, doseq=True)
-    request_url = f"{TMDB_API_BASE_URL}{normalized_path}"
+    request_url = f"{resolve_tmdb_api_base_url(active_cfg)}{normalized_path}"
     if query:
         request_url = f"{request_url}?{query}"
     try:
         payload = http_request_json(
             request_url,
             timeout=TMDB_REQUEST_TIMEOUT_SECONDS,
-            extra_headers={"Accept": "application/json"},
+            extra_headers=extra_headers,
             proxy_url=proxy_url,
         )
     except urllib.error.HTTPError as exc:
@@ -169,7 +213,7 @@ def tmdb_request_json(
     prune_tmdb_cache()
     return payload
 
-def build_tmdb_image_url(path: Any, size: str = "w342") -> str:
+def build_tmdb_image_url(path: Any, size: str = "w342", cfg: Optional[Dict[str, Any]] = None) -> str:
     raw_path = str(path or "").strip()
     if not raw_path:
         return ""
@@ -177,7 +221,7 @@ def build_tmdb_image_url(path: Any, size: str = "w342") -> str:
     normalized_size = str(size or "w342").strip() or "w342"
     if not re.fullmatch(r"(?:w\d+|original)", normalized_size):
         normalized_size = "w342"
-    return f"{TMDB_IMAGE_BASE_URL}/{normalized_size}{normalized_path}"
+    return f"{resolve_tmdb_image_base_url(cfg)}/{normalized_size}{normalized_path}"
 
 def normalize_tmdb_result_item(item: Dict[str, Any], media_type_hint: str = "") -> Dict[str, Any]:
     payload = item if isinstance(item, dict) else {}
