@@ -211,6 +211,10 @@ def _build_subscription_episode_batch_decision(
         return {"enabled": False, "reason": "scan_unreliable", "candidate_missing_episodes": []}
 
     target_episodes = set(range(1, upper_bound + 1))
+    # Apply start_episode filter: only consider episodes from start_episode onwards for target calculation
+    task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+    if task_start_episode > 1:
+        target_episodes = set(range(task_start_episode, upper_bound + 1))
     target_missing = target_episodes.difference(normalized_existing)
     if not target_missing:
         return {
@@ -1562,6 +1566,10 @@ async def _run_subscription_task_quark(
                 if single_season_episode_upper_bound > 0:
                     episode_upper = min(episode_upper, single_season_episode_upper_bound) if episode_upper > 0 else single_season_episode_upper_bound
                 start_episode = 1 if existing_episode_scan_ready or last_episode <= 0 else max(1, last_episode + 1)
+                # Apply user-configured start_episode filter: skip episodes before the configured threshold
+                task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+                if task_start_episode > 1:
+                    start_episode = max(start_episode, task_start_episode)
                 if episode_upper >= start_episode:
                     precise_missing_episode_values = set(range(start_episode, episode_upper + 1))
 
@@ -2105,6 +2113,13 @@ async def _run_subscription_task_quark(
             and existing_episode_scan_ready
         ):
             target_episodes = set(range(1, single_season_episode_upper_bound + 1))
+            # Apply start_episode filter for quark directory coverage check
+            task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+            if task_start_episode > 1:
+                target_episodes = {
+                    episode_no for episode_no in target_episodes
+                    if episode_no >= task_start_episode
+                }
             if target_episodes.issubset(existing_folder_episodes):
                 await write_subscription_log(
                     f"夸克目录已覆盖单季全部 E1-E{single_season_episode_upper_bound}，结束本轮候选尝试",
@@ -3676,6 +3691,14 @@ async def run_subscription_task(
                         precise_missing_episode_values = set(range(1, single_season_episode_upper_bound + 1))
                     elif candidate_episode_values:
                         precise_missing_episode_values = set(candidate_episode_values)
+                    # Apply user-configured start_episode filter for fixed share seed candidate
+                    task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+                    if task_start_episode > 1 and precise_missing_episode_values:
+                        precise_missing_episode_values = {
+                            episode_no
+                            for episode_no in precise_missing_episode_values
+                            if episode_no >= task_start_episode
+                        }
                     if existing_episode_scan_ready and precise_missing_episode_values:
                         precise_missing_episode_values = {
                             episode_no
@@ -3769,6 +3792,13 @@ async def run_subscription_task(
                         target_upper = single_season_episode_upper_bound or known_total
                         if target_upper > 0:
                             title_precise_episode_values = set(range(1, target_upper + 1))
+                            # Apply start_episode filter for title precise selection
+                            task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+                            if task_start_episode > 1:
+                                title_precise_episode_values = {
+                                    episode_no for episode_no in title_precise_episode_values
+                                    if episode_no >= task_start_episode
+                                }
                     if existing_episode_scan_ready and title_precise_episode_values:
                         title_precise_episode_values = {
                             episode_no
@@ -4707,6 +4737,13 @@ async def run_subscription_task(
                 and single_season_episode_upper_bound > 0
             ):
                 required_episode_values = set(range(1, single_season_episode_upper_bound + 1))
+                # Apply start_episode filter: only check episodes from start_episode onwards
+                task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+                if task_start_episode > 1:
+                    required_episode_values = {
+                        episode_no for episode_no in required_episode_values
+                        if episode_no >= task_start_episode
+                    }
                 if required_episode_values.issubset(existing_folder_episodes):
                     await write_subscription_log(
                         f"目标目录已覆盖单季全部 E1-E{single_season_episode_upper_bound}，结束本轮候选尝试",

@@ -1975,6 +1975,7 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "year": year,
         "season": max(1, season),
         "total_episodes": max(0, total_episodes),
+        "start_episode": max(1, int(task.get("start_episode", 1) or 1)),
         "savepath": savepath,
         "share_link_url": share_link_url if use_fixed_share_link else "",
         "share_link_receive_code": share_link_receive_code if use_fixed_share_link else "",

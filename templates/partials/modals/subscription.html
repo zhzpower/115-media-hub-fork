@@ -69,7 +69,7 @@
                         <input id="subscription_tmdb_season_episode_map" class="hidden" value="">
                         <input id="subscription_tmdb_episode_mode" class="hidden" value="seasonal">
                     </div>
-                    <div id="subscription-tv-fields" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div id="subscription-tv-fields" class="grid grid-cols-1 md:grid-cols-3 gap-4">
                         <label class="block">
                             <span class="text-xs text-slate-500">季数（电视剧）</span>
                             <input id="subscription_season" type="number" min="1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="1">
@@ -77,6 +77,11 @@
                         <label class="block">
                             <span class="text-xs text-slate-500">总集数（可选，0 为自动识别）</span>
                             <input id="subscription_total_episodes" type="number" min="0" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="0">
+                        </label>
+                        <label class="block">
+                            <span class="text-xs text-slate-500">从第几集开始订阅（可选）</span>
+                            <input id="subscription_start_episode" type="number" min="1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="1" placeholder="例如：5 表示从第5集开始订阅">
+                            <div class="text-[11px] text-slate-500 mt-1">留空或1表示从第1集开始；设为5则跳过前4集</div>
                         </label>
                     </div>
                     <label id="subscription-anime-mode-wrap" class="flex items-center gap-3 cursor-pointer text-sm">
