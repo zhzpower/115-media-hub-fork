@@ -1671,6 +1671,8 @@
             document.getElementById('subscription_year').value = task.year || '';
             document.getElementById('subscription_season').value = task.season || 1;
             document.getElementById('subscription_total_episodes').value = task.total_episodes || 0;
+            const editStartEpisodeInput = document.getElementById('subscription_start_episode');
+            if (editStartEpisodeInput) editStartEpisodeInput.value = task.start_episode || 1;
             document.getElementById('subscription_anime_mode').checked = resolveTaskMultiSeasonMode(task);
             subscriptionFolderTrail = [{ id: '0', name: '根目录' }];
             setSubscriptionSavepath('0', task.savepath || '');
