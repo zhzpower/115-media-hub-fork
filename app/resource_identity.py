@@ -22,13 +22,36 @@ def normalize_telegram_channel_id_from_input(value: str) -> str:
     return raw
 
 
-def build_telegram_channel_url(channel_id: str) -> str:
+def normalize_tg_proxy_url_prefix(value: Any) -> str:
+    """规整反向代理前缀：去掉尾部斜杠；空字符串表示直连。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    # 只保留 http/https，避免 file:// 等意外前缀。
+    lowered = raw.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raw = f"https://{raw}"
+    return raw.rstrip("/")
+
+
+def build_telegram_channel_url(channel_id: str, proxy_url_prefix: str = "") -> str:
     normalized = normalize_telegram_channel_id_from_input(channel_id)
-    return f"https://t.me/s/{normalized}" if normalized else ""
+    if not normalized:
+        return ""
+    base = f"https://t.me/s/{normalized}"
+    prefix = normalize_tg_proxy_url_prefix(proxy_url_prefix)
+    if not prefix:
+        return base
+    return f"{prefix}/{base}"
 
 
-def build_telegram_channel_page_url(channel_id: str, before: str = "", query: str = "") -> str:
-    base_url = build_telegram_channel_url(channel_id)
+def build_telegram_channel_page_url(
+    channel_id: str,
+    before: str = "",
+    query: str = "",
+    proxy_url_prefix: str = "",
+) -> str:
+    base_url = build_telegram_channel_url(channel_id, proxy_url_prefix=proxy_url_prefix)
     cursor = str(before or "").strip()
     keyword = str(query or "").strip()
     if not base_url:
@@ -257,6 +280,7 @@ def get_resource_item_post_cursor(item: Dict[str, Any]) -> str:
 
 __all__ = [
     "normalize_telegram_channel_id_from_input",
+    "normalize_tg_proxy_url_prefix",
     "build_telegram_channel_url",
     "build_telegram_channel_page_url",
     "extract_telegram_post_cursor",

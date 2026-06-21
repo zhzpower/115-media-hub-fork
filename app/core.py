@@ -901,6 +901,7 @@ _SETTINGS_CONFIG_KEY_ORDER_AFTER_AUTH: Tuple[str, ...] = (
     "tg_proxy_protocol",
     "tg_proxy_host",
     "tg_proxy_port",
+    "tg_proxy_url_prefix",
     # 8. TMDB 元数据增强
     "tmdb_enabled",
     "tmdb_api_key",
@@ -996,6 +997,7 @@ def default_config() -> Dict[str, Any]:
         "tg_proxy_protocol": "http",
         "tg_proxy_host": "",
         "tg_proxy_port": "",
+        "tg_proxy_url_prefix": "",
         "notify_push_enabled": False,
         "notify_monitor_enabled": False,
         "notify_channel": "wecom_bot",
@@ -2371,6 +2373,8 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         merged["tg_proxy_host"] = ""
     if "tg_proxy_port" not in merged:
         merged["tg_proxy_port"] = ""
+    if "tg_proxy_url_prefix" not in merged:
+        merged["tg_proxy_url_prefix"] = ""
     if "notify_push_enabled" not in merged:
         merged["notify_push_enabled"] = False
     if "notify_monitor_enabled" not in merged:
@@ -2526,6 +2530,13 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         merged["tg_proxy_protocol"] = "http"
     merged["tg_proxy_host"] = str(merged.get("tg_proxy_host", "")).strip()
     merged["tg_proxy_port"] = str(merged.get("tg_proxy_port", "")).strip()
+    tg_proxy_url_prefix = str(merged.get("tg_proxy_url_prefix", "") or "").strip().rstrip("/")
+    if tg_proxy_url_prefix and not (
+        tg_proxy_url_prefix.lower().startswith("http://")
+        or tg_proxy_url_prefix.lower().startswith("https://")
+    ):
+        tg_proxy_url_prefix = f"https://{tg_proxy_url_prefix}"
+    merged["tg_proxy_url_prefix"] = tg_proxy_url_prefix
     merged["notify_push_enabled"] = normalize_bool(merged.get("notify_push_enabled", False), default=False)
     merged["notify_monitor_enabled"] = normalize_bool(merged.get("notify_monitor_enabled", False), default=False)
     notify_channel = str(merged.get("notify_channel", "wecom_bot") or "wecom_bot").strip().lower()

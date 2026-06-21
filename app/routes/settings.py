@@ -107,6 +107,7 @@ async def test_tg_proxy(request: Request) -> JSONResponse:
             "tg_proxy_protocol": incoming.get("tg_proxy_protocol", "http"),
             "tg_proxy_host": incoming.get("tg_proxy_host", ""),
             "tg_proxy_port": incoming.get("tg_proxy_port", ""),
+            "tg_proxy_url_prefix": incoming.get("tg_proxy_url_prefix", ""),
         }
     )
     try:

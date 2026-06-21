@@ -15,6 +15,7 @@ from .resource_identity import (
     extract_telegram_post_cursor,
     get_resource_item_sort_key,
     normalize_telegram_channel_id_from_input,
+    normalize_tg_proxy_url_prefix,
 )
 from .resource_linking import (
     RESOURCE_MAGNET_REGEX,
@@ -90,6 +91,11 @@ def build_tg_proxy_url(cfg: Dict[str, Any], ignore_enabled: bool = False) -> str
     if not host or not port:
         return ""
     return f"{protocol}://{host}:{port}"
+
+
+def get_tg_proxy_url_prefix(cfg: Dict[str, Any]) -> str:
+    """读取反向代理前缀（URL 拼接形式代理）。空字符串表示直连。"""
+    return normalize_tg_proxy_url_prefix((cfg or {}).get("tg_proxy_url_prefix", ""))
 
 
 def get_tg_channel_threads(cfg: Dict[str, Any]) -> int:
@@ -179,11 +185,31 @@ def is_retryable_telegram_request_error(exc: Exception) -> bool:
     return any(fragment in message for fragment in retry_fragments)
 
 
-def is_expected_telegram_channel_url(final_url: str, channel_id: str) -> bool:
+def strip_tg_proxy_prefix(final_url: str, proxy_url_prefix: str = "") -> str:
+    """从落地 URL 中剥掉反向代理前缀，还原出真实的 t.me / telegram.me 地址。
+
+    代理访问形式为 ``{prefix}/{真实URL}``，例如
+    ``https://proxy.zhz99.cn/https://t.me/s/telegram``。
+    """
+    candidate = str(final_url or "").strip()
+    if not candidate:
+        return ""
+    prefix = str(proxy_url_prefix or "").strip().rstrip("/")
+    if prefix and candidate.lower().startswith(prefix.lower() + "/"):
+        candidate = candidate[len(prefix) + 1:]
+    # 兜底：即便没传入 prefix，也尝试从路径里抠出嵌入的原始 URL。
+    match = re.search(r"(https?://(?:[\w.-]+\.)?(?:t\.me|telegram\.me)/\S+)", candidate, re.IGNORECASE)
+    if match:
+        candidate = match.group(1)
+    return candidate.strip()
+
+
+def is_expected_telegram_channel_url(final_url: str, channel_id: str, proxy_url_prefix: str = "") -> bool:
     normalized_channel = normalize_telegram_channel_id_from_input(channel_id)
     if not normalized_channel:
         return False
-    parsed = urllib.parse.urlparse(normalize_http_url(final_url))
+    resolved = strip_tg_proxy_prefix(final_url, proxy_url_prefix) or final_url
+    parsed = urllib.parse.urlparse(normalize_http_url(resolved))
     hostname = (parsed.hostname or "").lower()
     if hostname not in ("t.me", "telegram.me"):
         return False
@@ -194,7 +220,8 @@ def is_expected_telegram_channel_url(final_url: str, channel_id: str) -> bool:
 
 def test_telegram_latency(cfg: Dict[str, Any], channel_id: str = "telegram", timeout: int = 20) -> Dict[str, Any]:
     target_channel_id = normalize_telegram_channel_id_from_input(channel_id) or "telegram"
-    target_url = build_telegram_channel_url(target_channel_id)
+    proxy_url_prefix = get_tg_proxy_url_prefix(cfg)
+    target_url = build_telegram_channel_url(target_channel_id, proxy_url_prefix=proxy_url_prefix)
     proxy_url = build_tg_proxy_url(cfg, ignore_enabled=True)
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -212,7 +239,7 @@ def test_telegram_latency(cfg: Dict[str, Any], channel_id: str = "telegram", tim
         mode_label = "代理" if proxy_url else "直连"
         raise RuntimeError(f"{mode_label}请求 TG 失败：{format_network_error(exc)}") from exc
 
-    if not is_expected_telegram_channel_url(final_url, target_channel_id):
+    if not is_expected_telegram_channel_url(final_url, target_channel_id, proxy_url_prefix=proxy_url_prefix):
         raise RuntimeError(f"TG 页面发生跳转，当前落到了 {final_url}")
     latency_ms = max(1, int(round((time.perf_counter() - started_at) * 1000)))
     post_count = len(TG_WIDGET_POST_REGEX.findall(html))
@@ -256,7 +283,8 @@ def fetch_telegram_channel_info(cfg: Dict[str, Any], channel_id: str, timeout_se
     normalized_channel = normalize_telegram_channel_id_from_input(channel_id)
     if not normalized_channel:
         raise RuntimeError("频道 ID 无效")
-    target_url = build_telegram_channel_url(normalized_channel)
+    proxy_url_prefix = get_tg_proxy_url_prefix(cfg)
+    target_url = build_telegram_channel_url(normalized_channel, proxy_url_prefix=proxy_url_prefix)
     proxy_url = build_tg_proxy_url(cfg)
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -271,16 +299,17 @@ def fetch_telegram_channel_info(cfg: Dict[str, Any], channel_id: str, timeout_se
         )
     except Exception as exc:
         raise RuntimeError(f"TG 页面抓取失败：{format_network_error(exc)}") from exc
-    if not is_expected_telegram_channel_url(final_url, normalized_channel):
+    if not is_expected_telegram_channel_url(final_url, normalized_channel, proxy_url_prefix=proxy_url_prefix):
         raise RuntimeError(f"频道 ID 无效、频道未公开，或地址已跳转：{final_url}")
     display_name = parse_telegram_channel_display_name(html, normalized_channel)
     if not display_name:
         raise RuntimeError("已连接到 TG，但未识别到频道官方名称")
+    resolved_url = strip_tg_proxy_prefix(final_url, proxy_url_prefix) or final_url or target_url
     return {
         "ok": True,
         "channel_id": normalized_channel,
         "name": display_name,
-        "url": final_url or target_url,
+        "url": resolved_url,
     }
 
 
@@ -343,7 +372,7 @@ def parse_telegram_posts_page(html: str, source: Dict[str, Any], limit: int = 10
             "extra": {
                 "cover_url": unescape(image_match.group(1)) if image_match else "",
                 "source_post_id": match.group(1),
-                "source_url": build_telegram_channel_url(channel_id),
+                "source_url": build_telegram_channel_url(channel_id, proxy_url_prefix=""),
                 "all_links": all_links[:40],
             },
         }
@@ -371,12 +400,13 @@ def fetch_telegram_channel_posts_page(
     channel_id = normalize_telegram_channel_id_from_input(source.get("channel_id", ""))
     if not channel_id:
         return {"posts": [], "next_before": "", "has_more": False, "matched_count": 0}
+    proxy_url_prefix = get_tg_proxy_url_prefix(cfg)
     proxy_url = build_tg_proxy_url(cfg)
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "User-Agent": "Mozilla/5.0 115-media-hub",
     }
-    request_url = build_telegram_channel_page_url(channel_id, before, query)
+    request_url = build_telegram_channel_page_url(channel_id, before, query, proxy_url_prefix=proxy_url_prefix)
     html = ""
     final_url = request_url
     request_timeout = max(3, min(60, int(timeout_seconds or 45)))
@@ -400,7 +430,7 @@ def fetch_telegram_channel_posts_page(
                     raise RuntimeError(f"TG 代理连接不稳定，已重试 {attempt} 次仍失败：{detail}。请检查 TG 代理配置或代理服务状态") from exc
                 raise RuntimeError(f"TG 页面抓取失败：{detail}") from exc
             time.sleep(TG_FETCH_RETRY_DELAY_SECONDS * attempt)
-    if not is_expected_telegram_channel_url(final_url, channel_id):
+    if not is_expected_telegram_channel_url(final_url, channel_id, proxy_url_prefix=proxy_url_prefix):
         raise RuntimeError(f"频道 ID 无效、频道未公开，或地址已跳转：{final_url}")
     if not TG_WIDGET_POST_REGEX.search(html):
         if allow_empty:
@@ -489,12 +519,14 @@ __all__ = [
     "TG_IMAGE_STYLE_REGEX",
     "TG_PREV_BEFORE_REGEX",
     "build_tg_proxy_url",
+    "get_tg_proxy_url_prefix",
     "get_tg_channel_threads",
     "get_tg_channel_sync_limit",
     "normalize_tg_channel_sync_limit",
     "format_network_error",
     "unwrap_network_error",
     "is_retryable_telegram_request_error",
+    "strip_tg_proxy_prefix",
     "is_expected_telegram_channel_url",
     "test_telegram_latency",
     "parse_telegram_channel_display_name",

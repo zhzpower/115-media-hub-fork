@@ -126,6 +126,7 @@ function collectSettingsPayload({
         'tg_proxy_protocol',
         'tg_proxy_host',
         'tg_proxy_port',
+        'tg_proxy_url_prefix',
         'notify_channel',
         'notify_wecom_webhook',
         'notify_wecom_app_corp_id',

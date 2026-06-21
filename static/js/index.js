@@ -2999,7 +2999,8 @@
                 tg_proxy_enabled: document.getElementById('tg_proxy_enabled').checked,
                 tg_proxy_protocol: document.getElementById('tg_proxy_protocol').value.trim(),
                 tg_proxy_host: document.getElementById('tg_proxy_host').value.trim(),
-                tg_proxy_port: document.getElementById('tg_proxy_port').value.trim()
+                tg_proxy_port: document.getElementById('tg_proxy_port').value.trim(),
+                tg_proxy_url_prefix: (document.getElementById('tg_proxy_url_prefix')?.value || '').trim()
             };
         }
 
