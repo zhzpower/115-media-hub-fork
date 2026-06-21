@@ -1561,15 +1561,32 @@ async def _run_subscription_task_quark(
                 continue
 
             precise_missing_episode_values = set(candidate_episode_values)
+            # Apply user-configured start_episode filter: always filter out episodes before the threshold
+            task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+            if task_start_episode > 1 and precise_missing_episode_values:
+                # Log the filtering action
+                filtered_count = len([e for e in precise_missing_episode_values if e < task_start_episode])
+                if filtered_count > 0:
+                    await write_subscription_log(
+                        f"候选资源 #{index} 集数过滤：跳过第1到第{task_start_episode - 1}集（已设置从第{task_start_episode}集开始订阅），过滤了{filtered_count}集",
+                        "info",
+                    )
+                precise_missing_episode_values = {
+                    episode_no for episode_no in precise_missing_episode_values
+                    if episode_no >= task_start_episode
+                }
             if not precise_missing_episode_values:
                 episode_upper = known_total
                 if single_season_episode_upper_bound > 0:
                     episode_upper = min(episode_upper, single_season_episode_upper_bound) if episode_upper > 0 else single_season_episode_upper_bound
                 start_episode = 1 if existing_episode_scan_ready or last_episode <= 0 else max(1, last_episode + 1)
-                # Apply user-configured start_episode filter: skip episodes before the configured threshold
-                task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+                # Apply start_episode filter when calculating missing episode range
                 if task_start_episode > 1:
                     start_episode = max(start_episode, task_start_episode)
+                    await write_subscription_log(
+                        f"候选资源 #{index} 缺失集数计算：从第{start_episode}集开始（跳过第1到第{task_start_episode - 1}集）",
+                        "info",
+                    )
                 if episode_upper >= start_episode:
                     precise_missing_episode_values = set(range(start_episode, episode_upper + 1))
 
@@ -2310,6 +2327,13 @@ async def run_subscription_task(
         update_subscription_summary("任务失败", config_error)
         return
     provider = normalize_subscription_provider(task.get("provider", "115"), fallback="115")
+    # Log start_episode filter for TV tasks
+    if task.get("media_type") == "tv":
+        start_ep = task.get("start_episode", 1)
+        if start_ep > 1:
+            await write_subscription_log(f"订阅任务「{task_name}」起始集数过滤：从第{start_ep}集开始订阅（跳过第1到第{start_ep - 1}集）", "info")
+        else:
+            await write_subscription_log(f"订阅任务「{task_name}」起始集数过滤：从第1集开始订阅（无跳过）", "info")
     provider_meta = _get_provider_or_none(provider)
     provider_link_type = str(getattr(provider_meta, "link_type", "") or "").strip() or ("quark" if provider == "quark" else "115share")
     provider_label = str(getattr(provider_meta, "label", "") or provider).strip()
