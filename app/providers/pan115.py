@@ -1377,6 +1377,9 @@ def submit_115_share_receive(
                 or "115 网盘转存失败"
             )
             raise RuntimeError(detail)
+        # 转存成功后目标目录内容已变化，立即失效列表缓存，
+        # 确保后续「已缓存集数扫描」与「剧集标准化重命名」读到最新文件列表。
+        invalidate_115_entries_cache(str(folder_id or "0").strip() or "0")
         return {
             "response": response,
             "selection": prepared.get("selection", {}),

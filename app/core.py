@@ -1591,22 +1591,11 @@ def convert_subscription_absolute_to_season_episode(task: Dict[str, Any], absolu
 
 
 def build_subscription_tv_savepath(task: Dict[str, Any], base_savepath: str, season: int = 0, episode: int = 0) -> str:
-    normalized_base = resolve_subscription_tv_base_savepath(task, base_savepath)
-    if not normalized_base:
-        return ""
-    if str((task or {}).get("media_type", "movie") or "movie").strip().lower() != "tv":
-        return normalized_base
-
-    resolved_season = max(0, int(season or 0))
-    resolved_episode = max(0, int(episode or 0))
-    if resolved_season <= 0 and resolved_episode > 0 and is_subscription_multi_season_mode(task):
-        mapped_season, _ = convert_subscription_absolute_to_season_episode(task, resolved_episode)
-        resolved_season = mapped_season
-    if resolved_season <= 0:
-        resolved_season = max(1, int((task or {}).get("season", 1) or 1))
-
-    season_folder = f"Season {resolved_season:02d}"
-    return join_relative_path(normalized_base, season_folder)
+    # 订阅缓存路径不再自动追加季文件夹（Season XX），统一保存到基础目录。
+    # 季/集信息由转存后的 SxxExx 标准重命名承载；同时保证「保存路径」与
+    # 「已缓存集数扫描路径」（resolve_subscription_tv_scan_savepath）完全一致，
+    # 避免扫描/保存目录错位导致重复缓存。
+    return resolve_subscription_tv_base_savepath(task, base_savepath)
 
 
 def is_subscription_season_folder_name(value: Any) -> bool:
@@ -1647,9 +1636,9 @@ def resolve_subscription_tv_scan_savepath(task: Dict[str, Any], base_savepath: s
     payload = task if isinstance(task, dict) else {}
     if str(payload.get("media_type", "movie") or "movie").strip().lower() != "tv":
         return normalized_base
-    if is_subscription_multi_season_mode(payload):
-        return resolve_subscription_tv_base_savepath(payload, normalized_base) or normalized_base
-    return normalized_base
+    # 与 build_subscription_tv_savepath 保持一致：扫描路径 == 保存路径（基础目录），
+    # 单季/多季模式统一，确保缓存前的已有集数比对准确。
+    return resolve_subscription_tv_base_savepath(payload, normalized_base) or normalized_base
 
 
 def is_subscription_anime_compatible_task(task: Dict[str, Any]) -> bool:

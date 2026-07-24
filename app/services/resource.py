@@ -109,6 +109,123 @@ def _submit_provider_share_receive_job(
     return provider.submit_share_receive(cookie, receive_payload, selected_entries)
 
 
+def _find_subscription_task_by_name(task_name: str) -> Dict[str, Any]:
+    normalized_name = str(task_name or "").strip()
+    if not normalized_name:
+        return {}
+    cfg = get_config()
+    tasks = cfg.get("subscription_tasks", []) if isinstance(cfg.get("subscription_tasks"), list) else []
+    for task in tasks:
+        if isinstance(task, dict) and str(task.get("name", "")).strip() == normalized_name:
+            return task
+    return {}
+
+
+def _apply_subscription_episode_standard_renames(
+    provider: Any,
+    cookie: str,
+    job: Dict[str, Any],
+    job_extra: Dict[str, Any],
+) -> str:
+    """转存成功后，把订阅剧集文件统一重命名为 SxxExx 标准格式（如 S01E01.mkv）。
+
+    - 仅处理订阅自动任务（job_source=subscription_auto）的 TV 订阅
+    - 目标名已存在（同集文件已缓存）时跳过重命名，避免重复/覆盖
+    - 解析不出唯一集数的文件保持原名
+    返回用于状态说明的摘要文本（空字符串表示未做任何处理）。
+    """
+    import os as _os
+    import time as _time
+
+    if str(job_extra.get("job_source", "") or "").strip() != "subscription_auto":
+        return ""
+    if not bool(getattr(provider, "supports_rename", False)):
+        return ""
+    task = _find_subscription_task_by_name(str(job_extra.get("subscription_task_name", "") or ""))
+    if not task or str(task.get("media_type", "movie") or "movie").strip().lower() != "tv":
+        return ""
+    folder_id = str(job.get("folder_id", "") or "").strip()
+    if not folder_id:
+        return ""
+
+    from .subscription_episode import _extract_task_episodes_from_file_entry
+
+    def _list_entries(cid: str) -> List[Dict[str, Any]]:
+        try:
+            if str(getattr(provider, "name", "") or "") == "115":
+                from ..providers.pan115 import list_115_entries
+
+                return list_115_entries(cookie, cid, True)
+            return provider.list_entries(cookie, cid)
+        except Exception:
+            return []
+
+    # 转存后目录内容生效可能有轻微延迟，稍等再列目录
+    _time.sleep(2)
+
+    # 收集目标目录内的文件（含一层子目录，兼容整包转入的子文件夹场景）
+    collected: List[Tuple[Dict[str, Any], str, str]] = []  # (entry, parent_cid, parent_path)
+    queue: List[Tuple[str, str, int]] = [(folder_id, "", 0)]
+    visited_dirs = 0
+    while queue:
+        cid, parent_path, depth = queue.pop(0)
+        for entry in _list_entries(cid):
+            entry_name = str(entry.get("name", "") or "").strip()
+            entry_id = str(entry.get("id", "") or "").strip()
+            if not entry_name or not entry_id:
+                continue
+            if bool(entry.get("is_dir")):
+                if depth < 1 and visited_dirs < 20:
+                    visited_dirs += 1
+                    queue.append((entry_id, join_relative_path(parent_path, entry_name), depth + 1))
+                continue
+            collected.append((entry, cid, parent_path))
+    if not collected:
+        return ""
+
+    task_season = max(1, int(task.get("season", 1) or 1))
+    multi_season = is_subscription_multi_season_mode(task)
+    existing_names = {str(entry.get("name", "") or "").strip().lower() for entry, _, _ in collected}
+    renamed_count = 0
+    duplicate_count = 0
+    for entry, parent_cid, parent_path in collected:
+        entry_name = str(entry.get("name", "") or "").strip()
+        entry_id = str(entry.get("id", "") or "").strip()
+        episodes = _extract_task_episodes_from_file_entry(task, entry_name, parent_path)
+        if len(episodes) != 1:
+            continue
+        episode_value = max(0, int(next(iter(episodes)) or 0))
+        if episode_value <= 0:
+            continue
+        if multi_season:
+            season_no, episode_no = convert_subscription_absolute_to_season_episode(task, episode_value)
+            if season_no <= 0 or episode_no <= 0:
+                season_no, episode_no = task_season, episode_value
+        else:
+            season_no, episode_no = task_season, episode_value
+        extension = _os.path.splitext(entry_name)[1].strip().lower()
+        new_name = f"S{season_no:02d}E{episode_no:02d}{extension}"
+        if entry_name.lower() == new_name.lower():
+            continue
+        if new_name.lower() in existing_names:
+            # 同集文件已存在（已缓存过），保持原名不覆盖
+            duplicate_count += 1
+            continue
+        try:
+            provider.rename_entry(cookie, entry_id, new_name, parent_cid)
+        except Exception:
+            continue
+        existing_names.add(new_name.lower())
+        renamed_count += 1
+
+    parts: List[str] = []
+    if renamed_count > 0:
+        parts.append(f"已把 {renamed_count} 个剧集文件重命名为 SxxExx 标准格式")
+    if duplicate_count > 0:
+        parts.append(f"{duplicate_count} 个剧集与目录已有同集文件重名，保留原文件名")
+    return "；".join(parts)
+
+
 async def cancel_resource_job(job_id: int, reason: str = "manual") -> Dict[str, Any]:
     job = get_resource_job(job_id, include_private=True)
     if not job:
@@ -425,6 +542,24 @@ async def run_resource_job(job_id: int) -> None:
                 if job_snapshot:
                     merged_extra["snapshot"] = job_snapshot
                 job["extra_json"] = safe_json_dumps(merged_extra)
+
+            # 订阅剧集转存成功后，把剧集文件规范重命名为 SxxExx（尽力而为，失败不影响任务状态）
+            rename_summary = ""
+            try:
+                rename_summary = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _apply_subscription_episode_standard_renames,
+                        share_provider,
+                        provider_cookie,
+                        job,
+                        job_extra,
+                    ),
+                    timeout=min(import_timeout_seconds, 120),
+                )
+            except Exception:
+                rename_summary = ""
+            if rename_summary:
+                detail = f"{detail}；{rename_summary}"
         ensure_not_cancelled("提交后")
 
         if is_share_receive_link and not bool(getattr(share_provider, "supports_monitor", False)):

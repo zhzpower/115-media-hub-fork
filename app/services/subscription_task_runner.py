@@ -4178,12 +4178,27 @@ async def run_subscription_task(
                             else:
                                 scan_tail = _format_subscription_share_scan_log_tail(selection_stats)
                                 if is_subscription_multi_season_mode(task):
-                                    await write_subscription_log(
-                                        (
-                                            f"候选资源 #{index} 尝试按缺失集精细转存未命中（{scan_tail}），回退整包转存"
-                                        ),
-                                        "warn",
-                                    )
+                                    fallback_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+                                    if fallback_start_episode > 1:
+                                        # 整包转存不经过缺失集过滤，会把已看过的前 x 集一并转入；
+                                        # 已设置 start_episode 时禁止整包回退，避免缓存已看过的剧集。
+                                        skipped_precise_mismatch_candidates += 1
+                                        skip_due_overlap_fallback = True
+                                        await write_subscription_log(
+                                            (
+                                                f"候选资源 #{index} 尝试按缺失集精细转存未命中（{scan_tail}），"
+                                                f"已设置从第{fallback_start_episode}集开始订阅，"
+                                                f"跳过整包转存以避免缓存前{fallback_start_episode - 1}集"
+                                            ),
+                                            "warn",
+                                        )
+                                    else:
+                                        await write_subscription_log(
+                                            (
+                                                f"候选资源 #{index} 尝试按缺失集精细转存未命中（{scan_tail}），回退整包转存"
+                                            ),
+                                            "warn",
+                                        )
                                 else:
                                     skipped_precise_mismatch_candidates += 1
                                     skip_due_overlap_fallback = True
@@ -4349,6 +4364,34 @@ async def run_subscription_task(
                         job_plan.get("selected_episode_values", set()),
                         episode_upper_bound=single_season_episode_upper_bound,
                     )
+                    if task.get("media_type") == "tv" and plan_selected_episode_values:
+                        # 最终兜底一：start_episode 过滤（前 x 集已看过，不再缓存）
+                        plan_start_episode = max(0, int(task.get("start_episode", 0) or 0))
+                        if plan_start_episode > 1 and max(plan_selected_episode_values) < plan_start_episode:
+                            skipped_existing_candidates += 1
+                            await write_subscription_log(
+                                (
+                                    f"候选资源 #{index} 分组文件集数均早于第{plan_start_episode}集"
+                                    f"（已设置从第{plan_start_episode}集开始订阅），跳过导入"
+                                ),
+                                "info",
+                            )
+                            continue
+                        # 最终兜底二：云盘目录已有对应集数时不再重复缓存
+                        if (
+                            existing_episode_scan_ready
+                            and plan_selected_episode_values.issubset(existing_folder_episodes)
+                        ):
+                            skipped_existing_candidates += 1
+                            await write_subscription_log(
+                                (
+                                    f"候选资源 #{index} 分组剧集 "
+                                    f"{_format_episode_preview(plan_selected_episode_values)} "
+                                    "已全部存在于目标目录，跳过重复缓存"
+                                ),
+                                "info",
+                            )
+                            continue
                     pre_attempt_existing_episodes = set(existing_folder_episodes)
                     duplicate_validation_applied = False
                     duplicate_verified_episode_values: Set[int] = set()
