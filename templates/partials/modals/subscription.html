@@ -89,9 +89,10 @@
                             <div class="text-[11px] text-slate-500 mt-1">留空或1表示从第1集开始；设为5则跳过前4集</div>
                         </label>
                     </div>
-                    <label id="subscription-anime-mode-wrap" class="flex items-center gap-3 cursor-pointer text-sm">
+                    <!-- 多季合一功能已下线：仅保留当前季订阅。checkbox 隐藏保留以兼容脚本引用 -->
+                    <label id="subscription-anime-mode-wrap" class="hidden items-center gap-3 text-sm">
                         <input type="checkbox" id="subscription_anime_mode" class="ui-checkbox">
-                        多季合一（跨季追更，关闭时按当前季订阅）
+                        多季合一（功能已下线）
                     </label>
                     <div class="space-y-2">
                         <div id="subscription-savepath-provider-label" class="text-xs text-slate-500">115 保存目录</div>

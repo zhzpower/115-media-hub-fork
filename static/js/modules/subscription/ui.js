@@ -857,7 +857,8 @@
         }
 
         function resolveTaskMultiSeasonMode(task) {
-            return !!(task?.multi_season_mode ?? task?.anime_mode);
+            // 多季合一功能已下线：一律按单季（当前季）处理
+            return false;
         }
 
         function normalizeTmdbYear(value) {
@@ -991,9 +992,7 @@
             document.getElementById('subscription_total_episodes').value = Math.max(0, parseInt(payload.total_episodes || '0', 10) || 0);
             const startEpisodeInput = document.getElementById('subscription_start_episode');
             if (startEpisodeInput) startEpisodeInput.value = Math.max(1, parseInt(payload.start_episode || '1', 10) || 1);
-            document.getElementById('subscription_anime_mode').checked = mediaType === 'tv'
-                ? !!(payload.multi_season_mode ?? payload.anime_mode)
-                : false;
+            document.getElementById('subscription_anime_mode').checked = false;
             const tmdbKeywordInput = document.getElementById('subscription_tmdb_search_keyword');
             if (tmdbKeywordInput) tmdbKeywordInput.value = String(payload.title || '').trim();
             syncSubscriptionProviderUI();
@@ -1350,7 +1349,7 @@
             const tvFields = document.getElementById('subscription-tv-fields');
             if (tvFields) tvFields.classList.toggle('hidden', mediaType !== 'tv');
             const animeModeWrap = document.getElementById('subscription-anime-mode-wrap');
-            if (animeModeWrap) animeModeWrap.classList.toggle('hidden', mediaType !== 'tv');
+            if (animeModeWrap) animeModeWrap.classList.add('hidden'); // 多季合一功能已下线，始终隐藏
             const seasonInput = document.getElementById('subscription_season');
             const multiSeasonMode = !!document.getElementById('subscription_anime_mode')?.checked;
             if (seasonInput) {
@@ -1623,10 +1622,11 @@
                 task.tmdb_season_episode_map = {};
                 task.tmdb_episode_mode = 'seasonal';
             } else {
-                task.multi_season_mode = !!(task.multi_season_mode ?? task.anime_mode);
-                task.anime_mode = !!task.multi_season_mode;
+                // 多季合一功能已下线：一律按单季订阅提交
+                task.multi_season_mode = false;
+                task.anime_mode = false;
                 task.tmdb_episode_mode = normalizeTmdbEpisodeMode(task.tmdb_episode_mode || 'seasonal');
-                if (!task.multi_season_mode) {
+                {
                     const seasonTotal = getTmdbSeasonEpisodeTotal(task.tmdb_season_episode_map || {}, task.season);
                     const tmdbTotal = Math.max(0, parseInt(task.tmdb_total_episodes || '0', 10) || 0);
                     if (seasonTotal > 0 && (task.total_episodes <= 0 || (tmdbTotal > 0 && task.total_episodes === tmdbTotal && seasonTotal !== tmdbTotal))) {
@@ -1707,7 +1707,7 @@
             document.getElementById('subscription_total_episodes').value = task.total_episodes || 0;
             const editStartEpisodeInput = document.getElementById('subscription_start_episode');
             if (editStartEpisodeInput) editStartEpisodeInput.value = task.start_episode || 1;
-            document.getElementById('subscription_anime_mode').checked = resolveTaskMultiSeasonMode(task);
+            document.getElementById('subscription_anime_mode').checked = false;
             subscriptionFolderTrail = [{ id: '0', name: '根目录' }];
             setSubscriptionSavepath('0', task.savepath || '');
             const shareLinkInput = document.getElementById('subscription_share_link_url');
@@ -2332,7 +2332,7 @@
             const seasonBtn = document.getElementById('subscription-episode-mode-season');
             if (!switchWrap || !absoluteBtn || !seasonBtn) return;
 
-            const multiSeason = !!(task?.multi_season_mode ?? task?.anime_mode ?? payload?.multi_season_mode);
+            const multiSeason = false; // 多季合一功能已下线
             if (multiSeason) {
                 switchWrap.classList.remove('hidden');
                 switchWrap.classList.add('inline-flex');
@@ -2414,7 +2414,7 @@
             const scanFailed = parseInt(scanStats.failed_dirs || '0', 10) || 0;
             const scanTruncated = !!scanStats.truncated;
             const seasonEpisodeMap = normalizeTmdbSeasonEpisodeMap(task?.tmdb_season_episode_map || {});
-            const useSeasonView = subscriptionEpisodeViewMode === 'season' && !!(task?.multi_season_mode ?? task?.anime_mode);
+            const useSeasonView = false; // 多季合一功能已下线，仅绝对集数视图
 
             summaryEl.className = 'text-xs text-slate-300 mt-2';
 

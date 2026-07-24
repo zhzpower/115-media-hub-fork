@@ -52,12 +52,35 @@ class _FakeRenameProvider:
     def __init__(self, entries_by_cid):
         self.entries_by_cid = entries_by_cid
         self.renamed = []
+        self.moved = []
+        self.deleted = []
 
     def list_entries(self, cookie, cid="0"):
         return self.entries_by_cid.get(cid, [])
 
     def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
         self.renamed.append((entry_id, new_name, parent_id))
+        for entry in self.entries_by_cid.get(parent_id, []):
+            if entry.get("id") == entry_id:
+                entry["name"] = new_name
+        return {"state": True}
+
+    def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+        ids = set(entry_ids)
+        moved = [e for e in self.entries_by_cid.get(source_id, []) if e.get("id") in ids]
+        self.entries_by_cid[source_id] = [
+            e for e in self.entries_by_cid.get(source_id, []) if e.get("id") not in ids
+        ]
+        self.entries_by_cid.setdefault(target_id, []).extend(moved)
+        self.moved.append((tuple(sorted(ids)), target_id, source_id))
+        return {"state": True}
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        ids = set(entry_ids)
+        self.deleted.extend(sorted(ids))
+        self.entries_by_cid[parent_id] = [
+            e for e in self.entries_by_cid.get(parent_id, []) if e.get("id") not in ids
+        ]
         return {"state": True}
 
 
@@ -160,21 +183,48 @@ class SubscriptionEpisodeStandardRenameTest(unittest.TestCase):
         self.assertEqual(summary, "")
         self.assertEqual(provider.renamed, [])
 
-    def test_multi_season_absolute_episode_mapped_to_season_episode(self):
-        task = {
-            "name": "多季剧",
-            "title": "多季剧",
-            "media_type": "tv",
-            "season": 1,
-            "media_savepath": "Library",
-            "multi_season_mode": True,
-            "tmdb_episode_mode": "absolute",
-            "tmdb_season_episode_map": {"1": 12, "2": 12},
-        }
-        self.assertEqual(
-            core.convert_subscription_absolute_to_season_episode(task, 14),
-            (2, 2),
+    def test_multi_season_mode_is_fully_disabled(self):
+        # 多季合一功能已下线：即使旧任务存了 True，也一律按单季处理
+        legacy_task = {"media_type": "tv", "multi_season_mode": True, "anime_mode": True}
+        self.assertFalse(core.is_subscription_multi_season_mode(legacy_task))
+        normalized = core.normalize_subscription_task(
+            {
+                "name": "旧多季任务",
+                "title": "旧多季任务",
+                "media_type": "tv",
+                "season": 2,
+                "savepath": "剧集/旧多季任务",
+                "multi_season_mode": True,
+                "anime_mode": True,
+            }
         )
+        self.assertFalse(normalized.get("multi_season_mode"))
+        self.assertFalse(normalized.get("anime_mode"))
+
+    def test_flattens_season_folder_into_base_dir(self):
+        task = core.normalize_subscription_task(
+            {
+                "name": "测试剧",
+                "title": "风吹半夏",
+                "media_type": "tv",
+                "season": 5,
+                "savepath": "剧集/风吹半夏",
+            }
+        )
+        entries = {
+            "F1": [{"id": "sd1", "name": "Season 05", "is_dir": True}],
+            "sd1": [{"id": "f7", "name": "风吹半夏.EP03.mkv", "is_dir": False}],
+        }
+        provider, summary = self._run_rename(task, entries)
+        # 季文件夹内文件先按当前季重命名，再被移动到基础目录
+        self.assertIn(("f7", "S05E03.mkv", "sd1"), provider.renamed)
+        self.assertIn((("f7",), "F1", "sd1"), provider.moved)
+        base_names = {e["name"] for e in entries["F1"]}
+        self.assertIn("S05E03.mkv", base_names)
+        # 清空后的季文件夹被删除
+        self.assertIn("sd1", provider.deleted)
+        self.assertNotIn("Season 05", {e["name"] for e in entries["F1"]})
+        self.assertIn("季文件夹", summary)
 
 
 if __name__ == "__main__":

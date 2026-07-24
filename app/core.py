@@ -1448,8 +1448,9 @@ def normalize_tmdb_season_episode_map(value: Any) -> Dict[str, int]:
 
 
 def is_subscription_multi_season_mode(task: Dict[str, Any]) -> bool:
-    payload = task if isinstance(task, dict) else {}
-    return bool(payload.get("multi_season_mode", payload.get("anime_mode", False)))
+    # 多季合一功能已下线：订阅仅按当前季（task.season）追更。
+    # 旧任务即使存了 multi_season_mode/anime_mode=True 也一律按单季处理。
+    return False
 
 
 def resolve_subscription_tv_episode_mode(task: Dict[str, Any]) -> str:
@@ -1907,8 +1908,9 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
     )
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
     strict_title_match = normalize_bool(task.get("strict_title_match", False), default=False)
-    anime_mode = bool(task.get("anime_mode", False))
-    multi_season_mode = bool(task.get("multi_season_mode", anime_mode))
+    # 多季合一功能已下线：归一化时一律落为 False，仅保留当前季订阅。
+    anime_mode = False
+    multi_season_mode = False
     tmdb_media_type = normalize_tmdb_media_type(task.get("tmdb_media_type", ""), fallback=media_type)
     try:
         tmdb_id = max(0, int(task.get("tmdb_id", 0) or 0))

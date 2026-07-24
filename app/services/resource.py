@@ -163,8 +163,9 @@ def _apply_subscription_episode_standard_renames(
     # 转存后目录内容生效可能有轻微延迟，稍等再列目录
     _time.sleep(2)
 
-    # 收集目标目录内的文件（含一层子目录，兼容整包转入的子文件夹场景）
+    # 收集目标目录内的文件（含两层子目录，兼容整包转入「剧名/Season xx/文件」的场景）
     collected: List[Tuple[Dict[str, Any], str, str]] = []  # (entry, parent_cid, parent_path)
+    season_dirs: List[Tuple[str, str]] = []  # 基础目录下的季文件夹 (dir_id, dir_name)
     queue: List[Tuple[str, str, int]] = [(folder_id, "", 0)]
     visited_dirs = 0
     while queue:
@@ -175,16 +176,15 @@ def _apply_subscription_episode_standard_renames(
             if not entry_name or not entry_id:
                 continue
             if bool(entry.get("is_dir")):
-                if depth < 1 and visited_dirs < 20:
+                if depth == 0 and is_subscription_season_folder_name(entry_name):
+                    season_dirs.append((entry_id, entry_name))
+                if depth < 2 and visited_dirs < 40:
                     visited_dirs += 1
                     queue.append((entry_id, join_relative_path(parent_path, entry_name), depth + 1))
                 continue
             collected.append((entry, cid, parent_path))
-    if not collected:
-        return ""
 
     task_season = max(1, int(task.get("season", 1) or 1))
-    multi_season = is_subscription_multi_season_mode(task)
     existing_names = {str(entry.get("name", "") or "").strip().lower() for entry, _, _ in collected}
     renamed_count = 0
     duplicate_count = 0
@@ -197,12 +197,8 @@ def _apply_subscription_episode_standard_renames(
         episode_value = max(0, int(next(iter(episodes)) or 0))
         if episode_value <= 0:
             continue
-        if multi_season:
-            season_no, episode_no = convert_subscription_absolute_to_season_episode(task, episode_value)
-            if season_no <= 0 or episode_no <= 0:
-                season_no, episode_no = task_season, episode_value
-        else:
-            season_no, episode_no = task_season, episode_value
+        # 多季合一功能已下线：一律使用订阅任务的当前季
+        season_no, episode_no = task_season, episode_value
         extension = _os.path.splitext(entry_name)[1].strip().lower()
         new_name = f"S{season_no:02d}E{episode_no:02d}{extension}"
         if entry_name.lower() == new_name.lower():
@@ -218,11 +214,44 @@ def _apply_subscription_episode_standard_renames(
         existing_names.add(new_name.lower())
         renamed_count += 1
 
+    # 拍平季文件夹：转存内容自带的 Season xx / Sxx / 第x季 文件夹不保留，
+    # 把其中文件移动到基础保存目录，文件夹清空后删除。
+    flattened_count = 0
+    removed_dir_names: List[str] = []
+    for dir_id, dir_name in season_dirs:
+        try:
+            base_names = {
+                str(item.get("name", "") or "").strip().lower()
+                for item in _list_entries(folder_id)
+                if not bool(item.get("is_dir"))
+            }
+            children = _list_entries(dir_id)
+            movable_ids = [
+                str(item.get("id", "") or "").strip()
+                for item in children
+                if not bool(item.get("is_dir"))
+                and str(item.get("id", "") or "").strip()
+                and str(item.get("name", "") or "").strip().lower() not in base_names
+            ]
+            if movable_ids:
+                provider.move_entries(cookie, movable_ids, folder_id, dir_id)
+                flattened_count += len(movable_ids)
+            remaining = _list_entries(dir_id)
+            if not remaining:
+                provider.delete_entries(cookie, [dir_id], folder_id)
+                removed_dir_names.append(dir_name)
+        except Exception:
+            continue
+
     parts: List[str] = []
     if renamed_count > 0:
         parts.append(f"已把 {renamed_count} 个剧集文件重命名为 SxxExx 标准格式")
     if duplicate_count > 0:
         parts.append(f"{duplicate_count} 个剧集与目录已有同集文件重名，保留原文件名")
+    if flattened_count > 0:
+        parts.append(f"已把 {flattened_count} 个文件从季文件夹移动到保存目录")
+    if removed_dir_names:
+        parts.append(f"已删除空季文件夹：{'、'.join(removed_dir_names)}")
     return "；".join(parts)
 
 
