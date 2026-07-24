@@ -2,13 +2,24 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Callable, Dict, Generator, Optional, TypeVar
 
 from .paths import DB_PATH
 _DB_ENSURED = False
 _DB_ENSURE_LOCK = threading.Lock()
+_DB_LOCK_RETRY_ATTEMPTS = max(1, int(os.environ.get("SQLITE_LOCK_RETRY_ATTEMPTS", "8") or "8"))
+_DB_LOCK_RETRY_BASE_DELAY_SECONDS = max(
+    0.05,
+    float(os.environ.get("SQLITE_LOCK_RETRY_BASE_DELAY_SECONDS", "0.2") or "0.2"),
+)
+_DB_LOCK_RETRY_MAX_DELAY_SECONDS = max(
+    _DB_LOCK_RETRY_BASE_DELAY_SECONDS,
+    float(os.environ.get("SQLITE_LOCK_RETRY_MAX_DELAY_SECONDS", "2.5") or "2.5"),
+)
+_T = TypeVar("_T")
 
 
 def ensure_parent(path: str) -> None:
@@ -48,6 +59,30 @@ def sqlite_row_to_dict(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
     if row is None:
         return {}
     return {key: row[key] for key in row.keys()}
+
+
+def is_sqlite_locked_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc or "").lower()
+    return "database is locked" in message or "database table is locked" in message or "database schema is locked" in message
+
+
+def retry_sqlite_locked(operation: Callable[[], _T], *, attempts: Optional[int] = None) -> _T:
+    max_attempts = max(1, int(attempts or _DB_LOCK_RETRY_ATTEMPTS))
+    for attempt in range(max_attempts):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if (not is_sqlite_locked_error(exc)) or attempt >= max_attempts - 1:
+                raise
+            delay = min(
+                _DB_LOCK_RETRY_MAX_DELAY_SECONDS,
+                _DB_LOCK_RETRY_BASE_DELAY_SECONDS * (2**attempt),
+            )
+            time.sleep(delay)
+    # The loop either returns or raises. This keeps type checkers satisfied.
+    return operation()
 
 
 def _configure_connection(conn: sqlite3.Connection, enable_wal: bool = False) -> None:

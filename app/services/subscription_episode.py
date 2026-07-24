@@ -58,11 +58,26 @@ def _clamp_episode_values(episode_values: Set[int], episode_upper_bound: int = 0
     return normalized
 
 
-def _is_subscription_skipped_archive_file(name: str) -> bool:
+def _get_subscription_file_extension(name: str) -> str:
     normalized_name = normalize_relative_path(str(name or "").strip())
     if "." not in normalized_name:
+        return ""
+    suffix = normalized_name.rsplit(".", 1)[-1].strip().lower()
+    if "/" in suffix or not suffix:
+        return ""
+    return suffix
+
+
+def _is_subscription_excluded_file_type(task: Dict[str, Any], name: str) -> bool:
+    extension = _get_subscription_file_extension(name)
+    if not extension:
         return False
-    return normalized_name.rsplit(".", 1)[-1].lower() in {"zip", "rar"}
+    excluded_extensions = set(resolve_subscription_exclude_file_extensions(task or {}))
+    return extension in excluded_extensions
+
+
+def _is_subscription_skipped_archive_file(name: str) -> bool:
+    return _get_subscription_file_extension(name) in {"zip", "rar"}
 
 
 def _is_subscription_skipped_audio_file(name: str) -> bool:
@@ -334,7 +349,7 @@ def _extract_task_episodes_from_file_entry(
     normalized_file_name = normalize_relative_path(str(file_name or "").strip())
     if not normalized_file_name:
         return set()
-    if _is_subscription_skipped_archive_file(normalized_file_name):
+    if _is_subscription_excluded_file_type(task, normalized_file_name):
         return set()
     if _is_subscription_skipped_audio_file(normalized_file_name):
         return set()
@@ -704,7 +719,7 @@ def _pick_best_tv_share_files_by_episode_bucket(
         entry_name = normalize_relative_path(str(raw_entry.get("name", "") or "").strip())
         if not entry_id or not entry_name:
             continue
-        if _is_subscription_skipped_archive_file(entry_name):
+        if _is_subscription_excluded_file_type(task, entry_name):
             continue
 
         entry_episodes = _clamp_episode_values(
@@ -1173,6 +1188,8 @@ __all__ = [
     "SubscriptionEpisodeNormalization",
     "_expand_episode_values",
     "_clamp_episode_values",
+    "_get_subscription_file_extension",
+    "_is_subscription_excluded_file_type",
     "_is_subscription_skipped_archive_file",
     "_normalize_subscription_episode_evidence",
     "_extract_task_episode_normalization_from_name",

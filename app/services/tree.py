@@ -3,6 +3,7 @@ from http.cookies import SimpleCookie
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..core import *  # noqa: F401,F403
+from ..db import retry_sqlite_locked
 from ..memory import release_process_memory
 from .strm_files import delete_managed_strm_file, managed_strm_file_path
 
@@ -401,44 +402,63 @@ def _mark_local_files_seen_batch(
     if not ordered_rows:
         return [], duplicate_count
 
-    existing_rows: Dict[str, Tuple[str, str]] = {}
-    path_hashes = [path_hash for path_hash, _rel_path in ordered_rows]
-    for chunk in _iter_chunks(path_hashes, TREE_SYNC_SQLITE_SELECT_CHUNK_SIZE):
-        placeholders = ",".join("?" for _item in chunk)
-        cursor.execute(
-            f"SELECT path_hash, relative_path, scan_token FROM local_files WHERE path_hash IN ({placeholders})",
-            chunk,
-        )
-        for path_hash, existing_rel_path, existing_scan_token in cursor.fetchall():
-            existing_rows[str(path_hash or "")] = (
-                normalize_relative_path(existing_rel_path),
-                str(existing_scan_token or ""),
+    def write_batch() -> Tuple[List[str], int]:
+        duplicate_total = duplicate_count
+        existing_rows: Dict[str, Tuple[str, str]] = {}
+        path_hashes = [path_hash for path_hash, _rel_path in ordered_rows]
+        for chunk in _iter_chunks(path_hashes, TREE_SYNC_SQLITE_SELECT_CHUNK_SIZE):
+            placeholders = ",".join("?" for _item in chunk)
+            cursor.execute(
+                f"SELECT path_hash, relative_path, scan_token FROM local_files WHERE path_hash IN ({placeholders})",
+                chunk,
             )
+            for path_hash, existing_rel_path, existing_scan_token in cursor.fetchall():
+                existing_rows[str(path_hash or "")] = (
+                    normalize_relative_path(existing_rel_path),
+                    str(existing_scan_token or ""),
+                )
 
-    upsert_rows: List[Tuple[str, str, str]] = []
-    fresh_paths: List[str] = []
-    for path_hash, rel_path in ordered_rows:
-        existing_rel_path, existing_scan_token = existing_rows.get(path_hash, ("", ""))
-        if existing_rel_path == rel_path and existing_scan_token == scan_token:
-            duplicate_count += 1
-            continue
-        upsert_rows.append((path_hash, rel_path, scan_token))
-        fresh_paths.append(rel_path)
+        upsert_rows: List[Tuple[str, str, str]] = []
+        fresh_paths: List[str] = []
+        for path_hash, rel_path in ordered_rows:
+            existing_rel_path, existing_scan_token = existing_rows.get(path_hash, ("", ""))
+            if existing_rel_path == rel_path and existing_scan_token == scan_token:
+                duplicate_total += 1
+                continue
+            upsert_rows.append((path_hash, rel_path, scan_token))
+            fresh_paths.append(rel_path)
 
-    if upsert_rows:
-        cursor.executemany(
-            """
-            INSERT INTO local_files (path_hash, relative_path, scan_token)
-            VALUES (?, ?, ?)
-            ON CONFLICT(path_hash) DO UPDATE SET
-                relative_path = excluded.relative_path,
-                scan_token = excluded.scan_token
-            WHERE local_files.relative_path <> excluded.relative_path
-               OR local_files.scan_token <> excluded.scan_token
-            """,
-            upsert_rows,
-        )
-    return fresh_paths, duplicate_count
+        if upsert_rows:
+            cursor.executemany(
+                """
+                INSERT INTO local_files (path_hash, relative_path, scan_token)
+                VALUES (?, ?, ?)
+                ON CONFLICT(path_hash) DO UPDATE SET
+                    relative_path = excluded.relative_path,
+                    scan_token = excluded.scan_token
+                WHERE local_files.relative_path <> excluded.relative_path
+                   OR local_files.scan_token <> excluded.scan_token
+                """,
+                upsert_rows,
+            )
+        return fresh_paths, duplicate_total
+
+    def transactional_write() -> Tuple[List[str], int]:
+        conn = cursor.connection
+        owns_transaction = not conn.in_transaction
+        try:
+            if owns_transaction:
+                cursor.execute("BEGIN IMMEDIATE")
+            result = write_batch()
+            if owns_transaction:
+                conn.commit()
+            return result
+        except Exception:
+            if owns_transaction:
+                conn.rollback()
+            raise
+
+    return retry_sqlite_locked(transactional_write)
 
 
 async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
@@ -501,7 +521,8 @@ async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
         if not mount_prefix_115:
             raise RuntimeError("请先在参数配置中填写 115 网盘路径前缀")
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = open_db()
+        conn.isolation_level = None
         cursor = conn.cursor()
         scan_token = f"tree-{int(time.time())}-{secrets.token_hex(8)}"
         generate_started_at = time.perf_counter()
@@ -704,9 +725,18 @@ async def run_sync(use_local: bool = False, force_full: bool = False) -> None:
                     except Exception:
                         delete_failed_file_count += 1
 
-        cursor.execute("DELETE FROM local_files WHERE scan_token <> ?", (scan_token,))
-        stale_index_count = max(0, int(cursor.rowcount or 0))
-        conn.commit()
+        def delete_stale_local_files() -> int:
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute("DELETE FROM local_files WHERE scan_token <> ?", (scan_token,))
+                deleted_count = max(0, int(cursor.rowcount or 0))
+                conn.commit()
+                return deleted_count
+            except Exception:
+                conn.rollback()
+                raise
+
+        stale_index_count = retry_sqlite_locked(delete_stale_local_files)
         cleanup_elapsed_seconds = max(0.0, time.perf_counter() - cleanup_started_at)
 
         cleanup_mode_label = "开启" if cfg.get("sync_clean", True) else "关闭"

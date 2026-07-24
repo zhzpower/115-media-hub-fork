@@ -31,6 +31,7 @@
 
         const SUBSCRIPTION_LOG_RECENT_TASK_LIMIT = 1;
         const SUBSCRIPTION_LOG_PAGE_TASK_LIMIT = 1;
+        const SUBSCRIPTION_DEFAULT_EXCLUDE_FILE_EXTENSIONS = ['zip', 'rar'];
         const SUBSCRIPTION_SCAN_RECOMMENDED_DEFAULTS = {
             '115': {
                 candidate_scan_prefetch_limit: 3,
@@ -165,6 +166,11 @@
                     ? task.exclude_keywords.join(',')
                     : (task?.exclude_keywords || task?.exclude_words || '')
             );
+            const excludeFileExtensions = parseSubscriptionExcludeFileExtensions(
+                Array.isArray(task?.exclude_file_extensions)
+                    ? task.exclude_file_extensions.join(',')
+                    : (task?.exclude_file_extensions || '')
+            );
             const scheduleWeekdays = normalizeSubscriptionWeekdays(task?.schedule_weekdays || []);
             const scheduleStartTime = normalizeSubscriptionScheduleTime(task?.schedule_start_time || '00:00', '00:00');
             const scheduleEndTime = normalizeSubscriptionScheduleTime(task?.schedule_end_time || '23:59', '23:59');
@@ -197,10 +203,11 @@
                 : (shareSubdirCid ? `，分享子目录 CID ${shareSubdirCid}` : '');
             const providerRuleText = (!_pMeta?.supports_fixed_share_link) ? '，仅频道自动匹配（不使用固定分享链接）' : '';
             const excludeText = excludeKeywords.length ? `，排除 ${excludeKeywords.slice(0, 4).join('、')}` : '';
+            const excludeFileText = excludeFileExtensions.length ? `，排除文件类型 ${excludeFileExtensions.slice(0, 5).join('/')}` : '';
             const minFileSizeMb = normalizeSubscriptionMinFileSizeMb(task?.min_file_size_mb ?? 0);
             const sizeFilterText = minFileSizeMb > 0 ? `，小于 ${formatSubscriptionMinFileSizeMb(minFileSizeMb)}MB 不导入` : '';
             const strictMatchText = task?.strict_title_match ? '，精准匹配：简介命中不算同剧证据' : '';
-            return `状态：${statusText}（${enabledText}）。${providerText} · ${mediaText}《${titleText}》保存到 ${savepath}${fixedShareText}${shareScopeText}${providerRuleText}${excludeText}${sizeFilterText}${strictMatchText}，${modeText}，${episodeText}；${scheduleText}；${latestText}。`;
+            return `状态：${statusText}（${enabledText}）。${providerText} · ${mediaText}《${titleText}》保存到 ${savepath}${fixedShareText}${shareScopeText}${providerRuleText}${excludeText}${excludeFileText}${sizeFilterText}${strictMatchText}，${modeText}，${episodeText}；${scheduleText}；${latestText}。`;
         }
 
         function buildSubscriptionTaskProgressBar({ progress = 0, detail = '' } = {}) {
@@ -1012,6 +1019,21 @@
             return parseSubscriptionExcludeKeywords(values.join(',')).join(', ');
         }
 
+        function parseSubscriptionExcludeFileExtensions(value) {
+            return uniquePreserveOrder(String(value || '')
+                .split(/[,\n，]+/)
+                .map(item => item.trim().toLowerCase().replace(/^\.+/, '').replace(/\s+/g, ''))
+                .filter(item => /^[a-z0-9][a-z0-9_+-]{0,29}$/.test(item)))
+                .slice(0, 50);
+        }
+
+        function formatSubscriptionExcludeFileExtensions(value) {
+            const values = Array.isArray(value)
+                ? value
+                : parseSubscriptionExcludeFileExtensions(value);
+            return parseSubscriptionExcludeFileExtensions(values.join(',')).join(', ');
+        }
+
         function getSubscriptionTmdbBindingFromForm() {
             const tmdbId = parseInt(document.getElementById('subscription_tmdb_id')?.value || '0', 10) || 0;
             const tmdbMediaType = normalizeTmdbMediaType(document.getElementById('subscription_tmdb_media_type')?.value || '');
@@ -1395,6 +1417,9 @@
             const excludeKeywords = parseSubscriptionExcludeKeywords(document.getElementById('subscription_exclude_keywords')?.value || '');
             const excludeInput = document.getElementById('subscription_exclude_keywords');
             if (excludeInput) excludeInput.value = excludeKeywords.join(', ');
+            const excludeFileExtensions = parseSubscriptionExcludeFileExtensions(document.getElementById('subscription_exclude_file_extensions')?.value || '');
+            const excludeFileInput = document.getElementById('subscription_exclude_file_extensions');
+            if (excludeFileInput) excludeFileInput.value = excludeFileExtensions.join(', ');
             const minFileSizeInput = document.getElementById('subscription_min_file_size_mb');
             const minFileSizeMb = normalizeSubscriptionMinFileSizeMb(minFileSizeInput?.value || '0');
             if (minFileSizeInput) minFileSizeInput.value = formatSubscriptionMinFileSizeMb(minFileSizeMb);
@@ -1406,6 +1431,7 @@
                 title,
                 aliases: document.getElementById('subscription_aliases').value.trim(),
                 exclude_keywords: excludeKeywords,
+                exclude_file_extensions: excludeFileExtensions,
                 year: document.getElementById('subscription_year').value.trim(),
                 season: parseInt(document.getElementById('subscription_season').value || '1', 10) || 1,
                 total_episodes: parseInt(document.getElementById('subscription_total_episodes').value || '0', 10) || 0,
@@ -1457,6 +1483,8 @@
             document.getElementById('subscription_aliases').value = '';
             const excludeInput = document.getElementById('subscription_exclude_keywords');
             if (excludeInput) excludeInput.value = '';
+            const excludeFileInput = document.getElementById('subscription_exclude_file_extensions');
+            if (excludeFileInput) excludeFileInput.value = SUBSCRIPTION_DEFAULT_EXCLUDE_FILE_EXTENSIONS.join(', ');
             document.getElementById('subscription_year').value = '';
             document.getElementById('subscription_season').value = 1;
             document.getElementById('subscription_total_episodes').value = 0;
@@ -1662,6 +1690,12 @@
             document.getElementById('subscription_aliases').value = Array.isArray(task.aliases) ? task.aliases.join(', ') : (task.aliases || '');
             const excludeInput = document.getElementById('subscription_exclude_keywords');
             if (excludeInput) excludeInput.value = formatSubscriptionExcludeKeywords(task.exclude_keywords || task.exclude_words || '');
+            const excludeFileInput = document.getElementById('subscription_exclude_file_extensions');
+            if (excludeFileInput) excludeFileInput.value = formatSubscriptionExcludeFileExtensions(
+                Array.isArray(task.exclude_file_extensions)
+                    ? task.exclude_file_extensions
+                    : SUBSCRIPTION_DEFAULT_EXCLUDE_FILE_EXTENSIONS
+            );
             document.getElementById('subscription_year').value = task.year || '';
             document.getElementById('subscription_season').value = task.season || 1;
             document.getElementById('subscription_total_episodes').value = task.total_episodes || 0;

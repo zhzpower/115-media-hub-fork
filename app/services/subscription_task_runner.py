@@ -174,6 +174,21 @@ def _format_subscription_share_scan_log_tail(stats: Dict[str, Any], *, include_c
     return "，".join(parts)
 
 
+def _format_subscription_excluded_file_type_tail(stats: Dict[str, Any]) -> str:
+    payload = stats if isinstance(stats, dict) else {}
+    skipped = max(
+        0,
+        int(payload.get("skipped_excluded_file_types", payload.get("skipped_archive_files", 0)) or 0),
+    )
+    if skipped <= 0:
+        return ""
+    extensions = normalize_subscription_exclude_file_extensions(payload.get("exclude_file_extensions", []))
+    extension_text = "/".join(extensions[:5]) if extensions else "已配置类型"
+    if len(extensions) > 5:
+        extension_text = f"{extension_text}等"
+    return f"，已排除文件类型 {extension_text} {skipped} 个"
+
+
 def _build_subscription_episode_batch_decision(
     task: Dict[str, Any],
     *,
@@ -453,7 +468,7 @@ async def _prewarm_subscription_candidate_share_manifests(
                 )
                 reason = str((subdir_stats or {}).get("reason", "") or "").strip()
                 if selected_ids:
-                    manifest = _build_subscription_share_manifest_from_snapshot(snapshot, subdir_selection)
+                    manifest = _build_subscription_share_manifest_from_snapshot(snapshot, subdir_selection, task)
                     cache_subdir = True
                 elif reason == "target_is_share_root":
                     cache_subdir = True
@@ -1713,12 +1728,11 @@ async def _run_subscription_task_quark(
                     skipped_precise_mismatch_candidates += 1
                     reason_label = _format_subscription_reason_chain(reason)
                     scan_tail = _format_subscription_share_scan_log_tail(precise_stats)
-                    archive_skipped = int((precise_stats or {}).get("skipped_archive_files", 0) or 0)
-                    archive_tail = f"，已排除 zip/rar {archive_skipped} 个" if archive_skipped > 0 else ""
+                    excluded_type_tail = _format_subscription_excluded_file_type_tail(precise_stats)
                     await write_subscription_log(
                         (
                             f"候选资源 #{index} 精细筛选未命中缺失集（目标 {_format_episode_preview(precise_missing_episode_values)}，"
-                            f"原因 {reason_label}，{scan_tail}{archive_tail}），"
+                            f"原因 {reason_label}，{scan_tail}{excluded_type_tail}），"
                             "已跳过整包导入"
                         ),
                         "warn",
@@ -1815,7 +1829,29 @@ async def _run_subscription_task_quark(
                         ),
                         "scanned_dirs": max(0, int((manifest_payload or {}).get("scanned_dirs", 0) or 0)),
                         "scanned_entries": max(0, int((manifest_payload or {}).get("scanned_entries", 0) or 0)),
-                        "skipped_archive_files": max(0, int((manifest_payload or {}).get("skipped_archive_files", 0) or 0)),
+                        "exclude_file_extensions": normalize_subscription_exclude_file_extensions(
+                            (manifest_payload or {}).get("exclude_file_extensions", [])
+                        ),
+                        "skipped_excluded_file_types": max(
+                            0,
+                            int(
+                                (manifest_payload or {}).get(
+                                    "skipped_excluded_file_types",
+                                    (manifest_payload or {}).get("skipped_archive_files", 0),
+                                )
+                                or 0
+                            ),
+                        ),
+                        "skipped_archive_files": max(
+                            0,
+                            int(
+                                (manifest_payload or {}).get(
+                                    "skipped_excluded_file_types",
+                                    (manifest_payload or {}).get("skipped_archive_files", 0),
+                                )
+                                or 0
+                            ),
+                        ),
                     }
                 precise_ids = (
                     precise_selection.get("selected_ids", [])
@@ -1827,12 +1863,11 @@ async def _run_subscription_task_quark(
                     reason = str((precise_stats or {}).get("reason", "") or "no_precise_episode_match").strip()
                     reason_label = _format_subscription_reason_chain(reason)
                     scan_tail = _format_subscription_share_scan_log_tail(precise_stats)
-                    archive_skipped = int((precise_stats or {}).get("skipped_archive_files", 0) or 0)
-                    archive_tail = f"，已排除 zip/rar {archive_skipped} 个" if archive_skipped > 0 else ""
+                    excluded_type_tail = _format_subscription_excluded_file_type_tail(precise_stats)
                     await write_subscription_log(
                         (
                             f"候选资源 #{index} 清单精查未能定位目标季剧集文件"
-                            f"（原因 {reason_label}，{scan_tail}{archive_tail}），"
+                            f"（原因 {reason_label}，{scan_tail}{excluded_type_tail}），"
                             "已跳过整包导入"
                         ),
                         "warn",
@@ -1857,14 +1892,13 @@ async def _run_subscription_task_quark(
                     if str(sample or "").strip()
                 ]
                 dedupe_hits = int((precise_stats or {}).get("duplicate_bucket_hits", 0) or 0)
-                archive_skipped = int((manifest_payload or {}).get("skipped_archive_files", 0) or 0)
                 dedupe_tail = f"，同集/同范围已优选 {dedupe_hits} 条重复版本" if dedupe_hits > 0 else ""
-                archive_tail = f"，已排除 zip/rar {archive_skipped} 个" if archive_skipped > 0 else ""
+                excluded_type_tail = _format_subscription_excluded_file_type_tail(manifest_payload)
                 await write_subscription_log(
                     (
                         f"候选资源 #{index} 标题未给出明确集数，已按分享清单识别 "
                         f"{_format_episode_preview(selected_share_episode_values)} 并筛选 {len(precise_ids)} 个文件后转存"
-                        f"{dedupe_tail}{archive_tail}"
+                        f"{dedupe_tail}{excluded_type_tail}"
                     ),
                     "info",
                 )
@@ -3877,13 +3911,12 @@ async def run_subscription_task(
                             selection_reason = str((title_precise_stats or {}).get("reason", "") or "").strip() or "unknown"
                             selection_reason_label = _format_subscription_reason_chain(selection_reason)
                             scan_tail = _format_subscription_share_scan_log_tail(title_precise_stats)
-                            archive_skipped = int((title_precise_stats or {}).get("skipped_archive_files", 0) or 0)
-                            archive_tail = f"，已排除 zip/rar {archive_skipped} 个" if archive_skipped > 0 else ""
+                            excluded_type_tail = _format_subscription_excluded_file_type_tail(title_precise_stats)
                             await write_subscription_log(
                                 (
                                     f"候选资源 #{index} 未能在分享内容中精细识别目标剧集文件，"
                                     f"已跳过避免整包导入（目标 {_format_episode_preview(title_precise_episode_values)}，"
-                                    f"原因 {selection_reason_label}，{scan_tail}{archive_tail}）"
+                                    f"原因 {selection_reason_label}，{scan_tail}{excluded_type_tail}）"
                                 ),
                                 "warn",
                             )

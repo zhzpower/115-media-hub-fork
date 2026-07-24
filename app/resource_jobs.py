@@ -242,25 +242,29 @@ def prune_resource_job_history(
         "failed": max(100, min(10000, int(failed_keep or RESOURCE_JOB_FAILED_KEEP))),
     }
     ensure_db()
-    with db_connection() as conn:
-        cursor = conn.cursor()
-        deleted: Dict[str, int] = {}
-        for status, keep_count in keep_by_status.items():
-            cursor.execute(
-                """
-                DELETE FROM resource_jobs
-                WHERE status = ?
-                  AND id NOT IN (
-                    SELECT id FROM resource_jobs
+    def prune_history() -> Dict[str, int]:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            deleted: Dict[str, int] = {}
+            for status, keep_count in keep_by_status.items():
+                cursor.execute(
+                    """
+                    DELETE FROM resource_jobs
                     WHERE status = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                  )
-                """,
-                (status, status, keep_count),
-            )
-            deleted[status] = int(cursor.rowcount or 0)
-        conn.commit()
+                      AND id NOT IN (
+                        SELECT id FROM resource_jobs
+                        WHERE status = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                      )
+                    """,
+                    (status, status, keep_count),
+                )
+                deleted[status] = int(cursor.rowcount or 0)
+            conn.commit()
+            return deleted
+
+    deleted = retry_sqlite_locked(prune_history)
     if sum(deleted.values()) > 0:
         invalidate_resource_state_snapshot("resource-jobs-prune")
         touch_resource_jobs_state_signal("resource-jobs-prune")

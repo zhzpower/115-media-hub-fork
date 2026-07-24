@@ -1,5 +1,5 @@
 from ..core import *  # noqa: F401,F403
-from ..db import db_connection
+from ..db import db_connection, retry_sqlite_locked
 
 def has_subscription_match(task_name: str, resource_id: int) -> bool:
     with db_connection() as conn:
@@ -551,78 +551,81 @@ def upsert_subscription_channel_support_stats(
     if not normalized_payload:
         return 0
 
-    existing_rows = load_subscription_channel_support_stats(list(normalized_payload.keys()))
-    with db_connection() as conn:
-        cursor = conn.cursor()
-        written = 0
-        for channel_id, payload in normalized_payload.items():
-            existing = existing_rows.get(channel_id, {})
-            searched_runs = max(0, int(existing.get("searched_runs", 0) or 0)) + max(0, int(payload.get("searched_runs", 0) or 0))
-            matched_runs = max(0, int(existing.get("matched_runs", 0) or 0)) + max(0, int(payload.get("matched_runs", 0) or 0))
-            matched_items = max(0, int(existing.get("matched_items", 0) or 0)) + max(0, int(payload.get("matched_items", 0) or 0))
-            error_runs = max(0, int(existing.get("error_runs", 0) or 0)) + max(0, int(payload.get("error_runs", 0) or 0))
-            incremental_stop_hits = max(0, int(existing.get("incremental_stop_hits", 0) or 0)) + max(
-                0,
-                int(payload.get("incremental_stop_hits", 0) or 0),
-            )
-            pages_scanned = max(0, int(existing.get("pages_scanned", 0) or 0)) + max(0, int(payload.get("pages_scanned", 0) or 0))
-            channel_name = str(payload.get("channel_name", "") or "").strip() or str(existing.get("channel_name", "") or "").strip() or channel_id
-            last_error = str(payload.get("last_error", "") or "").strip() or str(existing.get("last_error", "") or "").strip()
-            last_searched_at = (
-                str(payload.get("last_searched_at", "") or "").strip()
-                or now_iso
-            )
-            last_matched_at = (
-                str(payload.get("last_matched_at", "") or "").strip()
-                or (now_iso if int(payload.get("matched_runs", 0) or 0) > 0 else str(existing.get("last_matched_at", "") or "").strip())
-            )
-            cursor.execute(
-                """
-                INSERT INTO subscription_channel_support_stats(
-                    channel_id, channel_name, searched_runs, matched_runs, matched_items,
-                    error_runs, incremental_stop_hits, pages_scanned, last_task_name,
-                    last_provider, last_trigger, last_error, last_searched_at,
-                    last_matched_at, updated_at
+    def upsert_stats() -> int:
+        existing_rows = load_subscription_channel_support_stats(list(normalized_payload.keys()))
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            written = 0
+            for channel_id, payload in normalized_payload.items():
+                existing = existing_rows.get(channel_id, {})
+                searched_runs = max(0, int(existing.get("searched_runs", 0) or 0)) + max(0, int(payload.get("searched_runs", 0) or 0))
+                matched_runs = max(0, int(existing.get("matched_runs", 0) or 0)) + max(0, int(payload.get("matched_runs", 0) or 0))
+                matched_items = max(0, int(existing.get("matched_items", 0) or 0)) + max(0, int(payload.get("matched_items", 0) or 0))
+                error_runs = max(0, int(existing.get("error_runs", 0) or 0)) + max(0, int(payload.get("error_runs", 0) or 0))
+                incremental_stop_hits = max(0, int(existing.get("incremental_stop_hits", 0) or 0)) + max(
+                    0,
+                    int(payload.get("incremental_stop_hits", 0) or 0),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(channel_id)
-                DO UPDATE SET
-                    channel_name = excluded.channel_name,
-                    searched_runs = excluded.searched_runs,
-                    matched_runs = excluded.matched_runs,
-                    matched_items = excluded.matched_items,
-                    error_runs = excluded.error_runs,
-                    incremental_stop_hits = excluded.incremental_stop_hits,
-                    pages_scanned = excluded.pages_scanned,
-                    last_task_name = excluded.last_task_name,
-                    last_provider = excluded.last_provider,
-                    last_trigger = excluded.last_trigger,
-                    last_error = excluded.last_error,
-                    last_searched_at = excluded.last_searched_at,
-                    last_matched_at = excluded.last_matched_at,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    channel_id,
-                    channel_name,
-                    searched_runs,
-                    matched_runs,
-                    matched_items,
-                    error_runs,
-                    incremental_stop_hits,
-                    pages_scanned,
-                    normalized_task_name,
-                    normalized_provider,
-                    normalized_trigger,
-                    last_error,
-                    last_searched_at,
-                    last_matched_at,
-                    now_iso,
-                ),
-            )
-            written += 1
-        conn.commit()
-    return written
+                pages_scanned = max(0, int(existing.get("pages_scanned", 0) or 0)) + max(0, int(payload.get("pages_scanned", 0) or 0))
+                channel_name = str(payload.get("channel_name", "") or "").strip() or str(existing.get("channel_name", "") or "").strip() or channel_id
+                last_error = str(payload.get("last_error", "") or "").strip() or str(existing.get("last_error", "") or "").strip()
+                last_searched_at = (
+                    str(payload.get("last_searched_at", "") or "").strip()
+                    or now_iso
+                )
+                last_matched_at = (
+                    str(payload.get("last_matched_at", "") or "").strip()
+                    or (now_iso if int(payload.get("matched_runs", 0) or 0) > 0 else str(existing.get("last_matched_at", "") or "").strip())
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO subscription_channel_support_stats(
+                        channel_id, channel_name, searched_runs, matched_runs, matched_items,
+                        error_runs, incremental_stop_hits, pages_scanned, last_task_name,
+                        last_provider, last_trigger, last_error, last_searched_at,
+                        last_matched_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(channel_id)
+                    DO UPDATE SET
+                        channel_name = excluded.channel_name,
+                        searched_runs = excluded.searched_runs,
+                        matched_runs = excluded.matched_runs,
+                        matched_items = excluded.matched_items,
+                        error_runs = excluded.error_runs,
+                        incremental_stop_hits = excluded.incremental_stop_hits,
+                        pages_scanned = excluded.pages_scanned,
+                        last_task_name = excluded.last_task_name,
+                        last_provider = excluded.last_provider,
+                        last_trigger = excluded.last_trigger,
+                        last_error = excluded.last_error,
+                        last_searched_at = excluded.last_searched_at,
+                        last_matched_at = excluded.last_matched_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        channel_id,
+                        channel_name,
+                        searched_runs,
+                        matched_runs,
+                        matched_items,
+                        error_runs,
+                        incremental_stop_hits,
+                        pages_scanned,
+                        normalized_task_name,
+                        normalized_provider,
+                        normalized_trigger,
+                        last_error,
+                        last_searched_at,
+                        last_matched_at,
+                        now_iso,
+                    ),
+                )
+                written += 1
+            conn.commit()
+        return written
+
+    return retry_sqlite_locked(upsert_stats)
 
 def load_subscription_task_state(task_name: str, media_type: str = "movie") -> Dict[str, Any]:
     with db_connection() as conn:
@@ -673,55 +676,49 @@ def upsert_subscription_task_state(task_name: str, **fields: Any) -> None:
     task_key = str(task_name or "").strip()
     if not task_key:
         return
-    max_attempts = 4
-    for attempt in range(max_attempts):
-        try:
-            current = load_subscription_task_state(task_key)
-            with db_connection() as conn:
-                cursor = conn.cursor()
-                payload = {**current}
-                payload.update(fields)
-                stats_value = payload.get("stats", {})
-                if not isinstance(stats_value, dict):
-                    stats_value = {}
-                now = now_text()
-                cursor.execute(
-                    """
-                    INSERT OR REPLACE INTO subscription_task_state(
-                        task_name, media_type, status, progress, detail, last_run_at, last_success_at, last_error,
-                        last_episode, total_episodes, matched_resource_id, matched_resource_title, matched_score,
-                        queued_job_id, stats_json, updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        task_key,
-                        str(payload.get("media_type", "movie") or "movie").strip().lower() or "movie",
-                        str(payload.get("status", "idle") or "idle").strip().lower(),
-                        max(0, min(100, int(payload.get("progress", 0) or 0))),
-                        str(payload.get("detail", "") or "").strip(),
-                        str(payload.get("last_run_at", "") or "").strip(),
-                        str(payload.get("last_success_at", "") or "").strip(),
-                        str(payload.get("last_error", "") or "").strip(),
-                        max(0, int(payload.get("last_episode", 0) or 0)),
-                        max(0, int(payload.get("total_episodes", 0) or 0)),
-                        max(0, int(payload.get("matched_resource_id", 0) or 0)),
-                        str(payload.get("matched_resource_title", "") or "").strip(),
-                        max(0, int(payload.get("matched_score", 0) or 0)),
-                        max(0, int(payload.get("queued_job_id", 0) or 0)),
-                        safe_json_dumps(stats_value),
-                        now,
-                    ),
+
+    def upsert_state() -> None:
+        current = load_subscription_task_state(task_key)
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            payload = {**current}
+            payload.update(fields)
+            stats_value = payload.get("stats", {})
+            if not isinstance(stats_value, dict):
+                stats_value = {}
+            now = now_text()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO subscription_task_state(
+                    task_name, media_type, status, progress, detail, last_run_at, last_success_at, last_error,
+                    last_episode, total_episodes, matched_resource_id, matched_resource_title, matched_score,
+                    queued_job_id, stats_json, updated_at
                 )
-                conn.commit()
-            schedule_ui_state_push(0)
-            return
-        except sqlite3.OperationalError as exc:
-            message = str(exc or "").lower()
-            retryable = "locked" in message
-            if (not retryable) or attempt >= max_attempts - 1:
-                raise
-            time.sleep(0.15 * (attempt + 1))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_key,
+                    str(payload.get("media_type", "movie") or "movie").strip().lower() or "movie",
+                    str(payload.get("status", "idle") or "idle").strip().lower(),
+                    max(0, min(100, int(payload.get("progress", 0) or 0))),
+                    str(payload.get("detail", "") or "").strip(),
+                    str(payload.get("last_run_at", "") or "").strip(),
+                    str(payload.get("last_success_at", "") or "").strip(),
+                    str(payload.get("last_error", "") or "").strip(),
+                    max(0, int(payload.get("last_episode", 0) or 0)),
+                    max(0, int(payload.get("total_episodes", 0) or 0)),
+                    max(0, int(payload.get("matched_resource_id", 0) or 0)),
+                    str(payload.get("matched_resource_title", "") or "").strip(),
+                    max(0, int(payload.get("matched_score", 0) or 0)),
+                    max(0, int(payload.get("queued_job_id", 0) or 0)),
+                    safe_json_dumps(stats_value),
+                    now,
+                ),
+            )
+            conn.commit()
+
+    retry_sqlite_locked(upsert_state)
+    schedule_ui_state_push(0)
 
 def list_subscription_task_runtime(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     cfg = cfg or get_config()

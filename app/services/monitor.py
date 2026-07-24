@@ -1,5 +1,6 @@
 from ..background import submit_background
 from ..core import *  # noqa: F401,F403
+from ..db import retry_sqlite_locked
 from ..memory import release_process_memory
 from .notify import push_monitor_success_notification
 from .strm_files import delete_managed_strm_file, managed_strm_file_path, remove_empty_parent_dirs
@@ -29,14 +30,16 @@ async def mark_cached_dir_as_seen(
 ) -> None:
     cursor = conn.cursor()
     like_prefix = f"{local_prefix}/%" if local_prefix else "%"
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO current_scan (local_rel_path, remote_rel_path, remote_modified, file_size)
-        SELECT local_rel_path, remote_rel_path, remote_modified, file_size
-        FROM monitor_files
-        WHERE task_name = ? AND (local_rel_path = ? OR local_rel_path LIKE ?)
-        """,
-        (task_name, local_prefix, like_prefix),
+    retry_sqlite_locked(
+        lambda: cursor.execute(
+            """
+            INSERT OR REPLACE INTO current_scan (local_rel_path, remote_rel_path, remote_modified, file_size)
+            SELECT local_rel_path, remote_rel_path, remote_modified, file_size
+            FROM monitor_files
+            WHERE task_name = ? AND (local_rel_path = ? OR local_rel_path LIKE ?)
+            """,
+            (task_name, local_prefix, like_prefix),
+        )
     )
     await asyncio.sleep(0)
 
@@ -84,49 +87,56 @@ def _mark_monitor_dir_success(
     dir_rel_path: str,
     remote_modified: str,
 ) -> None:
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO monitor_dirs(
-            task_name,
-            dir_rel_path,
-            remote_modified,
-            needs_rescan,
-            missing_confirmations
-        ) VALUES (?, ?, ?, 0, 0)
-        """,
-        (task_name, dir_rel_path, str(remote_modified or "")),
+    retry_sqlite_locked(
+        lambda: cursor.execute(
+            """
+            INSERT OR REPLACE INTO monitor_dirs(
+                task_name,
+                dir_rel_path,
+                remote_modified,
+                needs_rescan,
+                missing_confirmations
+            ) VALUES (?, ?, ?, 0, 0)
+            """,
+            (task_name, dir_rel_path, str(remote_modified or "")),
+        )
     )
 
 
 def _mark_monitor_dir_dirty(cursor: sqlite3.Cursor, task_name: str, dir_rel_path: str) -> None:
-    state = _load_monitor_dir_state(cursor, task_name, dir_rel_path)
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO monitor_dirs(
-            task_name,
-            dir_rel_path,
-            remote_modified,
-            needs_rescan,
-            missing_confirmations
-        ) VALUES (?, ?, ?, 1, ?)
-        """,
-        (
-            task_name,
-            dir_rel_path,
-            state["remote_modified"],
-            state["missing_confirmations"],
-        ),
-    )
+    def write_dirty() -> None:
+        state = _load_monitor_dir_state(cursor, task_name, dir_rel_path)
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO monitor_dirs(
+                task_name,
+                dir_rel_path,
+                remote_modified,
+                needs_rescan,
+                missing_confirmations
+            ) VALUES (?, ?, ?, 1, ?)
+            """,
+            (
+                task_name,
+                dir_rel_path,
+                state["remote_modified"],
+                state["missing_confirmations"],
+            ),
+        )
+
+    retry_sqlite_locked(write_dirty)
 
 
 def _reset_monitor_dir_missing_confirmations(cursor: sqlite3.Cursor, task_name: str, dir_rel_path: str) -> None:
-    cursor.execute(
-        """
-        UPDATE monitor_dirs
-        SET missing_confirmations = 0
-        WHERE task_name = ? AND dir_rel_path = ? AND missing_confirmations <> 0
-        """,
-        (task_name, dir_rel_path),
+    retry_sqlite_locked(
+        lambda: cursor.execute(
+            """
+            UPDATE monitor_dirs
+            SET missing_confirmations = 0
+            WHERE task_name = ? AND dir_rel_path = ? AND missing_confirmations <> 0
+            """,
+            (task_name, dir_rel_path),
+        )
     )
 
 
@@ -200,36 +210,44 @@ def _list_dirty_direct_children(cursor: sqlite3.Cursor, task_name: str, parent_d
 
 def _delete_monitor_dir_subtree(cursor: sqlite3.Cursor, task_name: str, dir_rel_path: str) -> None:
     scope_like = f"{dir_rel_path}/%"
-    cursor.execute(
-        """
-        DELETE FROM monitor_dirs
-        WHERE task_name = ?
-        AND (dir_rel_path = ? OR dir_rel_path LIKE ?)
-        """,
-        (task_name, dir_rel_path, scope_like),
+    retry_sqlite_locked(
+        lambda: cursor.execute(
+            """
+            DELETE FROM monitor_dirs
+            WHERE task_name = ?
+            AND (dir_rel_path = ? OR dir_rel_path LIKE ?)
+            """,
+            (task_name, dir_rel_path, scope_like),
+        )
     )
 
 
 def _bump_missing_monitor_dir(cursor: sqlite3.Cursor, task_name: str, dir_rel_path: str) -> int:
-    state = _load_monitor_dir_state(cursor, task_name, dir_rel_path)
-    next_missing = max(0, int(state["missing_confirmations"] or 0)) + 1
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO monitor_dirs(
-            task_name,
-            dir_rel_path,
-            remote_modified,
-            needs_rescan,
-            missing_confirmations
-        ) VALUES (?, ?, ?, 1, ?)
-        """,
-        (
-            task_name,
-            dir_rel_path,
-            state["remote_modified"],
-            next_missing,
-        ),
-    )
+    next_missing = 0
+
+    def write_missing() -> None:
+        nonlocal next_missing
+        state = _load_monitor_dir_state(cursor, task_name, dir_rel_path)
+        next_missing = max(0, int(state["missing_confirmations"] or 0)) + 1
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO monitor_dirs(
+                task_name,
+                dir_rel_path,
+                remote_modified,
+                needs_rescan,
+                missing_confirmations
+            ) VALUES (?, ?, ?, 1, ?)
+            """,
+            (
+                task_name,
+                dir_rel_path,
+                state["remote_modified"],
+                next_missing,
+            ),
+        )
+
+    retry_sqlite_locked(write_missing)
     return next_missing
 
 
@@ -294,7 +312,8 @@ async def run_monitor_task(
             await sleep_interruptible(run_delay)
         check_monitor_cancelled()
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = open_db()
+        conn.isolation_level = None
         cursor = conn.cursor()
         cursor.execute(
             "CREATE TEMP TABLE current_scan (local_rel_path TEXT PRIMARY KEY, remote_rel_path TEXT, remote_modified TEXT, file_size INTEGER)"
@@ -342,6 +361,8 @@ async def run_monitor_task(
         fallback_guard_parent_path = ""
         active_dir_rel = ""
         active_dir_active = False
+        visited_dir_rels: Set[str] = set()
+        monitor_file_index_replaced = False
 
         await write_monitor_section("扫描生成")
 
@@ -523,6 +544,7 @@ async def run_monitor_task(
                 )
 
             _mark_monitor_dir_success(cursor, task_name, dir_rel, modified)
+            visited_dir_rels.add(dir_rel)
             active_dir_rel = ""
             active_dir_active = False
             if task["list_delay_ms"] > 0:
@@ -565,37 +587,47 @@ async def run_monitor_task(
                         os.path.dirname(target_file), os.path.join(STRM_ROOT, task_root)
                     )
 
-            if start_local_rel == task_root:
-                cursor.execute("DELETE FROM monitor_files WHERE task_name = ?", (task_name,))
-            else:
-                scope_like = f"{start_local_rel}/%"
+        def replace_monitor_file_index() -> None:
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                if cleanup_enabled and stats["failed_dirs"] == 0:
+                    if start_local_rel == task_root:
+                        cursor.execute("DELETE FROM monitor_files WHERE task_name = ?", (task_name,))
+                    else:
+                        scope_like = f"{start_local_rel}/%"
+                        cursor.execute(
+                            """
+                            DELETE FROM monitor_files
+                            WHERE task_name = ? AND (local_rel_path = ? OR local_rel_path LIKE ?)
+                            """,
+                            (task_name, start_local_rel, scope_like),
+                        )
+                else:
+                    cursor.execute(
+                        """
+                        DELETE FROM monitor_files
+                        WHERE task_name = ? AND local_rel_path IN (SELECT local_rel_path FROM current_scan)
+                        """,
+                        (task_name,),
+                    )
                 cursor.execute(
                     """
-                    DELETE FROM monitor_files
-                    WHERE task_name = ? AND (local_rel_path = ? OR local_rel_path LIKE ?)
+                    INSERT OR REPLACE INTO monitor_files(task_name, local_rel_path, remote_rel_path, remote_modified, file_size)
+                    SELECT ?, local_rel_path, remote_rel_path, remote_modified, file_size FROM current_scan
                     """,
-                    (task_name, start_local_rel, scope_like),
+                    (task_name,),
                 )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
-        else:
+        if not (cleanup_enabled and stats["failed_dirs"] == 0):
             if cleanup_enabled and stats["failed_dirs"] > 0:
                 await write_monitor_log("检测到目录读取失败，已自动跳过过期 STRM 清理以防误删", "warn")
-            cursor.execute(
-                """
-                DELETE FROM monitor_files
-                WHERE task_name = ? AND local_rel_path IN (SELECT local_rel_path FROM current_scan)
-                """,
-                (task_name,),
-            )
 
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO monitor_files(task_name, local_rel_path, remote_rel_path, remote_modified, file_size)
-            SELECT ?, local_rel_path, remote_rel_path, remote_modified, file_size FROM current_scan
-            """,
-            (task_name,),
-        )
-        conn.commit()
+        retry_sqlite_locked(replace_monitor_file_index)
+        monitor_file_index_replaced = True
         conn.close()
         conn = None
 
@@ -635,7 +667,10 @@ async def run_monitor_task(
         try:
             if "conn" in locals() and conn is not None and "active_dir_active" in locals() and active_dir_active:
                 _mark_monitor_dir_dirty(conn.cursor(), task_name, active_dir_rel)
-                conn.commit()
+            if "conn" in locals() and conn is not None and not locals().get("monitor_file_index_replaced", False):
+                dirty_cursor = conn.cursor()
+                for visited_dir_rel in locals().get("visited_dir_rels", set()):
+                    _mark_monitor_dir_dirty(dirty_cursor, task_name, visited_dir_rel)
         except Exception:
             pass
         await write_monitor_section("执行结果")
@@ -649,7 +684,10 @@ async def run_monitor_task(
         try:
             if "conn" in locals() and conn is not None and "active_dir_active" in locals() and active_dir_active:
                 _mark_monitor_dir_dirty(conn.cursor(), task_name, active_dir_rel)
-                conn.commit()
+            if "conn" in locals() and conn is not None and not locals().get("monitor_file_index_replaced", False):
+                dirty_cursor = conn.cursor()
+                for visited_dir_rel in locals().get("visited_dir_rels", set()):
+                    _mark_monitor_dir_dirty(dirty_cursor, task_name, visited_dir_rel)
         except Exception:
             pass
         await write_monitor_section("执行结果")

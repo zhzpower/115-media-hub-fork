@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from ..background import submit_background
 from ..core import *  # noqa: F401,F403
+from ..db import retry_sqlite_locked
 from ..services.monitor import queue_monitor_job
 from ..services.resource import run_resource_job
 
@@ -78,12 +79,17 @@ def _extract_magnet_link(payload: Dict[str, Any]) -> str:
 
 
 def _delete_monitor_runtime_records(task_name: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM monitor_files WHERE task_name = ?", (task_name,))
-    cursor.execute("DELETE FROM monitor_dirs WHERE task_name = ?", (task_name,))
-    conn.commit()
-    conn.close()
+    def delete_records() -> None:
+        conn = open_db()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM monitor_files WHERE task_name = ?", (task_name,))
+            cursor.execute("DELETE FROM monitor_dirs WHERE task_name = ?", (task_name,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    retry_sqlite_locked(delete_records)
 
 
 def _resolve_magnet_title(payload: Dict[str, Any], magnet_link: str) -> str:

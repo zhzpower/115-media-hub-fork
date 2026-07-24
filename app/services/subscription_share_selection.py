@@ -953,7 +953,7 @@ async def _build_tv_share_selection_for_missing_episodes(
     scanned_dirs = 0
     scanned_entries = 0
     failed_dirs = 0
-    skipped_archive_files = 0
+    skipped_excluded_file_types = 0
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
     min_file_size_bytes = _subscription_task_min_file_size_bytes(task)
     skipped_small_files = 0
@@ -1035,8 +1035,8 @@ async def _build_tv_share_selection_for_missing_episodes(
                 if is_dir:
                     continue
 
-                if _is_subscription_skipped_archive_file(rel_name or entry_name):
-                    skipped_archive_files += 1
+                if _is_subscription_excluded_file_type(task, rel_name or entry_name):
+                    skipped_excluded_file_types += 1
                     continue
                 entry_size = max(0, int(entry.get("size", 0) or 0))
                 if min_file_size_bytes > 0 and entry_size < min_file_size_bytes:
@@ -1102,7 +1102,9 @@ async def _build_tv_share_selection_for_missing_episodes(
         "share_scope_cid": start_cid,
         "share_scope_path": start_parent_path,
         "min_file_size_mb": min_file_size_mb,
-        "skipped_archive_files": skipped_archive_files,
+        "exclude_file_extensions": resolve_subscription_exclude_file_extensions(task),
+        "skipped_excluded_file_types": skipped_excluded_file_types,
+        "skipped_archive_files": skipped_excluded_file_types,
         "skipped_small_files": skipped_small_files,
     }
 
@@ -1221,7 +1223,7 @@ async def _scan_subscription_share_tree_snapshot(
     scanned_entries = 0
     failed_dirs = 0
     share_root_title = ""
-    skipped_archive_files = 0
+    skipped_excluded_file_types = 0
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
     min_file_size_bytes = _subscription_task_min_file_size_bytes(task)
     skipped_small_files = 0
@@ -1330,8 +1332,8 @@ async def _scan_subscription_share_tree_snapshot(
 
                 if not entry_id or entry_id in seen_file_ids:
                     continue
-                if _is_subscription_skipped_archive_file(rel_name or entry_name):
-                    skipped_archive_files += 1
+                if _is_subscription_excluded_file_type(task, rel_name or entry_name):
+                    skipped_excluded_file_types += 1
                     continue
                 entry_size = max(0, int(entry.get("size", 0) or 0))
                 if min_file_size_bytes > 0 and entry_size < min_file_size_bytes:
@@ -1407,7 +1409,9 @@ async def _scan_subscription_share_tree_snapshot(
         **truncation_stats,
         "force_refresh": bool(force_refresh),
         "min_file_size_mb": min_file_size_mb,
-        "skipped_archive_files": skipped_archive_files,
+        "exclude_file_extensions": resolve_subscription_exclude_file_extensions(task),
+        "skipped_excluded_file_types": skipped_excluded_file_types,
+        "skipped_archive_files": skipped_excluded_file_types,
         "skipped_small_files": skipped_small_files,
     }
 
@@ -1569,6 +1573,7 @@ def _build_subscription_share_selection_from_snapshot(
 def _build_subscription_share_manifest_from_snapshot(
     snapshot: Dict[str, Any],
     selection: Dict[str, Any],
+    task: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = snapshot if isinstance(snapshot, dict) else {}
     normalized_selection = normalize_share_selection_meta(selection or {})
@@ -1589,6 +1594,7 @@ def _build_subscription_share_manifest_from_snapshot(
     file_entries = payload.get("files", []) if isinstance(payload.get("files"), list) else []
     scoped_files: List[Dict[str, Any]] = []
     covered_episodes: Set[int] = set()
+    skipped_excluded_file_types = 0
     for raw_entry in file_entries:
         if not isinstance(raw_entry, dict):
             continue
@@ -1596,6 +1602,9 @@ def _build_subscription_share_manifest_from_snapshot(
         if not entry_name:
             continue
         if scope_path and entry_name.lower() != scope_path.lower() and not entry_name.lower().startswith(f"{scope_path.lower()}/"):
+            continue
+        if _is_subscription_excluded_file_type(task or {}, entry_name):
+            skipped_excluded_file_types += 1
             continue
         scoped_files.append(raw_entry)
         entry_episodes = raw_entry.get("episodes", []) if isinstance(raw_entry.get("episodes"), list) else []
@@ -1625,7 +1634,15 @@ def _build_subscription_share_manifest_from_snapshot(
         "provider_truncated_dirs": int(payload.get("provider_truncated_dirs", 0) or 0),
         "force_refresh": bool(payload.get("force_refresh", False)),
         "min_file_size_mb": normalize_subscription_min_file_size_mb(payload.get("min_file_size_mb", 0)),
-        "skipped_archive_files": int(payload.get("skipped_archive_files", 0) or 0),
+        "exclude_file_extensions": resolve_subscription_exclude_file_extensions(task or {}),
+        "skipped_excluded_file_types": (
+            int(payload.get("skipped_excluded_file_types", payload.get("skipped_archive_files", 0)) or 0)
+            + skipped_excluded_file_types
+        ),
+        "skipped_archive_files": (
+            int(payload.get("skipped_excluded_file_types", payload.get("skipped_archive_files", 0)) or 0)
+            + skipped_excluded_file_types
+        ),
         "skipped_small_files": int(payload.get("skipped_small_files", 0) or 0),
     }
 
@@ -1679,7 +1696,7 @@ async def _scan_subscription_share_episode_manifest(
     failed_dirs = 0
     share_root_title = normalize_relative_path(str(normalized_selection.get("share_root_title", "") or "").strip())
     concurrency = get_subscription_share_scan_concurrency(task)
-    skipped_archive_files = 0
+    skipped_excluded_file_types = 0
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
     min_file_size_bytes = _subscription_task_min_file_size_bytes(task)
     skipped_small_files = 0
@@ -1755,8 +1772,8 @@ async def _scan_subscription_share_episode_manifest(
                         queue.append((child_cid, depth + 1, full_name or rel_name))
                     continue
 
-                if _is_subscription_skipped_archive_file(rel_name or entry_name):
-                    skipped_archive_files += 1
+                if _is_subscription_excluded_file_type(task, rel_name or entry_name):
+                    skipped_excluded_file_types += 1
                     continue
                 entry_size = max(0, int(entry.get("size", 0) or 0))
                 if min_file_size_bytes > 0 and entry_size < min_file_size_bytes:
@@ -1817,7 +1834,9 @@ async def _scan_subscription_share_episode_manifest(
         **truncation_stats,
         "force_refresh": bool(force_refresh),
         "min_file_size_mb": min_file_size_mb,
-        "skipped_archive_files": skipped_archive_files,
+        "exclude_file_extensions": resolve_subscription_exclude_file_extensions(task),
+        "skipped_excluded_file_types": skipped_excluded_file_types,
+        "skipped_archive_files": skipped_excluded_file_types,
         "skipped_small_files": skipped_small_files,
     }
 
@@ -1847,9 +1866,17 @@ def _build_tv_share_selection_from_manifest(
     )
     min_file_size_bytes = _subscription_task_min_file_size_bytes({"min_file_size_mb": min_file_size_mb})
     skipped_small_files = max(0, int(payload.get("skipped_small_files", 0) or 0))
+    skipped_excluded_file_types = max(
+        0,
+        int(payload.get("skipped_excluded_file_types", payload.get("skipped_archive_files", 0)) or 0),
+    )
     file_entries: List[Dict[str, Any]] = []
     for raw_entry in raw_file_entries:
         if not isinstance(raw_entry, dict):
+            continue
+        entry_name = normalize_relative_path(str(raw_entry.get("name", "") or "").strip())
+        if _is_subscription_excluded_file_type(task or {}, entry_name):
+            skipped_excluded_file_types += 1
             continue
         entry_size = max(0, int(raw_entry.get("size", 0) or 0))
         if min_file_size_bytes > 0 and entry_size < min_file_size_bytes:
@@ -1888,7 +1915,9 @@ def _build_tv_share_selection_from_manifest(
         "truncated_reason": str(payload.get("truncated_reason", "") or "").strip(),
         "provider_truncated_dirs": max(0, int(payload.get("provider_truncated_dirs", 0) or 0)),
         "min_file_size_mb": min_file_size_mb,
-        "skipped_archive_files": max(0, int(payload.get("skipped_archive_files", 0) or 0)),
+        "exclude_file_extensions": resolve_subscription_exclude_file_extensions(task or {}),
+        "skipped_excluded_file_types": skipped_excluded_file_types,
+        "skipped_archive_files": skipped_excluded_file_types,
         "skipped_small_files": skipped_small_files,
         "share_scope_cid": str(payload.get("share_scope_cid", "") or "").strip(),
         "share_scope_path": normalize_relative_path(str(payload.get("share_scope_path", "") or "").strip()),
