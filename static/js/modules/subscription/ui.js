@@ -195,6 +195,7 @@
             const latestMatched = String(task?.matched_resource_title || '').trim();
             const latestText = latestMatched ? `最近命中：${latestMatched}` : '最近尚未命中资源';
             const modeText = isTv ? (multiSeasonMode ? '多季合一追更' : '单季追更') : '命中资源后即执行';
+            const startEpisodeText = isTv && task?.start_episode && task?.start_episode > 1 ? `，从第${task.start_episode}集开始订阅` : '';
             const fixedShareText = fixedShareLink
                 ? (fixedLinkChannelSearch ? '，固定分享链接兜底' : '，固定分享链接已填写（未启用兜底）')
                 : '';
@@ -207,7 +208,7 @@
             const minFileSizeMb = normalizeSubscriptionMinFileSizeMb(task?.min_file_size_mb ?? 0);
             const sizeFilterText = minFileSizeMb > 0 ? `，小于 ${formatSubscriptionMinFileSizeMb(minFileSizeMb)}MB 不导入` : '';
             const strictMatchText = task?.strict_title_match ? '，精准匹配：简介命中不算同剧证据' : '';
-            return `状态：${statusText}（${enabledText}）。${providerText} · ${mediaText}《${titleText}》保存到 ${savepath}${fixedShareText}${shareScopeText}${providerRuleText}${excludeText}${excludeFileText}${sizeFilterText}${strictMatchText}，${modeText}，${episodeText}；${scheduleText}；${latestText}。`;
+            return `状态：${statusText}（${enabledText}）。${providerText} · ${mediaText}《${titleText}》保存到 ${savepath}${fixedShareText}${shareScopeText}${providerRuleText}${excludeText}${excludeFileText}${sizeFilterText}${strictMatchText}，${modeText}${startEpisodeText}，${episodeText}；${scheduleText}；${latestText}。`;
         }
 
         function buildSubscriptionTaskProgressBar({ progress = 0, detail = '' } = {}) {
@@ -988,6 +989,8 @@
             document.getElementById('subscription_year').value = normalizeTmdbYear(payload.year || '');
             document.getElementById('subscription_season').value = Math.max(1, parseInt(payload.season || '1', 10) || 1);
             document.getElementById('subscription_total_episodes').value = Math.max(0, parseInt(payload.total_episodes || '0', 10) || 0);
+            const startEpisodeInput = document.getElementById('subscription_start_episode');
+            if (startEpisodeInput) startEpisodeInput.value = Math.max(1, parseInt(payload.start_episode || '1', 10) || 1);
             document.getElementById('subscription_anime_mode').checked = mediaType === 'tv'
                 ? !!(payload.multi_season_mode ?? payload.anime_mode)
                 : false;
@@ -1435,6 +1438,7 @@
                 year: document.getElementById('subscription_year').value.trim(),
                 season: parseInt(document.getElementById('subscription_season').value || '1', 10) || 1,
                 total_episodes: parseInt(document.getElementById('subscription_total_episodes').value || '0', 10) || 0,
+                start_episode: parseInt(document.getElementById('subscription_start_episode')?.value || '1', 10) || 1,
                 anime_mode: multiSeasonMode,
                 multi_season_mode: multiSeasonMode,
                 savepath: normalizeRelativePathInput(document.getElementById('subscription_savepath').value.trim()),
@@ -1488,6 +1492,8 @@
             document.getElementById('subscription_year').value = '';
             document.getElementById('subscription_season').value = 1;
             document.getElementById('subscription_total_episodes').value = 0;
+            const startEpisodeResetInput = document.getElementById('subscription_start_episode');
+            if (startEpisodeResetInput) startEpisodeResetInput.value = 1;
             document.getElementById('subscription_anime_mode').checked = false;
             setSubscriptionSavepath('0', '');
             const shareLinkInput = document.getElementById('subscription_share_link_url');
@@ -1699,6 +1705,8 @@
             document.getElementById('subscription_year').value = task.year || '';
             document.getElementById('subscription_season').value = task.season || 1;
             document.getElementById('subscription_total_episodes').value = task.total_episodes || 0;
+            const editStartEpisodeInput = document.getElementById('subscription_start_episode');
+            if (editStartEpisodeInput) editStartEpisodeInput.value = task.start_episode || 1;
             document.getElementById('subscription_anime_mode').checked = resolveTaskMultiSeasonMode(task);
             subscriptionFolderTrail = [{ id: '0', name: '根目录' }];
             setSubscriptionSavepath('0', task.savepath || '');
