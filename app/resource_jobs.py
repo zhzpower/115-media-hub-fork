@@ -29,7 +29,7 @@ def _build_resource_job_filter_where(status_filter: str) -> Tuple[str, Tuple[Any
 
 
 def list_resource_jobs_page(limit: int = 20, offset: int = 0, status_filter: str = "") -> Dict[str, Any]:
-    page_limit = max(1, min(int(limit or 20), 200))
+    page_limit = max(1, min(int(limit or 20), RESOURCE_JOB_PAGE_MAX_LIMIT))
     page_offset = max(0, int(offset or 0))
     normalized_filter = normalize_resource_job_status_filter(status_filter)
     where_sql, where_params = _build_resource_job_filter_where(normalized_filter)
@@ -172,6 +172,81 @@ def normalize_resource_job_clear_scope(scope: Any) -> str:
         return "terminal"
     return "completed"
 
+
+def _reset_resource_items_without_jobs(cursor: Any, resource_ids: List[int]) -> int:
+    reset_item_count = 0
+    now = now_text()
+    for resource_id in resource_ids:
+        cursor.execute("SELECT COUNT(1) FROM resource_jobs WHERE resource_id = ?", (resource_id,))
+        remain_row = cursor.fetchone()
+        remains = int(remain_row[0] if remain_row else 0)
+        if remains > 0:
+            continue
+        cursor.execute(
+            "UPDATE resource_items SET status = 'new', last_seen_at = ? WHERE id = ?",
+            (now, resource_id),
+        )
+        reset_item_count += int(cursor.rowcount or 0)
+    return reset_item_count
+
+
+def _reset_resource_jobs_sequence_if_empty(cursor: Any) -> None:
+    cursor.execute("SELECT COUNT(1) FROM resource_jobs")
+    remaining_jobs_row = cursor.fetchone()
+    remaining_jobs = int(remaining_jobs_row[0] if remaining_jobs_row else 0)
+    if remaining_jobs == 0:
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'resource_jobs'")
+
+
+def delete_resource_job(job_id: int) -> Dict[str, int]:
+    try:
+        normalized_job_id = int(job_id or 0)
+    except (TypeError, ValueError):
+        normalized_job_id = 0
+    if normalized_job_id <= 0:
+        raise ValueError("任务 ID 无效")
+
+    ensure_db()
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT resource_id, status FROM resource_jobs WHERE id = ?",
+            (normalized_job_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise LookupError("任务不存在")
+
+        resource_id = max(0, int(row[0] or 0))
+        status = str(row[1] or "").strip().lower()
+        if status not in ("completed", "failed"):
+            raise RuntimeError("仅支持删除已完成或失败的导入任务")
+
+        cursor.execute(
+            "DELETE FROM resource_jobs WHERE id = ? AND status IN ('completed', 'failed')",
+            (normalized_job_id,),
+        )
+        deleted_count = int(cursor.rowcount or 0)
+        if deleted_count != 1:
+            raise RuntimeError("任务状态已变化，请刷新后重试")
+
+        reset_item_count = _reset_resource_items_without_jobs(
+            cursor,
+            [resource_id] if resource_id > 0 else [],
+        )
+        _reset_resource_jobs_sequence_if_empty(cursor)
+        conn.commit()
+
+    invalidate_resource_state_snapshot("resource-job-delete")
+    touch_resource_jobs_state_signal("resource-job-delete")
+    return {
+        "job_id": normalized_job_id,
+        "deleted": deleted_count,
+        "reset_items": reset_item_count,
+    }
+
+
 def clear_resource_jobs(scope: str = "completed") -> Dict[str, int]:
     normalized_scope = normalize_resource_job_clear_scope(scope)
     if normalized_scope == "failed":
@@ -197,26 +272,8 @@ def clear_resource_jobs(scope: str = "completed") -> Dict[str, int]:
         )
         deleted_count = int(cursor.rowcount or 0)
 
-        reset_item_count = 0
-        now = now_text()
-        for resource_id in affected_resource_ids:
-            cursor.execute("SELECT COUNT(1) FROM resource_jobs WHERE resource_id = ?", (resource_id,))
-            remain_row = cursor.fetchone()
-            remains = int(remain_row[0] if remain_row else 0)
-            if remains == 0:
-                cursor.execute(
-                    "UPDATE resource_items SET status = 'new', last_seen_at = ? WHERE id = ?",
-                    (now, resource_id),
-                )
-                reset_item_count += int(cursor.rowcount or 0)
-
-        # If the task table has been fully cleared, reset the AUTOINCREMENT counter
-        # so the next created task starts from 1 again.
-        cursor.execute("SELECT COUNT(1) FROM resource_jobs")
-        remaining_jobs_row = cursor.fetchone()
-        remaining_jobs = int(remaining_jobs_row[0] if remaining_jobs_row else 0)
-        if remaining_jobs == 0:
-            cursor.execute("DELETE FROM sqlite_sequence WHERE name = 'resource_jobs'")
+        reset_item_count = _reset_resource_items_without_jobs(cursor, affected_resource_ids)
+        _reset_resource_jobs_sequence_if_empty(cursor)
 
         conn.commit()
     if deleted_count > 0 or reset_item_count > 0:
@@ -439,96 +496,123 @@ def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[st
         touch_resource_jobs_state_signal("resource-jobs-recover-submitted")
     return {"recovered": recovered, "checked": checked}
 
-def create_resource_job(resource: Dict[str, Any], data: Dict[str, Any]) -> int:
+def _build_resource_job_insert(resource: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
+    now = now_text()
+    link_type = resolve_resource_link_type(resource.get("link_type", "unknown"), resource.get("link_url", ""))
+    try:
+        from .providers.registry import get_by_link_type as _registry_get_by_link_type
+
+        share_provider = _registry_get_by_link_type(link_type)
+    except Exception:
+        share_provider = None
+    is_share_receive_link = bool(share_provider and share_provider.supports_share_receive)
+    folder_id = str(data.get("folder_id", "")).strip()
+    savepath = normalize_relative_path(data.get("savepath", ""))
+    extra = normalize_share_selection_meta(data.get("share_selection", {})) if is_share_receive_link else {}
+    custom_extra = data.get("extra", {})
+    if isinstance(custom_extra, dict):
+        extra = merge_json_object(extra, custom_extra)
+    job_source = str(data.get("job_source", "") or "").strip()
+    if job_source:
+        extra["job_source"] = job_source
+    elif not str(extra.get("job_source", "") or "").strip():
+        # 默认归类为手动导入。自动化来源（订阅、Webhook 等）应在调用侧显式覆盖。
+        extra["job_source"] = "manual_import"
+    manual_receive_code = normalize_receive_code(data.get("receive_code", ""))
+    if is_share_receive_link and manual_receive_code:
+        extra["receive_code"] = manual_receive_code
+    extra["snapshot"] = build_resource_job_snapshot(resource, link_type, manual_receive_code)
+    manual_sharetitle = normalize_relative_path(data.get("sharetitle", ""))
+    if manual_sharetitle:
+        sharetitle = manual_sharetitle
+    elif is_share_receive_link:
+        sharetitle = normalize_relative_path(extra.get("auto_sharetitle", ""))
+    elif link_type in ("magnet", "ed2k"):
+        # 离线任务的目标目录已经体现在 savepath 中，不再追加文件名。
+        sharetitle = ""
+    else:
+        sharetitle = normalize_relative_path(resource.get("title", ""))
+    monitor_task_name = str(data.get("monitor_task_name", "")).strip()
+    refresh_delay_seconds = max(0, int(data.get("refresh_delay_seconds", 0) or 0))
+    auto_refresh = bool(data.get("auto_refresh", True))
+    provider_label = (
+        str(getattr(share_provider, "label", "") or share_provider.name).strip()
+        if is_share_receive_link
+        else str(
+            extra.get("offline_provider_label", "")
+            or extra.get("magnet_provider_label", "")
+            or "115"
+        ).strip()
+    )
+    resource_id = int(resource.get("id", 0) or 0)
+    status_detail = f"等待提交到 {provider_label}"
+    return {
+        "resource_id": resource_id,
+        "now": now,
+        "status_detail": status_detail,
+        "params": (
+            resource_id,
+            str(resource.get("title", "")).strip(),
+            str(resource.get("link_url", "")).strip(),
+            link_type,
+            folder_id,
+            savepath,
+            sharetitle,
+            monitor_task_name,
+            refresh_delay_seconds,
+            1 if auto_refresh else 0,
+            status_detail,
+            now,
+            now,
+            safe_json_dumps(extra),
+        ),
+    }
+
+
+def create_resource_jobs(entries: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> List[int]:
+    prepared = [_build_resource_job_insert(resource, data) for resource, data in (entries or [])]
+    if not prepared:
+        return []
     ensure_db()
+    created: List[Dict[str, Any]] = []
     with db_connection() as conn:
         cursor = conn.cursor()
-        now = now_text()
-        link_type = resolve_resource_link_type(resource.get("link_type", "unknown"), resource.get("link_url", ""))
-        try:
-            from .providers.registry import get_by_link_type as _registry_get_by_link_type
-
-            share_provider = _registry_get_by_link_type(link_type)
-        except Exception:
-            share_provider = None
-        is_share_receive_link = bool(share_provider and share_provider.supports_share_receive)
-        folder_id = str(data.get("folder_id", "")).strip()
-        savepath = normalize_relative_path(data.get("savepath", ""))
-        extra = normalize_share_selection_meta(data.get("share_selection", {})) if is_share_receive_link else {}
-        custom_extra = data.get("extra", {})
-        if isinstance(custom_extra, dict):
-            extra = merge_json_object(extra, custom_extra)
-        job_source = str(data.get("job_source", "") or "").strip()
-        if job_source:
-            extra["job_source"] = job_source
-        elif not str(extra.get("job_source", "") or "").strip():
-            # 默认归类为手动导入。自动化来源（订阅、Webhook 等）应在调用侧显式覆盖。
-            extra["job_source"] = "manual_import"
-        manual_receive_code = normalize_receive_code(data.get("receive_code", ""))
-        if is_share_receive_link and manual_receive_code:
-            extra["receive_code"] = manual_receive_code
-        extra["snapshot"] = build_resource_job_snapshot(resource, link_type, manual_receive_code)
-        manual_sharetitle = normalize_relative_path(data.get("sharetitle", ""))
-        if manual_sharetitle:
-            sharetitle = manual_sharetitle
-        elif is_share_receive_link:
-            sharetitle = normalize_relative_path(extra.get("auto_sharetitle", ""))
-        elif link_type == "magnet":
-            # 磁力任务默认不绑定子目录提示，避免把原始链接文本误当目录。
-            sharetitle = ""
-        else:
-            sharetitle = normalize_relative_path(resource.get("title", ""))
-        monitor_task_name = str(data.get("monitor_task_name", "")).strip()
-        refresh_delay_seconds = max(0, int(data.get("refresh_delay_seconds", 0) or 0))
-        auto_refresh = bool(data.get("auto_refresh", True))
-        provider_label = (
-            str(getattr(share_provider, "label", "") or share_provider.name).strip()
-            if is_share_receive_link
-            else str(extra.get("magnet_provider_label", "") or "115").strip()
-        )
-        cursor.execute(
-            """
-            INSERT INTO resource_jobs(
-                resource_id, title, link_url, link_type, folder_id, savepath, sharetitle,
-                monitor_task_name, refresh_delay_seconds, auto_refresh, status, status_detail,
-                created_at, updated_at, extra_json
+        for record in prepared:
+            cursor.execute(
+                """
+                INSERT INTO resource_jobs(
+                    resource_id, title, link_url, link_type, folder_id, savepath, sharetitle,
+                    monitor_task_name, refresh_delay_seconds, auto_refresh, status, status_detail,
+                    created_at, updated_at, extra_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                """,
+                record["params"],
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-            """,
-            (
-                int(resource.get("id", 0) or 0),
-                str(resource.get("title", "")).strip(),
-                str(resource.get("link_url", "")).strip(),
-                link_type,
-                folder_id,
-                savepath,
-                sharetitle,
-                monitor_task_name,
-                refresh_delay_seconds,
-                1 if auto_refresh else 0,
-                f"等待提交到 {provider_label}",
-                now,
-                now,
-                safe_json_dumps(extra),
-            ),
-        )
-        job_id = int(cursor.lastrowid)
-        resource_id = int(resource.get("id", 0) or 0)
-        if resource_id > 0:
-            update_resource_item_status(conn, resource_id, "queued")
+            job_id = int(cursor.lastrowid)
+            resource_id = int(record["resource_id"])
+            if resource_id > 0:
+                update_resource_item_status(conn, resource_id, "queued")
+            created.append({**record, "id": job_id})
         conn.commit()
     invalidate_resource_state_snapshot("resource-job-create")
-    touch_resource_jobs_state_signal(
-        "resource-job-create",
-        {
-            "id": job_id,
-            "resource_id": resource_id,
-            "status": "pending",
-            "status_detail": f"等待提交到 {provider_label}",
-            "updated_at": now,
-        },
-    )
-    return job_id
+    for record in created:
+        touch_resource_jobs_state_signal(
+            "resource-job-create",
+            {
+                "id": record["id"],
+                "resource_id": record["resource_id"],
+                "status": "pending",
+                "status_detail": record["status_detail"],
+                "updated_at": record["now"],
+            },
+        )
+    return [int(record["id"]) for record in created]
+
+
+def create_resource_job(resource: Dict[str, Any], data: Dict[str, Any]) -> int:
+    return create_resource_jobs([(resource, data)])[0]
+
 
 def update_resource_job(job_id: int, **fields: Any) -> None:
     if not fields:

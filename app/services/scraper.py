@@ -8,7 +8,7 @@ from ..db import db_connection
 from ..providers.pan115 import invalidate_115_entries_cache
 from ..providers.registry import get_or_none as get_provider_or_none, list_enabled as list_enabled_providers
 from ..media_tags import media_tag_labels, remove_media_tags
-from ..services.subscription_episode import _extract_task_episodes_from_file_entry
+from ..services.subscription_episode import _extract_subscription_season_from_name, _extract_task_episodes_from_file_entry
 
 
 SCRAPER_JOB_LIMIT_DEFAULT = 20
@@ -799,6 +799,48 @@ def _resolve_scraper_tv_episode_info(task: Dict[str, Any], episodes: Set[int], d
     return {"season": season_no, "episodes": episode_values}, ""
 
 
+def _normalize_scraper_manual_episode(value: Any) -> int:
+    try:
+        episode = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return episode if episode > 0 else 0
+
+
+def _normalize_scraper_manual_episode_overrides(raw_overrides: Any) -> Dict[str, int]:
+    if not isinstance(raw_overrides, dict):
+        return {}
+    episode_values: Dict[str, int] = {}
+    for raw_entry_id, raw_episode in raw_overrides.items():
+        entry_id = str(raw_entry_id or "").strip()
+        episode = _normalize_scraper_manual_episode(raw_episode)
+        if not entry_id or episode <= 0:
+            continue
+        episode_values[entry_id] = episode
+    return episode_values
+
+
+def _resolve_scraper_manual_episode_info(
+    task: Dict[str, Any],
+    entry: Dict[str, Any],
+    episode: int,
+    default_season: int,
+) -> Tuple[Dict[str, Any], str]:
+    item = entry if isinstance(entry, dict) else {}
+    parent_path = normalize_relative_path(str(item.get("parent_path", "") or ""))
+    source_path = normalize_relative_path(str(item.get("path", "") or item.get("name", "")))
+    source_season = _extract_subscription_season_from_name(parent_path) or _extract_subscription_season_from_name(source_path)
+    normalized_episode = _normalize_scraper_manual_episode(episode)
+    if normalized_episode <= 0:
+        return {}, "手动集数无效"
+    if is_subscription_multi_season_mode(task) and source_season > 0:
+        absolute_episode = convert_subscription_episode_to_absolute(task, source_season, normalized_episode)
+        if absolute_episode <= 0:
+            return {}, "手动集数无法映射到 TMDB 季集"
+        return _resolve_scraper_tv_episode_info(task, {absolute_episode}, default_season)
+    return _resolve_scraper_tv_episode_info(task, {normalized_episode}, source_season or default_season)
+
+
 def _scraper_episode_width_from_value(value: int) -> int:
     return max(2, len(str(max(0, int(value or 0)))))
 
@@ -1141,8 +1183,21 @@ def build_scraper_rename_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     default_season = max(1, parse_int(plan_options.get("season") or task.get("season") or 1, 1)) if media_type == "tv" else 1
     file_episode_infos: List[Dict[str, Any]] = []
     episode_widths_by_season: Dict[int, int] = {}
+    manual_episode_values: Dict[str, int] = {}
     if media_type == "tv":
+        manual_episode_values = _normalize_scraper_manual_episode_overrides(payload.get("episode_overrides"))
         for entry in expanded_files:
+            entry_id = str(entry.get("id", "") or "").strip()
+            manual_episode = manual_episode_values.get(entry_id, 0)
+            if manual_episode > 0:
+                manual_episode_info, _ = _resolve_scraper_manual_episode_info(
+                    task,
+                    entry,
+                    manual_episode,
+                    default_season,
+                )
+                file_episode_infos.append(manual_episode_info)
+                continue
             episodes = _extract_task_episodes_from_file_entry(
                 task,
                 str(entry.get("path") or entry.get("name") or ""),
@@ -1162,6 +1217,7 @@ def build_scraper_rename_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     preview_entries_cache: Dict[Tuple[str, bool], Dict[str, Any]] = {}
     preview_folder_path_cache: Dict[Tuple[str, str], Tuple[str, bool]] = {}
     action_index = 1
+    unchanged_count = 0
     if folder_mode and bool(plan_options.get("rename_selected_folders", True)):
         _, _, target_folder_name = _build_scraper_media_titles(tmdb, plan_options, "")
         for raw in selected:
@@ -1176,6 +1232,8 @@ def build_scraper_rename_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
             old_path = normalize_relative_path(str(entry.get("path", "") or old_name))
             new_name = target_folder_name
             if not new_name or new_name == old_name:
+                if new_name and new_name == old_name:
+                    unchanged_count += 1
                 continue
             action_issue = ""
             if new_name in target_folder_names:
@@ -1226,6 +1284,9 @@ def build_scraper_rename_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         old_parent_id = str(entry.get("parent_id", "") or base_cid).strip() or "0"
         old_path = normalize_relative_path(str(entry.get("path", "") or entry.get("name", "")))
         action_issue = issue
+        if target_path and target_path == old_path:
+            unchanged_count += 1
+            continue
         target_parent_path = normalize_relative_path(os.path.dirname(target_path).replace("\\", "/")) if target_path else ""
         new_name = os.path.basename(target_path) if target_path else ""
         existing_parent_id = ""
@@ -1265,6 +1326,11 @@ def build_scraper_rename_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
             "warning": "",
             "ready": bool(target_path and not action_issue),
         }
+        manual_episode = manual_episode_values.get(str(entry.get("id", "") or "").strip(), 0)
+        if media_type == "tv" and (manual_episode > 0 or action_issue == "无法识别集数"):
+            action["manual_episode_allowed"] = True
+        if manual_episode > 0:
+            action["manual_episode"] = manual_episode
         action_warning = _collect_scraper_action_warning(provider, action)
         if action_warning:
             action["warning"] = action_warning
@@ -1284,6 +1350,7 @@ def build_scraper_rename_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         "ready": bool(actions) and ready_count == len(actions) and not issues,
         "ready_count": ready_count,
         "total_count": len(actions),
+        "unchanged_count": unchanged_count,
         "tmdb": tmdb,
         "options": plan_options,
     }
@@ -1592,13 +1659,13 @@ def _execute_move_rename(
         target_name = str(action.get("new_name", "") or "")
     if not target_name:
         raise RuntimeError("目标文件名为空")
-    if _target_name_exists(provider, cookie, target_parent, target_name, same_entry_id=entry_id):
-        raise RuntimeError("目标目录中已有同名文件")
     need_move = source_parent != target_parent
     need_rename = source_name != target_name
     responses: List[Dict[str, Any]] = []
     if not need_move and not need_rename:
         return {"skipped": True, "detail": "文件名和目录未变化"}
+    if _target_name_exists(provider, cookie, target_parent, target_name, same_entry_id=entry_id):
+        raise RuntimeError("目标目录中已有同名文件")
     if need_move and need_rename:
         temp_name = _build_temp_name(int(action.get("id", 0) or 0), entry_id, source_name)
         responses.append(_rename_provider_entry(provider, cookie, entry_id, temp_name, source_parent))

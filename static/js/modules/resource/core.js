@@ -244,6 +244,7 @@
         function getResourceProviderForLinkType(linkType) {
             const normalized = String(linkType || '').trim().toLowerCase();
             if (normalized === 'magnet') return getResourceSelectedMagnetProvider();
+            if (normalized === 'ed2k' || normalized === 'link') return '115';
             return getResourceProviderByLinkType(normalized);
         }
 
@@ -272,6 +273,27 @@
                 unknown: '待识别'
             };
             return map[normalized] || normalized || '待识别';
+        }
+
+        function getResourceDisplayLinkType(item) {
+            return window.ResourceLinkTags.resolveDisplayType(item);
+        }
+
+        function getResourceDisplayLinkTypeLabel(linkType) {
+            return window.ResourceLinkTags.getTagMeta(linkType).label;
+        }
+
+        function getResourceDisplayLinkTypeBadgeClass(linkType) {
+            const tone = window.ResourceLinkTags.getTagMeta(linkType).tone;
+            return `resource-link-tag resource-link-tag--${tone}`;
+        }
+
+        function getResourceImportMode(item) {
+            return window.ResourceLinkTags.getTagMeta(getResourceDisplayLinkType(item)).importMode;
+        }
+
+        function buildResourceDisplayProfile(items, fallbackProfile = {}) {
+            return window.ResourceLinkTags.summarize(items, fallbackProfile);
         }
 
         function getResourceProviderByLinkType(linkType) {
@@ -405,7 +427,7 @@
 
         function getResourceProviderFilterLabel(value = resourceProviderFilter) {
             const normalized = normalizeResourceProviderFilter(value);
-            if (normalized === 'magnet') return '磁力';
+            if (normalized === 'magnet') return '离线';
             const p = getProviderByName(normalized);
             if (p) return p.label;
             return '全部';
@@ -415,7 +437,7 @@
             const normalized = normalizeResourceProviderFilter(providerFilter);
             if (normalized === 'all') return true;
             const linkType = getEffectiveResourceLinkType(item);
-            if (normalized === 'magnet') return linkType === 'magnet';
+            if (normalized === 'magnet') return linkType === 'magnet' || linkType === 'ed2k';
             const p = getProviderByName(normalized);
             if (p) return linkType === p.link_type;
             return false;
@@ -629,33 +651,11 @@
         }
 
         function detectResourceLinkTypeByUrl(url) {
-            const raw = String(url || '').trim();
-            const lowered = raw.toLowerCase();
-            if (!lowered) return 'unknown';
-            if (lowered.startsWith('magnet:?')) return 'magnet';
-            if (lowered.startsWith('ed2k://')) return 'ed2k';
-            if (/(?:https?:\/\/)?(?:115cdn|115|anxia)\.com\/s\/[a-z0-9]+/i.test(raw)) return '115share';
-            if (/https?:\/\/(?:pan|www)\.quark\.cn\/s\/[a-z0-9]+/i.test(raw)) return 'quark';
-            if (/https?:\/\/(?:www\.)?(?:aliyundrive|alipan)\.com\/s\/[a-z0-9]+/i.test(raw)) return 'aliyun';
-            if (/https?:\/\/(?:pan|yun)\.baidu\.com\/(?:s\/|share\/)/i.test(raw)) return 'baidu';
-            if (/https?:\/\/(?:pan|xlpan)\.xunlei\.com\/s\/[a-z0-9]+/i.test(raw)) return 'xunlei';
-            if (/https?:\/\/drive\.uc\.cn\/s\/[a-z0-9]+/i.test(raw)) return 'uc';
-            if (/https?:\/\/(?:www\.)?(?:123pan|123684|123865|123912)\.(?:com|cn)\/s\/[a-z0-9_-]+(?:\.html?)?/i.test(raw)) return '123pan';
-            if (/https?:\/\/cloud\.189\.cn\/(?:t\/|web\/share)/i.test(raw)) return 'tianyi';
-            if (/https?:\/\/(?:www\.)?(?:mypikpak|pikpak)\.com\/s\/[a-z0-9]+/i.test(raw)) return 'pikpak';
-            if (/https?:\/\/(?:www\.)?lanzou[a-z0-9]*\.[a-z.]+\/[a-z0-9]+/i.test(raw)) return 'lanzou';
-            if (/https?:\/\/drive\.google\.com\//i.test(raw)) return 'google_drive';
-            if (/https?:\/\/(?:1drv\.ms|onedrive\.live\.com)\//i.test(raw)) return 'onedrive';
-            if (/https?:\/\/mega\.nz\//i.test(raw)) return 'mega';
-            if (lowered.startsWith('http://') || lowered.startsWith('https://')) return 'link';
-            return 'unknown';
+            return window.ResourceLinkTags.resolveActionType({ link_url: url });
         }
 
         function getEffectiveResourceLinkType(item) {
-            const rawType = String(item?.link_type || '').trim().toLowerCase();
-            const detected = detectResourceLinkTypeByUrl(item?.link_url || '');
-            if (detected !== 'unknown') return detected;
-            return rawType || 'unknown';
+            return window.ResourceLinkTags.resolveActionType(item);
         }
 
         function getResourceRefreshTargetLabel(targetType) {
@@ -1170,7 +1170,13 @@
 
         function canOpenResourceImport(item) {
             const linkType = getEffectiveResourceLinkType(item);
-            return !!String(item?.link_url || '').trim() && (linkType === 'magnet' || isResourceShareLinkType(linkType));
+            const linkUrl = String(item?.link_url || '').trim();
+            return !!linkUrl && (
+                linkType === 'magnet'
+                || getResourceImportMode(item) === 'ed2k-direct'
+                || getResourceImportMode(item) === 'ed2k-page'
+                || isResourceShareLinkType(linkType)
+            );
         }
 
         function canImportResource(item) {
@@ -1182,10 +1188,14 @@
             const linkType = getEffectiveResourceLinkType(item);
             if (!String(item?.link_url || '').trim()) return '暂无可导入链接';
             if (isResourceShareLinkType(linkType)) return '转存';
-            if (linkType === 'magnet') {
+            if (
+                linkType === 'magnet'
+                || getResourceImportMode(item) === 'ed2k-direct'
+                || getResourceImportMode(item) === 'ed2k-page'
+            ) {
                 return '下载';
             }
-            return '当前不可导入';
+            return '暂不支持下载';
         }
 
         function getResourceCopyLabel(item) {
@@ -1536,6 +1546,18 @@
             return normalized || 'new';
         }
 
+        function mergeResourceJobRecords(primaryJobs = [], secondaryJobs = []) {
+            const seen = new Set();
+            return [...(Array.isArray(primaryJobs) ? primaryJobs : []), ...(Array.isArray(secondaryJobs) ? secondaryJobs : [])]
+                .filter((job, index) => {
+                    const jobId = Number(job?.id || 0) || 0;
+                    const key = jobId > 0 ? `id:${jobId}` : `fallback:${String(job?.title || '')}:${index}`;
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                });
+        }
+
         function findMatchingResourceJob(item) {
             const itemKeys = uniquePreserveOrder([
                 String(item?.source_post_id || item?.extra?.source_post_id || '').trim() ? `post:${String(item?.source_post_id || item?.extra?.source_post_id || '').trim()}` : '',
@@ -1545,7 +1567,7 @@
             if (!itemKeys.length) return null;
             const jobs = Array.isArray(resourceState.jobs) ? resourceState.jobs : [];
             const activeJobs = Array.isArray(resourceState.active_jobs) ? resourceState.active_jobs : [];
-            for (const job of mergeResourceJobPages(jobs, activeJobs)) {
+            for (const job of mergeResourceJobRecords(jobs, activeJobs)) {
                 const jobKeys = new Set(uniquePreserveOrder([
                     String(job?.source_post_id || '').trim() ? `post:${String(job?.source_post_id || '').trim()}` : '',
                     String(job?.message_url || '').trim() ? `msg:${String(job?.message_url || '').trim()}` : '',
@@ -1692,6 +1714,7 @@
         }
 
         function buildResourceCard(item) {
+            const displayType = getResourceDisplayLinkType(item);
             const importOpenable = canOpenResourceImport(item);
             const importClass = importOpenable ? 'resource-card-action-primary' : 'resource-card-action-secondary resource-card-action-disabled';
             const copyDisabled = String(item?.link_url || item?.raw_text || item?.title || '').trim() ? '' : 'resource-card-action-disabled';
@@ -1705,7 +1728,7 @@
                             <button type="button" data-resource-action="preview" data-resource-id="${item.id}" class="resource-card-title break-words text-left bg-transparent border-none p-0 hover:text-sky-700 transition-colors">${escapeHtml(item?.title || '未命名资源')}</button>
                             <div class="resource-card-badges">
                                 ${buildResourceStatusBadge(getResourceDisplayStatus(item))}
-                                <span class="${escapeHtml(getResourceLinkTypeBadgeClass(getEffectiveResourceLinkType(item)))}">${escapeHtml(getResourceLinkTypeLabel(getEffectiveResourceLinkType(item)))}</span>
+                                <span class="${escapeHtml(getResourceDisplayLinkTypeBadgeClass(displayType))}">${escapeHtml(getResourceDisplayLinkTypeLabel(displayType))}</span>
                                 ${item?.quality ? `<span class="text-[10px] px-3 py-1 rounded-full bg-sky-500/15 text-sky-300 border border-sky-500/20">${escapeHtml(item.quality)}</span>` : ''}
                                 ${item?.year ? `<span class="text-[10px] px-3 py-1 rounded-full bg-violet-500/15 text-violet-300 border border-violet-500/20">${escapeHtml(item.year)}</span>` : ''}
                             </div>
@@ -1781,10 +1804,29 @@
             };
         }
 
+        function isResourceEd2kImportActive() {
+            return resourceModalMode === 'import' && !!resourceEd2kState?.active;
+        }
+
+        function getResourceImportTargetSavepath(savepath = '') {
+            const parentSavepath = normalizeRelativePathInput(savepath);
+            if (!isResourceEd2kImportActive()) return parentSavepath;
+            const createFolder = resourceEd2kState.createFolder !== false;
+            const folderName = String(
+                document.getElementById('resource-ed2k-folder-name')?.value
+                || resourceEd2kState.folderName
+                || ''
+            ).trim();
+            if (window.ResourceEd2kImport?.buildTargetSavepath) {
+                return window.ResourceEd2kImport.buildTargetSavepath(parentSavepath, folderName, createFolder);
+            }
+            return createFolder ? joinRelativePathInput(parentSavepath, folderName) : parentSavepath;
+        }
+
         function syncResourceSavepathPreview(savepath = '') {
             const previewEl = document.getElementById('resource_job_savepath_preview');
             if (!previewEl) return;
-            const normalizedSavepath = normalizeRelativePathInput(savepath);
+            const normalizedSavepath = getResourceImportTargetSavepath(savepath);
             if (normalizedSavepath) {
                 previewEl.textContent = normalizedSavepath;
             } else {
@@ -1796,6 +1838,12 @@
             const linkType = String(resourceModalLinkType || '').trim().toLowerCase();
             const provider = getResourceProviderByLinkType(linkType);
             const providerLabel = getResourceProviderLabel(provider);
+            if (isResourceEd2kImportActive()) {
+                const selectedCount = Array.isArray(resourceEd2kState.selectedItemIds)
+                    ? resourceEd2kState.selectedItemIds.length
+                    : 0;
+                return selectedCount ? `当前选择 ${selectedCount} 个 ED2K 文件。` : '当前未选择 ED2K 文件。';
+            }
             if (isResourceBatchImportMode()) {
                 const batchCount = getResourceBatchMagnetItems().length;
                 return `当前为批量模式，将按同一保存目录依次导入 ${batchCount} 条磁力链接。`;
@@ -1826,7 +1874,8 @@
                 return;
             }
 
-            const match = resolveResourceMonitorTaskMatch(savepath || document.getElementById('resource_job_savepath')?.value || '');
+            const parentSavepath = savepath || document.getElementById('resource_job_savepath')?.value || '';
+            const match = resolveResourceMonitorTaskMatch(getResourceImportTargetSavepath(parentSavepath));
             if (!match.savepath) {
                 hintEl.innerText = `请选择一个非根目录的${providerLabel}保存目录。`;
                 return;
@@ -1863,8 +1912,9 @@
                 return;
             }
 
-            const match = resolveResourceMonitorTaskMatch(savepath);
-            syncResourceSavepathPreview(match.savepath);
+            const targetSavepath = getResourceImportTargetSavepath(savepath);
+            const match = resolveResourceMonitorTaskMatch(targetSavepath);
+            syncResourceSavepathPreview(savepath);
 
             if (!match.savepath) {
                 hiddenInput.value = '';
@@ -1879,7 +1929,7 @@
                 displayInput.textContent = `${providerLabel}链路不绑定监控`;
                 delayInput.value = '0';
                 delayInput.disabled = true;
-                renderResourceImportBehaviorHint(match.savepath);
+                renderResourceImportBehaviorHint(savepath);
                 renderResourceImportSummary();
                 return;
             }
@@ -1893,7 +1943,7 @@
             }
             delayInput.disabled = false;
 
-            renderResourceImportBehaviorHint(match.savepath);
+            renderResourceImportBehaviorHint(savepath);
             renderResourceImportSummary();
         }
 
@@ -1913,6 +1963,13 @@
             const selectionState = getResourceShareSelectionState();
             const isShare = isCurrentResource115Share();
             let selectionText = '整条资源';
+
+            if (isResourceEd2kImportActive()) {
+                const selectedCount = Array.isArray(resourceEd2kState.selectedItemIds)
+                    ? resourceEd2kState.selectedItemIds.length
+                    : 0;
+                selectionText = resourceEd2kState.loading ? '解析中' : `${selectedCount} 个文件`;
+            }
 
             if (!isShare && isResourceBatchImportMode()) {
                 selectionText = `${getResourceBatchMagnetItems().length} 条磁力`;
@@ -2077,7 +2134,6 @@
             const secondaryBadge = isSearchSection
                 ? (isPansouSection ? '外部搜索' : `${escapeHtml(String(section?.pages_scanned || 0))} 页`)
                 : `缓存 ${escapeHtml(String(section.item_count || (section.items || []).length || 0))}`;
-            const primaryType = getResourceLinkTypeLabel(section?.primary_link_type || section?.channel_profile?.primary_link_type || 'unknown');
             const latestPublishedAt = String(section?.latest_published_at || section?.channel_profile?.latest_published_at || '').trim();
             const subtleText = isSearchSection
                 ? (isPansouSection ? `关键词「${escapeHtml(keyword)}」 · 类型 ${escapeHtml(getResourceProviderFilterLabel())}` : `关键词「${escapeHtml(keyword)}」`)
@@ -2098,7 +2154,6 @@
                                 ${isPansouSection ? '<span class="resource-section-chip resource-section-chip-accent">PanSou</span>' : `<span class="resource-section-chip">@${escapeHtml(section.channel_id || '--')}</span>`}
                                 <span class="resource-section-chip resource-section-chip-accent">${primaryBadge}</span>
                                 <span class="resource-section-chip">${secondaryBadge}</span>
-                                ${!isSearchSection ? `<span class="resource-section-chip">${escapeHtml(primaryType)}</span>` : ''}
                                 ${!isSearchSection && section.last_error ? '<span class="resource-section-chip resource-section-chip-warn">同步异常</span>' : ''}
                             </div>
                             <div class="resource-section-subtle">${subtleText}</div>
@@ -2510,6 +2565,8 @@
 
         function applyResourceState(data, options = {}) {
             if (!data) return;
+            const projectedJobs = projectResourceJobsResponse(data, options);
+            data = projectedJobs.data;
             const deferHeavyRender = !!options.deferHeavyRender;
             const compactUpdate = !!options.compactUpdate;
             const previousBoardStatusSignature = compactUpdate ? buildResourceBoardStatusSignature() : '';
@@ -2846,7 +2903,7 @@
             }
         }
 
-        async function refreshResourceState({ allowSearch = true, keywordOverride = null, searchId = '', signal = null, compact = false } = {}) {
+        async function refreshResourceState({ allowSearch = true, keywordOverride = null, searchId = '', signal = null, compact = false, jobMode = 'poll' } = {}) {
             const resourceModule = await loadResourceTabModule();
             if (resourceModule?.refreshResourceState) {
                 return resourceModule.refreshResourceState({
@@ -2856,14 +2913,16 @@
                     signal,
                     compact,
                     getResourceState: () => resourceState,
-                    getResourceJobsStateRequest,
+                    getResourceJobsStateRequest: () => getResourceJobsStateRequest({ mode: jobMode }),
                     isDirectImportInput,
                     setResourceStateHydrated: (nextValue) => {
                         resourceStateHydrated = !!nextValue;
                     },
                     applyResourceState,
+                    rejectResourceJobsRequest,
                 });
             }
+            let jobRequest = null;
             try {
                 const activeKeyword = typeof keywordOverride === 'string'
                     ? keywordOverride.trim()
@@ -2874,7 +2933,7 @@
                 params.set('search_source', normalizeResourceSearchSource(resourceSearchSource));
                 params.set('provider_filter', 'all');
                 if (searchId) params.set('search_id', String(searchId || '').trim());
-                const jobRequest = getResourceJobsStateRequest();
+                jobRequest = getResourceJobsStateRequest({ mode: jobMode });
                 params.set('job_status', jobRequest.status);
                 params.set('job_offset', String(jobRequest.offset));
                 params.set('job_limit', String(jobRequest.limit));
@@ -2882,9 +2941,10 @@
                 const endpoint = params.toString() ? `/resource/state?${params.toString()}` : '/resource/state';
                 const data = await window.MediaHubApi.getJson(endpoint, signal ? { signal } : undefined);
                 resourceStateHydrated = true;
-                applyResourceState(data, { compactUpdate: !!compact });
+                applyResourceState(data, { compactUpdate: !!compact, jobRequest });
                 return data;
             } catch (e) {
+                rejectResourceJobsRequest(jobRequest, e);
                 return null;
             }
         }
@@ -2906,75 +2966,110 @@
             });
         }
 
+        const resourceJobStateController = window.ResourceJobState.create({
+            pageSize: RESOURCE_JOB_PAGE_SIZE,
+            maxWindowSize: RESOURCE_JOB_PAGE_MAX_SIZE,
+        });
+
+        function scheduleResourceJobWindowCalibration() {
+            if (resourceJobCalibrationPending) return;
+            resourceJobCalibrationPending = true;
+            Promise.resolve()
+                .then(() => refreshResourceJobsOnly({ mode: 'window' }))
+                .finally(() => {
+                    resourceJobCalibrationPending = false;
+                });
+        }
+
+        function projectResourceJobsResponse(data, options = {}) {
+            const source = data && typeof data === 'object' ? data : {};
+            const result = resourceJobStateController.accept(options.jobRequest || null, source);
+            if (!result.accepted) {
+                const currentStats = resourceState?.stats && typeof resourceState.stats === 'object'
+                    ? resourceState.stats
+                    : {};
+                const incomingStats = source.stats && typeof source.stats === 'object' ? source.stats : {};
+                return {
+                    accepted: false,
+                    data: {
+                        ...source,
+                        jobs: resourceState.jobs || [],
+                        active_jobs: resourceState.active_jobs || [],
+                        job_counts: resourceState.job_counts || {},
+                        pagination: resourceState.job_pagination || {},
+                        stats: {
+                            ...incomingStats,
+                            total_job_count: currentStats.total_job_count,
+                            active_job_count: currentStats.active_job_count,
+                            completed_job_count: currentStats.completed_job_count,
+                            failed_job_count: currentStats.failed_job_count,
+                        },
+                    },
+                };
+            }
+            resourceJobLoadError = '';
+            const projected = {
+                ...source,
+                jobs: result.jobs,
+                active_jobs: result.activeJobs,
+                pagination: result.pagination,
+            };
+            if (result.needsCalibration) scheduleResourceJobWindowCalibration();
+            return { accepted: true, data: projected };
+        }
+
+        function rejectResourceJobsRequest(jobRequest, error) {
+            const result = resourceJobStateController.reject(jobRequest, error);
+            if (!result.accepted) return result;
+            resourceJobLoadError = result.error;
+            resourceJobLoadingMore = false;
+            renderResourceJobs();
+            return result;
+        }
+
         function buildResourceJobsStateUrl({ status = resourceJobFilter, offset = 0, limit = RESOURCE_JOB_PAGE_SIZE } = {}) {
             const params = new URLSearchParams();
             const normalizedStatus = normalizeResourceJobFilter(status);
             params.set('status', normalizedStatus);
             params.set('offset', String(Math.max(0, Number(offset || 0) || 0)));
-            params.set('limit', String(Math.max(1, Number(limit || RESOURCE_JOB_PAGE_SIZE) || RESOURCE_JOB_PAGE_SIZE)));
+            params.set('limit', String(Math.max(1, Math.min(RESOURCE_JOB_PAGE_MAX_SIZE, Number(limit || RESOURCE_JOB_PAGE_SIZE) || RESOURCE_JOB_PAGE_SIZE))));
             return `/resource/jobs/state?${params.toString()}`;
         }
 
-        function getResourceJobsStateRequest({ status = resourceJobFilter, offset = 0, limit = null } = {}) {
-            const pagination = resourceState?.job_pagination && typeof resourceState.job_pagination === 'object'
-                ? resourceState.job_pagination
-                : {};
-            const loadedCount = Math.max(
-                RESOURCE_JOB_PAGE_SIZE,
-                Number(pagination.loaded_count || 0) || 0,
-                Number(pagination.next_offset || 0) || 0,
-                Array.isArray(resourceState.jobs) ? resourceState.jobs.length : 0
-            );
-            const requestedLimit = limit == null ? loadedCount : Number(limit || RESOURCE_JOB_PAGE_SIZE) || RESOURCE_JOB_PAGE_SIZE;
-            return {
-                status: normalizeResourceJobFilter(status || pagination.status || resourceJobFilter),
-                offset: Math.max(0, Number(offset || 0) || 0),
-                limit: Math.max(1, Math.min(200, requestedLimit)),
-            };
-        }
-
-        function mergeResourceJobPages(existingJobs = [], incomingJobs = []) {
-            const result = [];
-            const seen = new Set();
-            [...(Array.isArray(existingJobs) ? existingJobs : []), ...(Array.isArray(incomingJobs) ? incomingJobs : [])].forEach((job) => {
-                const jobId = Number(job?.id || 0) || 0;
-                const key = jobId > 0 ? `id:${jobId}` : JSON.stringify(job || {});
-                if (seen.has(key)) return;
-                seen.add(key);
-                result.push(job);
-            });
-            return result;
-        }
-
-        async function fetchResourceJobsPage({ status = resourceJobFilter, offset = 0, append = false } = {}) {
+        function getResourceJobsStateRequest({ status = resourceJobFilter, reset = false, extend = false, mode = 'poll' } = {}) {
             const normalizedStatus = normalizeResourceJobFilter(status);
-            const normalizedOffset = Math.max(0, Number(offset || 0) || 0);
             resourceJobFilter = normalizedStatus;
-            if (append) {
+            resourceJobLoadError = '';
+            return resourceJobStateController.begin({
+                status: normalizedStatus,
+                reset,
+                extend,
+                mode,
+            });
+        }
+
+        async function fetchResourceJobsPage({ status = resourceJobFilter, reset = false, extend = false } = {}) {
+            const normalizedStatus = normalizeResourceJobFilter(status);
+            resourceJobFilter = normalizedStatus;
+            if (extend) {
                 resourceJobLoadingMore = true;
                 renderResourceJobs();
             }
+            const jobRequest = getResourceJobsStateRequest({
+                status: normalizedStatus,
+                reset,
+                extend,
+                mode: 'window',
+            });
             try {
-                const data = await window.MediaHubApi.getJson(buildResourceJobsStateUrl({
-                    status: normalizedStatus,
-                    offset: normalizedOffset,
-                    limit: RESOURCE_JOB_PAGE_SIZE,
-                }));
-                if (append) {
-                    data.jobs = mergeResourceJobPages(resourceState.jobs || [], data.jobs || []);
-                }
-                if (data && typeof data === 'object') {
-                    data.pagination = {
-                        ...(data.pagination && typeof data.pagination === 'object' ? data.pagination : {}),
-                        loaded_count: Array.isArray(data.jobs) ? data.jobs.length : 0,
-                    };
-                }
-                applyResourceJobsState(data);
+                const data = await window.MediaHubApi.getJson(buildResourceJobsStateUrl(jobRequest));
+                applyResourceJobsState(data, { jobRequest });
                 return data;
             } catch (e) {
+                rejectResourceJobsRequest(jobRequest, e);
                 return null;
             } finally {
-                if (append) {
+                if (extend) {
                     resourceJobLoadingMore = false;
                     renderResourceJobs();
                 }
@@ -2989,12 +3084,14 @@
             if (!pagination.has_more) return;
             await fetchResourceJobsPage({
                 status: pagination.status || resourceJobFilter,
-                offset: pagination.next_offset || 0,
-                append: true,
+                extend: true,
             });
         }
 
-        function applyResourceJobsState(data) {
+        function applyResourceJobsState(data, options = {}) {
+            const projectedJobs = projectResourceJobsResponse(data, options);
+            if (!projectedJobs.accepted) return;
+            data = projectedJobs.data;
             const resourceModule = tabRuntimeState.tabModuleCache.resource;
             if (resourceModule?.applyResourceJobsState) {
                 resourceModule.applyResourceJobsState(data, {
@@ -3048,20 +3145,24 @@
             }
         }
 
-        async function refreshResourceJobsOnly() {
+        async function refreshResourceJobsOnly({ mode = 'poll' } = {}) {
             const resourceModule = await loadResourceTabModule();
             if (resourceModule?.refreshResourceJobsOnly) {
                 return resourceModule.refreshResourceJobsOnly({
                     applyResourceJobsState,
                     buildResourceJobsStateUrl,
                     getResourceJobsStateRequest,
+                    rejectResourceJobsRequest,
+                    requestOptions: { mode },
                 });
             }
+            const jobRequest = getResourceJobsStateRequest({ mode });
             try {
-                const data = await window.MediaHubApi.getJson(buildResourceJobsStateUrl(getResourceJobsStateRequest()));
-                applyResourceJobsState(data);
+                const data = await window.MediaHubApi.getJson(buildResourceJobsStateUrl(jobRequest));
+                applyResourceJobsState(data, { jobRequest });
                 return data;
             } catch (e) {
+                rejectResourceJobsRequest(jobRequest, e);
                 return null;
             }
         }
@@ -3070,12 +3171,12 @@
             const raw = String(value || '').trim();
             if (!raw) return false;
             if (/magnet:\?/i.test(raw)) return true;
-            if (/ed2k:\/\/[^\s<>'"]+/i.test(raw)) return true;
+            if (/ed2k:\/\/\|file\|/i.test(raw)) return true;
             if (/(?:^|[\s(（【\[])(?:https?:\/\/)?(?:115cdn|115|anxia)\.com\/s\/[a-z0-9]+(?:\?[^\s<>'"]*)?/i.test(raw)) return true;
             const links = raw.match(/https?:\/\/[^\s<>'"]+/gi) || [];
             return links.some(link => {
                 const linkType = detectResourceLinkTypeByUrl(link);
-                return linkType !== 'unknown' && linkType !== 'link';
+                return linkType !== 'unknown';
             });
         }
 
@@ -3087,7 +3188,7 @@
             const importableItems = items
                 .filter(item => canOpenResourceImport(item))
                 .map(item => createTransientResourceItem(item));
-            if (!importableItems.length) throw new Error('未在文本中识别到可导入的 magnet 或已启用网盘分享链接');
+            if (!importableItems.length) throw new Error('未在文本中识别到可导入的离线链接、资源外链或已启用网盘分享链接');
 
             const magnetItems = importableItems.filter(item => getEffectiveResourceLinkType(item) === 'magnet');
             const hasShareItems = importableItems.some(item => isResourceShareLinkType(getEffectiveResourceLinkType(item)));
@@ -3412,8 +3513,7 @@
                 showToast(`清空失败：${error?.message || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
                 return;
             }
-            await refreshResourceState();
-            await fetchResourceJobsPage({ status: resourceJobFilter, offset: 0 });
+            await refreshResourceState({ jobMode: 'window' });
             const deleted = Number(data.deleted || 0);
             if (deleted > 0) {
                 showToast(`已清空 ${deleted} 条${meta.label}导入记录`, { tone: 'success', duration: 2600, placement: 'top-center' });
@@ -3535,6 +3635,11 @@
             getResourceSelectedMagnetProvider,
             getResourceProviderByLinkType,
             getEffectiveResourceLinkType,
+            buildResourceDisplayProfile,
+            getResourceDisplayLinkType,
+            getResourceDisplayLinkTypeBadgeClass,
+            getResourceDisplayLinkTypeLabel,
+            getResourceImportMode,
             isLinkTypeCookieConfigured,
             isProviderCookieConfigured,
             normalizeReceiveCodeInput,

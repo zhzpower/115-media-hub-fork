@@ -35,6 +35,8 @@ const state = {
     identifyResult: null,
     identifySelectionKey: '',
     identifyRequestSeq: 0,
+    identifyPathSelection: createEmptyIdentifyPathSelection(),
+    identifyPathGesture: null,
     tmdb: null,
     manualBusy: false,
     manualResults: [],
@@ -42,6 +44,7 @@ const state = {
     planBusy: false,
     plan: null,
     planSelections: new Set(),
+    planEpisodeOverrides: {},
     planRequestSeq: 0,
     executeBusy: false,
     jobs: [],
@@ -319,14 +322,32 @@ function isWholeFolderSelection(entries = getSelectedEntries()) {
     return getSelectionMode(entries) === 'folder';
 }
 
+function createEmptyIdentifyPathSelection() {
+    return {
+        source: '',
+        tokens: [],
+        selectedIndexes: [],
+        expanded: true,
+    };
+}
+
+function createIdentifyPathSelection(entries) {
+    const pathSelection = window.ScraperPathSelection;
+    if (!pathSelection) throw new Error('ScraperPathSelection 尚未加载');
+    return pathSelection.createSelection(entries, currentParentPath());
+}
+
 function resetIdentifyContext({ resetInputs = false } = {}) {
     state.identifyRequestSeq += 1;
     state.identifyBusy = false;
     state.identifyResult = null;
     state.identifySelectionKey = '';
+    state.identifyPathSelection = createEmptyIdentifyPathSelection();
+    state.identifyPathGesture = null;
     state.tmdb = null;
     state.manualResults = [];
     state.manualMediaTypeTouched = false;
+    state.planEpisodeOverrides = {};
     if (resetInputs) {
         const manualInput = $('scraper-manual-query');
         if (manualInput) manualInput.value = '';
@@ -337,10 +358,6 @@ function resetIdentifyContext({ resetInputs = false } = {}) {
 
 function applyIdentifyManualSearchDefaults(identifyResult = {}) {
     const data = identifyResult && typeof identifyResult === 'object' ? identifyResult : {};
-    const manualInput = $('scraper-manual-query');
-    if (manualInput && !String(manualInput.value || '').trim() && data.query) {
-        manualInput.value = String(data.query || '');
-    }
     const mediaSelect = $('scraper-manual-media-type');
     if (mediaSelect && data.media_type && !state.manualMediaTypeTouched) {
         mediaSelect.value = data.media_type === 'tv' ? 'tv' : 'movie';
@@ -379,7 +396,6 @@ function openIdentifyPanel() {
     if (!panel) return;
     panel.classList.remove('hidden');
     panel.classList.add('is-open');
-    setTimeout(() => $('scraper-manual-query')?.focus(), 30);
 }
 
 function closeIdentifyPanel() {
@@ -552,6 +568,39 @@ function getPlanActions() {
     return state.plan && Array.isArray(state.plan.actions) ? state.plan.actions : [];
 }
 
+function parseManualEpisode(value) {
+    const episode = Number(value);
+    return Number.isInteger(episode) && episode > 0 ? episode : 0;
+}
+
+function getPlanEpisodeOverrides() {
+    return Object.fromEntries(
+        Object.entries(state.planEpisodeOverrides)
+            .map(([entryId, episode]) => [String(entryId || '').trim(), parseManualEpisode(episode)])
+            .filter(([entryId, episode]) => entryId && episode > 0),
+    );
+}
+
+function getPlanAction(actionIndex) {
+    const normalizedIndex = Number(actionIndex || 0) || 0;
+    return getPlanActions().find(action => Number(action.action_index || 0) === normalizedIndex) || null;
+}
+
+function renderManualEpisodeEditor(action) {
+    const actionIndex = Number(action.action_index || 0) || 0;
+    const entryId = String(action.entry_id || '').trim();
+    const manualEpisode = parseManualEpisode(action.manual_episode || state.planEpisodeOverrides[entryId]);
+    if (!actionIndex || !entryId || (!action.manual_episode_allowed && manualEpisode <= 0)) return '';
+    return `
+        <div class="scraper-preview-manual-episode">
+            <label for="scraper-manual-episode-${escapeHtml(String(actionIndex))}">手动集数</label>
+            <input id="scraper-manual-episode-${escapeHtml(String(actionIndex))}" type="number" min="1" step="1" inputmode="numeric" class="scraper-input" data-scraper-manual-episode-input="${escapeHtml(String(actionIndex))}" value="${manualEpisode ? escapeHtml(String(manualEpisode)) : ''}" placeholder="如 12">
+            <button type="button" class="scraper-compact-btn scraper-primary-soft" data-scraper-action="apply-manual-episode" data-scraper-action-index="${escapeHtml(String(actionIndex))}">应用</button>
+            ${manualEpisode ? `<button type="button" class="scraper-compact-btn" data-scraper-action="clear-manual-episode" data-scraper-action-index="${escapeHtml(String(actionIndex))}">清除</button>` : ''}
+        </div>
+    `;
+}
+
 function getSelectedReadyPlanCount() {
     return getPlanActions().filter(action => action.ready && state.planSelections.has(Number(action.action_index || 0))).length;
 }
@@ -591,14 +640,14 @@ function renderSelection() {
     }
     const checkAll = $('scraper-check-all');
     if (checkAll) {
-        const selectable = state.entries;
+        const selectable = getDisplayEntries();
         const selectedInCurrent = selectable.filter(item => state.selected.has(item.id)).length;
         checkAll.checked = selectable.length > 0 && selectedInCurrent === selectable.length;
         checkAll.indeterminate = selectedInCurrent > 0 && selectedInCurrent < selectable.length;
         checkAll.disabled = state.loading || selectable.length <= 0;
     }
     const hasSelection = selectedEntries.length > 0;
-    const selectedInCurrent = state.entries.filter(item => state.selected.has(item.id)).length;
+    const selectedInCurrent = getDisplayEntries().filter(item => state.selected.has(item.id)).length;
     const renameButton = document.querySelector('[data-scraper-action="rename-selected"]');
     if (renameButton) {
         const canRename = supportsProviderOperation('rename') && selectedEntries.length === 1 && !hasPlan;
@@ -762,6 +811,7 @@ function renderEntries() {
                         </div>
                         ${action.issue ? `<em>${escapeHtml(action.issue)}</em>` : ''}
                         ${action.warning ? `<em class="scraper-plan-warning">${escapeHtml(action.warning)}</em>` : ''}
+                        ${renderManualEpisodeEditor(action)}
                     </div>
                     <label class="scraper-preview-check">
                         <input type="checkbox" class="ui-checkbox ui-checkbox-sm" data-scraper-plan-check="${escapeHtml(String(actionIndex))}" ${checked ? 'checked' : ''} ${action.ready ? '' : 'disabled'}>
@@ -985,15 +1035,19 @@ function syncFolderScopedControls() {
 
 function getDisplayEntries() {
     const manager = getFileManager();
+    const keyword = String(state.search || '').trim().toLowerCase();
+    const entries = keyword
+        ? state.entries.filter(entry => String(entry.name || '').toLowerCase().includes(keyword))
+        : state.entries;
     if (manager?.sortEntries) {
-        return manager.sortEntries(state.entries, state.entrySort, {
+        return manager.sortEntries(entries, state.entrySort, {
             foldersFirst: true,
             entryFilter: 'all',
         });
     }
     const sortKey = ['name', 'size', 'modified_at'].includes(state.entrySort?.key) ? state.entrySort.key : 'name';
     const direction = state.entrySort?.direction === 'desc' ? -1 : 1;
-    return state.entries.slice().sort((a, b) => {
+    return entries.slice().sort((a, b) => {
         if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
         let result = 0;
         if (sortKey === 'size') {
@@ -1040,23 +1094,149 @@ function setEntrySort(key) {
     renderEntries();
 }
 
-function renderKeywordSuggestions(identifyResult = {}) {
-    const keywords = Array.isArray(identifyResult.keywords) ? identifyResult.keywords : [];
-    if (!keywords.length) return '';
-    return `
-        <div class="scraper-keyword-group">
-            ${keywords.slice(0, 5).map(item => `
-                <button
-                    type="button"
-                    class="scraper-keyword-chip"
-                    data-scraper-keyword="${escapeHtml(item.keyword || '')}"
-                    title="${escapeHtml(item.source || '识别关键词')}"
-                >
-                    ${escapeHtml(item.keyword || '--')}
-                </button>
-            `).join('')}
+function renderIdentifyPathSelection() {
+    const candidates = $('scraper-candidate-list');
+    if (!candidates) return;
+    if (state.identifyBusy) {
+        candidates.innerHTML = '<div class="scraper-empty-small">正在读取完整路径...</div>';
+        return;
+    }
+    const selection = state.identifyPathSelection || createEmptyIdentifyPathSelection();
+    const source = String(selection.source || '').trim();
+    const tokens = Array.isArray(selection.tokens) ? selection.tokens : [];
+    if (!source || !tokens.length) {
+        candidates.innerHTML = '<div class="scraper-empty-small">当前选择没有可用的文件夹路径，可直接在下方输入影视名称。</div>';
+        return;
+    }
+    const selectedIndexes = Array.isArray(selection.selectedIndexes) ? selection.selectedIndexes : [];
+    const selected = new Set(selectedIndexes.map(Number));
+    const query = window.ScraperPathSelection?.composeQuery(selection) || '';
+    if (selection.expanded === false) {
+        candidates.innerHTML = `
+            <div class="scraper-path-selector is-collapsed">
+                <div class="scraper-path-collapsed">
+                    <div class="scraper-path-result">
+                        <span>已填入搜索框</span>
+                        <strong>${escapeHtml(query || '尚未选择标题')}</strong>
+                    </div>
+                    <button
+                        type="button"
+                        class="scraper-path-reselect"
+                        data-scraper-action="reopen-path-selection"
+                        title="重新选择 TMDB 搜索标题"
+                        aria-label="重新选择 TMDB 搜索标题"
+                    >
+                        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path d="M12 20h9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                            <path d="M16.5 3.5a2.12 2.12 0 013 3L8 18l-4 1 1-4L16.5 3.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        `;
+        return;
+    }
+    candidates.innerHTML = `
+        <div class="scraper-path-selector">
+            <div class="scraper-path-heading">
+                <span>完整路径</span>
+                <span>${selected.size ? `已选择 ${selected.size} 个词块` : '请选择影视标题'}</span>
+            </div>
+            <div class="scraper-path-source" title="${escapeHtml(source)}">${escapeHtml(source)}</div>
+            <div class="scraper-path-tokens" role="listbox" aria-label="完整路径标题选词">
+                ${tokens.map((token, index) => `
+                    <button
+                        type="button"
+                        class="scraper-path-token ${selected.has(index) ? 'is-selected' : ''}"
+                        data-scraper-path-token-index="${index}"
+                        role="option"
+                        aria-selected="${selected.has(index) ? 'true' : 'false'}"
+                    >${escapeHtml(token.text || '')}</button>
+                `).join('')}
+            </div>
+            <div class="scraper-path-actions">
+                <button type="button" class="scraper-compact-btn" data-scraper-action="clear-path-selection" ${selected.size ? '' : 'disabled'}>清空</button>
+                <button type="button" class="scraper-compact-btn scraper-primary-soft" data-scraper-action="complete-path-selection" ${selected.size ? '' : 'disabled'}>完成选词</button>
+            </div>
         </div>
     `;
+}
+
+function beginIdentifyPathSelection(event, index) {
+    const selection = state.identifyPathSelection;
+    const tokenIndex = Number(index);
+    if (!selection || !Number.isInteger(tokenIndex) || tokenIndex < 0) return;
+    event.preventDefault();
+    const selectedIndexes = Array.isArray(selection.selectedIndexes) ? selection.selectedIndexes : [];
+    state.identifyPathGesture = {
+        pointerId: event.pointerId,
+        startIndex: tokenIndex,
+        lastIndex: tokenIndex,
+        baseSelection: selectedIndexes.slice(),
+        shouldSelect: !selectedIndexes.includes(tokenIndex),
+    };
+    selection.selectedIndexes = window.MediaHubTextSelection.applySelectionRange(
+        state.identifyPathGesture.baseSelection,
+        tokenIndex,
+        tokenIndex,
+        state.identifyPathGesture.shouldSelect
+    );
+    renderIdentifyPathSelection();
+}
+
+function continueIdentifyPathSelection(event, index) {
+    const gesture = state.identifyPathGesture;
+    const tokenIndex = Number(index);
+    if (
+        !gesture
+        || gesture.pointerId !== event.pointerId
+        || !Number.isInteger(tokenIndex)
+        || tokenIndex < 0
+        || gesture.lastIndex === tokenIndex
+    ) return;
+    gesture.lastIndex = tokenIndex;
+    state.identifyPathSelection.selectedIndexes = window.MediaHubTextSelection.applySelectionRange(
+        gesture.baseSelection,
+        gesture.startIndex,
+        tokenIndex,
+        gesture.shouldSelect
+    );
+    renderIdentifyPathSelection();
+}
+
+function clearIdentifyPathSelection() {
+    state.identifyPathSelection.selectedIndexes = [];
+    state.identifyPathSelection.expanded = true;
+    renderIdentifyPathSelection();
+}
+
+function completeIdentifyPathSelection() {
+    const query = window.ScraperPathSelection?.composeQuery(state.identifyPathSelection) || '';
+    if (!query) {
+        showToast('请先选择影视标题文字', { tone: 'warn', duration: 2200, placement: 'top-center' });
+        return;
+    }
+    const input = $('scraper-manual-query');
+    if (input) input.value = query;
+    state.identifyPathSelection.expanded = false;
+    state.manualResults = [];
+    renderIdentify();
+    if (input) {
+        input.focus();
+        input.setSelectionRange?.(query.length, query.length);
+    }
+}
+
+function reopenIdentifyPathSelection() {
+    if (!state.identifyPathSelection?.tokens?.length) return;
+    state.identifyPathSelection.expanded = true;
+    renderIdentifyPathSelection();
+    requestAnimationFrame(() => {
+        const container = $('scraper-candidate-list');
+        container?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        const selectedIndex = state.identifyPathSelection.selectedIndexes?.[0] ?? 0;
+        container?.querySelector(`[data-scraper-path-token-index="${selectedIndex}"]`)?.focus();
+    });
 }
 
 function renderPoster(item = {}) {
@@ -1081,21 +1261,13 @@ function renderIdentify() {
             summary.innerHTML = `已绑定 <strong>${escapeHtml(typeLabel)} #${escapeHtml(String(state.tmdb.tmdb_id || state.tmdb.id || 0))}</strong>：${escapeHtml(getTmdbDisplayTitle())}${seasonText}`;
         } else if (identifyResult.msg) {
             summary.textContent = identifyResult.msg;
-        } else if (identifyResult.query) {
-            summary.textContent = `已根据选中条目推荐关键词，请点击关键词填入 TMDB 搜索框后手动搜索绑定。`;
+        } else if (identifyResult.query || state.identifyPathSelection?.source) {
+            summary.textContent = '已读取所选资源的完整文件夹路径，请选择影视标题后搜索并绑定 TMDB。';
         } else {
             summary.textContent = '等待选择文件或文件夹。';
         }
     }
-    if (candidates) {
-        if (state.identifyBusy) {
-            candidates.innerHTML = '<div class="scraper-empty-small">识别中...</div>';
-        } else if (!Array.isArray(identifyResult.keywords) || !identifyResult.keywords.length) {
-            candidates.innerHTML = '';
-        } else {
-            candidates.innerHTML = renderKeywordSuggestions(identifyResult);
-        }
-    }
+    if (candidates) renderIdentifyPathSelection();
     if (manualResults) {
         if (state.manualBusy) {
             manualResults.innerHTML = '<div class="scraper-empty-small">搜索中...</div>';
@@ -1188,15 +1360,23 @@ function renderPlan() {
     }
     const total = Number(plan.total_count || 0);
     const ready = Number(plan.ready_count || 0);
+    const unchanged = Number(plan.unchanged_count || 0);
     const issues = Array.isArray(plan.issues) ? plan.issues : [];
     const warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
-    summary.innerHTML = `
-        <span class="${ready > 0 ? 'scraper-ok-text' : 'scraper-warn-text'}">${ready > 0 ? '可执行' : '需要处理'}</span>
-        <span> / 已勾选 ${escapeHtml(String(selectedReadyCount))} 项，${escapeHtml(String(ready))} / ${escapeHtml(String(total))} 项可执行${issues.length ? ` / ${escapeHtml(String(issues.length))} 个冲突` : ''}${warnings.length ? ` / ${escapeHtml(String(warnings.length))} 个提醒` : ''}</span>
-    `;
+    if (total === 0 && unchanged > 0) {
+        summary.innerHTML = `
+            <span class="scraper-ok-text">无需改名</span>
+            <span> / 已跳过 ${escapeHtml(String(unchanged))} 项无变化文件</span>
+        `;
+    } else {
+        summary.innerHTML = `
+            <span class="${ready > 0 ? 'scraper-ok-text' : 'scraper-warn-text'}">${ready > 0 ? '可执行' : '需要处理'}</span>
+            <span> / 已勾选 ${escapeHtml(String(selectedReadyCount))} 项，${escapeHtml(String(ready))} / ${escapeHtml(String(total))} 项可执行${unchanged > 0 ? ` / 已跳过 ${escapeHtml(String(unchanged))} 项无变化` : ''}${issues.length ? ` / ${escapeHtml(String(issues.length))} 个冲突` : ''}${warnings.length ? ` / ${escapeHtml(String(warnings.length))} 个提醒` : ''}</span>
+        `;
+    }
     const actions = Array.isArray(plan.actions) ? plan.actions : [];
     if (!actions.length) {
-        list.innerHTML = '<div class="scraper-empty-row">没有可改名文件。</div>';
+        list.innerHTML = '<div class="scraper-empty-row">没有需要改名的文件。</div>';
         return;
     }
     list.innerHTML = '';
@@ -1582,6 +1762,7 @@ async function identifySelected() {
         return;
     }
     resetIdentifyContext({ resetInputs: true });
+    state.identifyPathSelection = createIdentifyPathSelection(entries);
     state.identifyBusy = true;
     state.identifySelectionKey = selectionKey;
     clearPlan();
@@ -1598,7 +1779,7 @@ async function identifySelected() {
         state.tmdb = null;
         state.identifySelectionKey = selectionKey;
         applyIdentifyManualSearchDefaults(data || {});
-        showToast('已推荐关键词，请手动搜索并绑定 TMDB 条目', {
+        showToast('请选择完整路径中的影视标题，再搜索并绑定 TMDB 条目', {
             tone: 'info',
             duration: 2600,
             placement: 'top-center',
@@ -1671,65 +1852,143 @@ async function manualSearchTmdb() {
     }
 }
 
-async function buildPlan() {
-    if (state.planBusy) return;
+function buildPlanRequestPayload() {
     const entries = getEffectiveSelectedEntries();
-    if (!entries.length) {
-        showToast('请先选择要刮削的文件或文件夹', { tone: 'warn', duration: 2400, placement: 'top-center' });
-        return;
-    }
+    if (!entries.length) throw new Error('请先选择要刮削的文件或文件夹');
     if (!state.tmdb || Number(state.tmdb.tmdb_id || state.tmdb.id || 0) <= 0) {
-        showToast('请先绑定 TMDB 条目', { tone: 'warn', duration: 2400, placement: 'top-center' });
-        return;
+        throw new Error('请先绑定 TMDB 条目');
     }
-    clearPlan();
-    state.planBusy = true;
-    showToast('正在识别文件并生成预览...', { tone: 'info', duration: 1800, placement: 'top-center' });
-    renderPlan();
+    const options = collectOptions();
+    const tmdb = { ...state.tmdb };
+    if (options.episode_mode && options.episode_mode !== 'auto') {
+        tmdb.tmdb_episode_mode = options.episode_mode;
+    }
+    const payload = {
+        provider: state.provider,
+        base_cid: state.cid,
+        base_path: currentParentPath(),
+        entries,
+        tmdb,
+        options,
+    };
+    const episodeOverrides = getPlanEpisodeOverrides();
+    if (Object.keys(episodeOverrides).length) payload.episode_overrides = episodeOverrides;
+    return payload;
+}
+
+function applyPlanResponse(data) {
+    state.plan = data;
+    const actions = Array.isArray(data.actions) ? data.actions : [];
+    state.planSelections = new Set(
+        actions
+            .filter(action => action.ready)
+            .map(action => Number(action.action_index || 0) || 0)
+            .filter(Boolean),
+    );
+    state.planEpisodeOverrides = Object.fromEntries(
+        actions
+            .map(action => [String(action.entry_id || '').trim(), parseManualEpisode(action.manual_episode)])
+            .filter(([entryId, episode]) => entryId && episode > 0),
+    );
+}
+
+async function requestPlan(payload, { resetPlan = false } = {}) {
+    state.planRequestSeq += 1;
     const requestSeq = state.planRequestSeq;
+    state.planBusy = true;
+    if (resetPlan) {
+        state.plan = null;
+        state.planSelections.clear();
+    }
+    renderPlan();
+    renderEntries();
     try {
-        const options = collectOptions();
-        const tmdb = state.tmdb ? { ...state.tmdb } : null;
-        if (tmdb && options.episode_mode && options.episode_mode !== 'auto') {
-            tmdb.tmdb_episode_mode = options.episode_mode;
-        }
-        const data = await window.MediaHubApi.postJson('/scraper/rename-plan', {
-            provider: state.provider,
-            base_cid: state.cid,
-            base_path: currentParentPath(),
-            entries,
-            tmdb: tmdb || state.tmdb,
-            options,
-        });
-        if (state.planRequestSeq !== requestSeq) return;
-        state.plan = data;
-        state.planSelections = new Set(
-            (Array.isArray(data.actions) ? data.actions : [])
-                .filter(action => action.ready)
-                .map(action => Number(action.action_index || 0) || 0)
-                .filter(Boolean)
-        );
-        const warningCount = Array.isArray(data.warnings) ? data.warnings.length : 0;
-        showToast(
-            Number(data.ready_count || 0) > 0
-                ? (warningCount > 0 ? `预览已生成，含 ${warningCount} 个提醒` : '预览已生成，请勾选确认后执行')
-                : '预览没有可执行项，请处理冲突后再试',
-            {
-                tone: Number(data.ready_count || 0) > 0 ? (warningCount > 0 ? 'warn' : 'success') : 'warn',
-                duration: 2800,
-                placement: 'top-center',
-            },
-        );
-        closeIdentifyPanel();
-    } catch (error) {
-        if (state.planRequestSeq !== requestSeq) return;
-        showToast(`生成预览失败：${error.message || '未知错误'}`, { tone: 'error', duration: 3600, placement: 'top-center' });
+        const data = await window.MediaHubApi.postJson('/scraper/rename-plan', payload);
+        if (state.planRequestSeq !== requestSeq) return null;
+        applyPlanResponse(data);
+        return data;
     } finally {
         if (state.planRequestSeq === requestSeq) {
             state.planBusy = false;
             renderPlan();
             renderEntries();
         }
+    }
+}
+
+function showPlanReadyToast(data) {
+    const warningCount = Array.isArray(data.warnings) ? data.warnings.length : 0;
+    const readyCount = Number(data.ready_count || 0);
+    const totalCount = Number(data.total_count || 0);
+    const unchangedCount = Number(data.unchanged_count || 0);
+    const unchangedNote = unchangedCount > 0 ? `，已跳过 ${unchangedCount} 项无变化` : '';
+    const noChangeOnly = readyCount <= 0 && totalCount === 0 && unchangedCount > 0;
+    showToast(
+        readyCount > 0
+            ? (warningCount > 0 ? `预览已生成，含 ${warningCount} 个提醒${unchangedNote}` : `预览已生成，请勾选确认后执行${unchangedNote}`)
+            : (noChangeOnly ? '识别完成，没有需要改名的文件' : `预览没有可执行项，请处理冲突后再试${unchangedNote}`),
+        {
+            tone: readyCount > 0 ? (warningCount > 0 ? 'warn' : 'success') : (noChangeOnly ? 'info' : 'warn'),
+            duration: 2800,
+            placement: 'top-center',
+        },
+    );
+}
+
+async function buildPlan() {
+    if (state.planBusy) return;
+    let payload;
+    try {
+        payload = buildPlanRequestPayload();
+    } catch (error) {
+        showToast(error.message || '无法生成预览', { tone: 'warn', duration: 2400, placement: 'top-center' });
+        return;
+    }
+    showToast('正在识别文件并生成预览...', { tone: 'info', duration: 1800, placement: 'top-center' });
+    try {
+        const data = await requestPlan(payload, { resetPlan: true });
+        if (!data) return;
+        showPlanReadyToast(data);
+        closeIdentifyPanel();
+    } catch (error) {
+        showToast(`生成预览失败：${error.message || '未知错误'}`, { tone: 'error', duration: 3600, placement: 'top-center' });
+    }
+}
+
+async function updateManualEpisode(actionIndex, { clear = false } = {}) {
+    if (state.planBusy) return;
+    const action = getPlanAction(actionIndex);
+    const entryId = String(action?.entry_id || '').trim();
+    if (!action || !entryId) return;
+    const previousOverrides = { ...state.planEpisodeOverrides };
+    if (clear) {
+        delete state.planEpisodeOverrides[entryId];
+    } else {
+        const input = document.querySelector(`[data-scraper-manual-episode-input="${Number(actionIndex || 0)}"]`);
+        const episode = parseManualEpisode(input?.value);
+        if (episode <= 0) {
+            showToast('请输入大于 0 的集数', { tone: 'warn', duration: 2400, placement: 'top-center' });
+            input?.focus();
+            return;
+        }
+        state.planEpisodeOverrides[entryId] = episode;
+    }
+    let payload;
+    try {
+        payload = buildPlanRequestPayload();
+    } catch (error) {
+        state.planEpisodeOverrides = previousOverrides;
+        showToast(error.message || '无法更新预览', { tone: 'warn', duration: 2400, placement: 'top-center' });
+        return;
+    }
+    showToast(clear ? '正在恢复自动识别...' : '正在按手动集数更新预览...', { tone: 'info', duration: 1800, placement: 'top-center' });
+    try {
+        const data = await requestPlan(payload);
+        if (!data) return;
+        showToast(clear ? '已恢复自动识别' : '已应用手动集数', { tone: 'success', duration: 2200, placement: 'top-center' });
+    } catch (error) {
+        state.planEpisodeOverrides = previousOverrides;
+        showToast(`更新预览失败：${error.message || '未知错误'}`, { tone: 'error', duration: 3600, placement: 'top-center' });
     }
 }
 
@@ -1781,6 +2040,7 @@ async function executePlan() {
         }
         state.plan = null;
         state.planSelections.clear();
+        state.planEpisodeOverrides = {};
         await refreshJobs();
         scheduleJobsPoll();
         await loadEntries({ force: true });
@@ -1855,10 +2115,11 @@ function setSelected(entryId, checked) {
 }
 
 function toggleAll(checked) {
+    const visibleEntries = getDisplayEntries();
     if (checked) {
-        state.entries.forEach(entry => state.selected.set(entry.id, entry));
+        visibleEntries.forEach(entry => state.selected.set(entry.id, entry));
     } else {
-        clearSelection();
+        visibleEntries.forEach(entry => state.selected.delete(entry.id));
     }
     invalidateSelectionContext();
     renderEntries();
@@ -1882,6 +2143,27 @@ function selectRangeBetweenChecked() {
     invalidateSelectionContext();
     renderEntries();
     showToast(`已补齐选择 ${end - start + 1} 项`, { tone: 'success', duration: 2200, placement: 'top-center' });
+}
+
+function handlePointerDown(event) {
+    const token = event.target.closest('[data-scraper-path-token-index]');
+    if (!token) return;
+    beginIdentifyPathSelection(event, Number(token.dataset.scraperPathTokenIndex));
+}
+
+function handleGlobalPointerMove(event) {
+    const gesture = state.identifyPathGesture;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const token = document.elementFromPoint(event.clientX, event.clientY)
+        ?.closest?.('[data-scraper-path-token-index]');
+    if (!token) return;
+    continueIdentifyPathSelection(event, Number(token.dataset.scraperPathTokenIndex));
+}
+
+function endIdentifyPathGesture(event) {
+    if (state.identifyPathGesture?.pointerId === event.pointerId) {
+        state.identifyPathGesture = null;
+    }
 }
 
 function handleClick(event) {
@@ -1909,17 +2191,6 @@ function handleClick(event) {
         setEntrySort(sortButton.dataset.scraperSort);
         return;
     }
-    const keywordButton = event.target.closest('[data-scraper-keyword]');
-    if (keywordButton) {
-        const keyword = String(keywordButton.dataset.scraperKeyword || '').trim();
-        const input = $('scraper-manual-query');
-        if (input && keyword) {
-            input.value = keyword;
-            input.focus();
-            input.select();
-        }
-        return;
-    }
     const manualButton = event.target.closest('[data-scraper-manual-index]');
     if (manualButton) {
         void bindTmdbCandidate(state.manualResults[Number(manualButton.dataset.scraperManualIndex || 0)]);
@@ -1941,14 +2212,14 @@ function handleClick(event) {
     if (action === 'search') {
         state.search = String($('scraper-search-input')?.value || '').trim();
         closeToolPopovers();
-        void loadEntries();
+        renderEntries();
     }
     if (action === 'clear-search') {
         state.search = '';
         const input = $('scraper-search-input');
         if (input) input.value = '';
         closeToolPopovers();
-        void loadEntries({ keepSearch: false });
+        renderEntries();
     }
     if (action === 'create-folder') void createFolder();
     if (action === 'select-range') selectRangeBetweenChecked();
@@ -1967,8 +2238,13 @@ function handleClick(event) {
         }
     }
     if (action === 'close-identify') closeIdentifyPanel();
+    if (action === 'clear-path-selection') clearIdentifyPathSelection();
+    if (action === 'complete-path-selection') completeIdentifyPathSelection();
+    if (action === 'reopen-path-selection') reopenIdentifyPathSelection();
     if (action === 'manual-search') void manualSearchTmdb();
     if (action === 'build-plan') void buildPlan();
+    if (action === 'apply-manual-episode') void updateManualEpisode(actionButton.dataset.scraperActionIndex);
+    if (action === 'clear-manual-episode') void updateManualEpisode(actionButton.dataset.scraperActionIndex, { clear: true });
     if (action === 'clear-plan') {
         clearPlan();
         renderSelection();
@@ -2049,18 +2325,23 @@ function bindEvents() {
     root.dataset.scraperBound = '1';
     root.addEventListener('click', handleClick);
     root.addEventListener('change', handleChange);
+    root.addEventListener('pointerdown', handlePointerDown);
     window.addEventListener('scroll', syncScraperBackTopButton, { passive: true });
     window.addEventListener('resize', () => {
         syncScraperBackTopButton();
         syncScraperBrowserHeight();
     });
     document.addEventListener('keydown', handleGlobalKeydown);
+    document.addEventListener('pointermove', handleGlobalPointerMove, { passive: true });
+    document.addEventListener('pointerup', endIdentifyPathGesture, { passive: true });
+    document.addEventListener('pointercancel', endIdentifyPathGesture, { passive: true });
     window.syncScraperBackTopButton = syncScraperBackTopButton;
     window.syncScraperBrowserHeight = syncScraperBrowserHeight;
     $('scraper-search-input')?.addEventListener('keydown', (event) => {
         if (event.key !== 'Enter' || event.isComposing) return;
         state.search = String(event.target.value || '').trim();
-        void loadEntries();
+        closeToolPopovers();
+        renderEntries();
     });
     $('scraper-new-folder-name')?.addEventListener('keydown', (event) => {
         if (event.key !== 'Enter' || event.isComposing) return;

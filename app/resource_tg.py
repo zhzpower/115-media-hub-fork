@@ -18,11 +18,10 @@ from .resource_identity import (
     normalize_tg_proxy_url_prefix,
 )
 from .resource_linking import (
-    RESOURCE_MAGNET_REGEX,
-    RESOURCE_URL_REGEX,
     RESOURCE_YEAR_REGEX,
     choose_resource_link,
     detect_resource_link_type,
+    extract_resource_links,
     guess_resource_quality,
     pick_resource_title,
     strip_html_to_text,
@@ -68,18 +67,6 @@ TG_CHANNEL_TITLE_REGEXES = [
     re.compile(r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']', re.IGNORECASE | re.DOTALL),
     re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL),
 ]
-
-
-def _unique_preserve_order(values: List[str]) -> List[str]:
-    seen: Set[str] = set()
-    result: List[str] = []
-    for value in values:
-        token = str(value or "").strip()
-        if not token or token in seen:
-            continue
-        seen.add(token)
-        result.append(token)
-    return result
 
 
 def build_tg_proxy_url(cfg: Dict[str, Any], ignore_enabled: bool = False) -> str:
@@ -337,18 +324,12 @@ def parse_telegram_posts_page(html: str, source: Dict[str, Any], limit: int = 10
         text_html = text_match.group(1) if text_match else ""
         raw_text = strip_html_to_text(text_html)
         hrefs = [unescape(link) for link in TG_LINK_HREF_REGEX.findall(chunk)]
-        external_links = [
-            link for link in hrefs
-            if link.startswith(("http://", "https://", "magnet:?"))
-            and "t.me/" not in link
+        all_links = [
+            link for link in extract_resource_links("\n".join([*hrefs, raw_text]))
+            if "t.me/" not in link
             and "telegram.me/" not in link
             and "telegram.org/" not in link
         ]
-        inline_links = RESOURCE_MAGNET_REGEX.findall(raw_text) + [
-            url for url in RESOURCE_URL_REGEX.findall(raw_text)
-            if "t.me/" not in url and "telegram.me/" not in url
-        ]
-        all_links = _unique_preserve_order(external_links + inline_links)
         link_url = choose_resource_link(all_links)
         if not raw_text and not link_url:
             continue
@@ -474,6 +455,8 @@ def fetch_telegram_channel_post_samples(
         )
         pages_scanned += 1
         page_posts = page.get("posts", []) if isinstance(page, dict) else []
+        page_posts = list(page_posts)
+        page_posts.sort(key=get_resource_item_sort_key, reverse=True)
         for post in page_posts:
             identity = build_resource_item_identity(post)
             if identity in seen_keys:

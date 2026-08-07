@@ -660,7 +660,7 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
                 '</div>' +
                 '<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation()">' +
                     '<input type="checkbox" id="provider_enabled_' + p.name + '" ' + (enabled ? 'checked' : '') + ' onchange="toggleProviderEnabled(\'' + p.name + '\', this.checked)" class="sr-only peer">' +
-                    '<div class="w-9 h-5 bg-slate-600 rounded-full peer peer-checked:bg-emerald-500/70 peer-focus:ring-2 peer-focus:ring-emerald-400/30 after:content-[\'\'] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>' +
+                    '<div class="provider-toggle w-9 h-5 bg-slate-600 rounded-full peer peer-checked:bg-emerald-500/70 peer-focus:ring-2 peer-focus:ring-emerald-400/30 after:content-[\'\'] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>' +
                 '</label>' +
             '</div>' +
             '<div id="provider-block-body-' + p.name + '" class="p-3 pt-0 border-t border-slate-700/50 hidden">' +
@@ -752,8 +752,8 @@ export function renderMagnetProviderSetting(cfg) {
         <div class="provider-auth-block mb-3 bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">
             <div class="flex items-center justify-between p-3">
                 <div class="flex items-center gap-3">
-                    <span class="text-sm text-slate-200">磁力下载网盘</span>
-                    <span class="text-xs text-slate-500">固定离线下载</span>
+                    <span class="text-sm text-slate-200">离线下载网盘</span>
+                    <span class="text-xs text-slate-500">磁力、电驴链接仅支持</span>
                 </div>
                 <input id="default_magnet_provider" type="hidden" value="115">
                 <span class="px-3 py-1.5 rounded-lg bg-slate-700 border border-slate-600 text-sm text-slate-200">${label}</span>
