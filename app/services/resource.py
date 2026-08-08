@@ -221,6 +221,7 @@ def _apply_subscription_episode_standard_renames(
     existing_names = {str(entry.get("name", "") or "").strip().lower() for entry, _, _ in collected}
     renamed_count = 0
     duplicate_count = 0
+    oversize_count = 0
     for entry, parent_cid, parent_path in collected:
         entry_name = str(entry.get("name", "") or "").strip()
         entry_id = str(entry.get("id", "") or "").strip()
@@ -233,9 +234,15 @@ def _apply_subscription_episode_standard_renames(
         # 多季合一功能已下线：一律使用订阅任务的当前季
         season_no, episode_no = task_season, episode_value
         prefix = f"S{season_no:02d}E{episode_no:02d}"
-        if entry_name.lower().startswith(prefix.lower() + "."):
+        entry_name_lower = entry_name.lower()
+        prefix_lower = prefix.lower()
+        # 已是标准命名（旧格式 S01E01.mkv 或新格式 S01E01.原名.mkv）则跳过
+        if entry_name_lower == prefix_lower or entry_name_lower.startswith(prefix_lower + "."):
             continue
         new_name = f"{prefix}.{entry_name}"
+        if len(new_name) > 240:
+            oversize_count += 1
+            continue
         if new_name.lower() in existing_names:
             # 同集文件已存在（已缓存过），保持原名不覆盖
             duplicate_count += 1
@@ -281,6 +288,8 @@ def _apply_subscription_episode_standard_renames(
         parts.append(f"已把 {renamed_count} 个剧集文件名前加上 SxxExx 前缀")
     if duplicate_count > 0:
         parts.append(f"{duplicate_count} 个剧集与目录已有同集文件重名，保留原文件名")
+    if oversize_count > 0:
+        parts.append(f"{oversize_count} 个剧集文件名加前缀后过长，保留原文件名")
     if flattened_count > 0:
         parts.append(f"已把 {flattened_count} 个文件从季文件夹移动到保存目录")
     if removed_dir_names:
