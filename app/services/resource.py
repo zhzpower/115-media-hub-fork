@@ -161,14 +161,13 @@ def _apply_subscription_episode_standard_renames(
     job: Dict[str, Any],
     job_extra: Dict[str, Any],
 ) -> str:
-    """转存成功后，把订阅剧集文件统一重命名为 SxxExx 标准格式（如 S01E01.mkv）。
+    """转存成功后，给订阅剧集文件加上 SxxExx 标准前缀（如 S01E01.原文件名.mkv）。
 
     - 仅处理订阅自动任务（job_source=subscription_auto）的 TV 订阅
     - 目标名已存在（同集文件已缓存）时跳过重命名，避免重复/覆盖
     - 解析不出唯一集数的文件保持原名
     返回用于状态说明的摘要文本（空字符串表示未做任何处理）。
     """
-    import os as _os
     import time as _time
 
     if str(job_extra.get("job_source", "") or "").strip() != "subscription_auto":
@@ -233,10 +232,10 @@ def _apply_subscription_episode_standard_renames(
             continue
         # 多季合一功能已下线：一律使用订阅任务的当前季
         season_no, episode_no = task_season, episode_value
-        extension = _os.path.splitext(entry_name)[1].strip().lower()
-        new_name = f"S{season_no:02d}E{episode_no:02d}{extension}"
-        if entry_name.lower() == new_name.lower():
+        prefix = f"S{season_no:02d}E{episode_no:02d}"
+        if entry_name.lower().startswith(prefix.lower() + "."):
             continue
+        new_name = f"{prefix}.{entry_name}"
         if new_name.lower() in existing_names:
             # 同集文件已存在（已缓存过），保持原名不覆盖
             duplicate_count += 1
@@ -279,7 +278,7 @@ def _apply_subscription_episode_standard_renames(
 
     parts: List[str] = []
     if renamed_count > 0:
-        parts.append(f"已把 {renamed_count} 个剧集文件重命名为 SxxExx 标准格式")
+        parts.append(f"已把 {renamed_count} 个剧集文件名前加上 SxxExx 前缀")
     if duplicate_count > 0:
         parts.append(f"{duplicate_count} 个剧集与目录已有同集文件重名，保留原文件名")
     if flattened_count > 0:
