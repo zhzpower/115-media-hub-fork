@@ -957,6 +957,7 @@ async def _build_tv_share_selection_for_missing_episodes(
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
     min_file_size_bytes = _subscription_task_min_file_size_bytes(task)
     skipped_small_files = 0
+    skipped_no_episode_files = 0
     returned_entries = 0
     provider_reported_entries = 0
     provider_pages_scanned = 0
@@ -1049,6 +1050,7 @@ async def _build_tv_share_selection_for_missing_episodes(
                     context_paths=episode_contexts,
                 )
                 if not matched_episodes:
+                    skipped_no_episode_files += 1
                     continue
                 episode_hit = matched_episodes.intersection(target_missing)
                 if not episode_hit:
@@ -1106,6 +1108,7 @@ async def _build_tv_share_selection_for_missing_episodes(
         "skipped_excluded_file_types": skipped_excluded_file_types,
         "skipped_archive_files": skipped_excluded_file_types,
         "skipped_small_files": skipped_small_files,
+        "skipped_no_episode_files": skipped_no_episode_files,
     }
 
     strict_filter = filter_subscription_manifest_files_by_strict_identity(
@@ -1700,6 +1703,7 @@ async def _scan_subscription_share_episode_manifest(
     min_file_size_mb = normalize_subscription_min_file_size_mb(task.get("min_file_size_mb", 0))
     min_file_size_bytes = _subscription_task_min_file_size_bytes(task)
     skipped_small_files = 0
+    skipped_no_episode_files = 0
     returned_entries = 0
     provider_reported_entries = 0
     provider_pages_scanned = 0
@@ -1788,6 +1792,7 @@ async def _scan_subscription_share_episode_manifest(
                     )
                 )
                 if not matched_episodes:
+                    skipped_no_episode_files += 1
                     continue
                 entry_id = str(entry.get("id", "") or entry.get("fid", "") or "").strip()
                 if (not entry_id) or entry_id in seen_file_ids:
@@ -1838,6 +1843,7 @@ async def _scan_subscription_share_episode_manifest(
         "skipped_excluded_file_types": skipped_excluded_file_types,
         "skipped_archive_files": skipped_excluded_file_types,
         "skipped_small_files": skipped_small_files,
+        "skipped_no_episode_files": skipped_no_episode_files,
     }
 
 

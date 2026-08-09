@@ -1584,9 +1584,9 @@
             document.getElementById('subscription_schedule_end_time').value = '23:59';
             document.getElementById('subscription_schedule_interval_minutes').value = SUBSCRIPTION_DEFAULT_SCHEDULE_INTERVAL_MINUTES;
             document.getElementById('subscription_min_score').value = 55;
-            document.getElementById('subscription_min_file_size_mb').value = 0;
+            document.getElementById('subscription_min_file_size_mb').value = 100;
             const strictTitleInput = document.getElementById('subscription_strict_title_match');
-            if (strictTitleInput) strictTitleInput.checked = false;
+            if (strictTitleInput) strictTitleInput.checked = true;
             document.getElementById('subscription_quality_priority').value = 'ultra';
             setSubscriptionScanSettingsToForm(getSubscriptionScanRecommendedDefaults(providerInput?.value || '115'), providerInput?.value || '115');
             document.getElementById('subscription_enabled').checked = true;

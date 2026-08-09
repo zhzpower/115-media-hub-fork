@@ -167,6 +167,9 @@ def _format_subscription_share_scan_log_tail(stats: Dict[str, Any], *, include_c
     skipped_small_files = max(0, int(payload.get("skipped_small_files", 0) or 0))
     if skipped_small_files > 0:
         parts.append(f"小文件过滤 {skipped_small_files} 个")
+    skipped_no_episode_files = max(0, int(payload.get("skipped_no_episode_files", 0) or 0))
+    if skipped_no_episode_files > 0:
+        parts.append(f"未识别集数跳过 {skipped_no_episode_files} 个")
     if bool(payload.get("truncated", False)):
         parts.append(
             f"已截断：{_format_subscription_share_scan_truncated_reason(payload.get('truncated_reason', ''))}"
@@ -4367,16 +4370,29 @@ async def run_subscription_task(
                     if task.get("media_type") == "tv" and plan_selected_episode_values:
                         # 最终兜底一：start_episode 过滤（前 x 集已看过，不再缓存）
                         plan_start_episode = max(0, int(task.get("start_episode", 0) or 0))
-                        if plan_start_episode > 1 and max(plan_selected_episode_values) < plan_start_episode:
-                            skipped_existing_candidates += 1
-                            await write_subscription_log(
-                                (
-                                    f"候选资源 #{index} 分组文件集数均早于第{plan_start_episode}集"
-                                    f"（已设置从第{plan_start_episode}集开始订阅），跳过导入"
-                                ),
-                                "info",
-                            )
-                            continue
+                        if plan_start_episode > 1:
+                            original_count = len(plan_selected_episode_values)
+                            plan_selected_episode_values = {
+                                ep for ep in plan_selected_episode_values
+                                if ep >= plan_start_episode
+                            }
+                            filtered_count = original_count - len(plan_selected_episode_values)
+                            if filtered_count > 0:
+                                await write_subscription_log(
+                                    f"候选资源 #{index} 分组文件集数过滤：跳过第1到第{plan_start_episode - 1}集"
+                                    f"（已设置从第{plan_start_episode}集开始订阅），过滤了{filtered_count}集",
+                                    "info",
+                                )
+                            if not plan_selected_episode_values:
+                                skipped_existing_candidates += 1
+                                await write_subscription_log(
+                                    (
+                                        f"候选资源 #{index} 分组文件集数均早于第{plan_start_episode}集"
+                                        f"（已设置从第{plan_start_episode}集开始订阅），跳过导入"
+                                    ),
+                                    "info",
+                                )
+                                continue
                         # 最终兜底二：云盘目录已有对应集数时不再重复缓存
                         if (
                             existing_episode_scan_ready
