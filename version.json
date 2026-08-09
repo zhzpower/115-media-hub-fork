@@ -1,10 +1,10 @@
 {
-  "version": "0.5.8",
-  "buildDate": "2026-08-05T00:00:00+08:00",
+  "version": "0.5.10",
+  "buildDate": "2026-08-09T00:00:00+08:00",
   "notes": [
-    "修复网盘配置在日间模式下的配色错误",
-    "油猴脚本 webhook URL 中文路径在配置框中保持原文显示，请求时自动编码",
-    "油猴脚本改进请求地址输入框提示词"
+    "修复资源中心频道同步完成后空搜索首页不自动刷新的问题",
+    "有搜索词时保留当前搜索结果，不被同步完成刷新覆盖",
+    "新增同步完成状态与资源刷新竞态回归测试"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

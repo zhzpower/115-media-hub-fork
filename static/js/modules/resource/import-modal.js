@@ -79,17 +79,22 @@
             renderResourceModalLayout(item);
             try {
                 const importMode = getResourceImportMode(item);
-                const data = importMode === 'ed2k-direct'
-                    ? {
+                let data;
+                if (importMode === 'ed2k-direct') {
+                    const items = window.ResourceEd2kImport.collectDirectEd2kItems(item);
+                    if (!items.length) throw new Error('不是有效的 ED2K 文件链接');
+                    data = {
                         title: String(item?.title || '').trim(),
                         source_url: linkUrl,
                         final_url: linkUrl,
-                        items: [window.ResourceEd2kImport.parseEd2kLink(linkUrl)],
-                    }
-                    : await window.MediaHubApi.postJson('/resource/ed2k/resolve', {
+                        items,
+                    };
+                } else {
+                    data = await window.MediaHubApi.postJson('/resource/ed2k/resolve', {
                         url: linkUrl,
                         resource_title: String(item?.title || '').trim(),
                     });
+                }
                 if (requestToken !== resourceEd2kState.requestToken || selectedResourceItem !== item) return;
                 applyResourceEd2kResolvedData(item, data);
             } catch (error) {
@@ -541,8 +546,21 @@
             openResourceModal(resourceId, 'detail');
         }
 
-        function openResourceImportModal(resourceId) {
-            openResourceModal(resourceId, 'import');
+        async function openResourceImportModal(resourceId) {
+            const item = findResourceItem(resourceId);
+            if (!item) return;
+            const candidates = getResourceImportCandidates(item);
+            if (!candidates.length) {
+                showToast('当前资源没有已启用且可导入的链接', { tone: 'warn', duration: 2600, placement: 'top-center' });
+                return;
+            }
+            const selected = await openResourceLinkChoiceModal(candidates, {
+                title: '选择下载或转存链接',
+                actionLabel: '选择此链接',
+            });
+            if (!selected) return;
+            setResourceBatchImportItems([]);
+            openResourceItemModal(selected, 'import');
         }
 
         function closeResourceJobModal() {
@@ -847,7 +865,17 @@
         async function copyResourceRecord(resourceId) {
             const item = findResourceItem(resourceId) || (selectedResourceItem && Number(selectedResourceItem?.id || 0) === Number(resourceId || 0) ? selectedResourceItem : null);
             if (!item) return;
-            const text = getResourceCopyText(item);
+            const records = getResourceLinkRecords(item);
+            let target = item;
+            if (records.length) {
+                const selected = await openResourceLinkChoiceModal(records, {
+                    title: '选择要复制的链接',
+                    actionLabel: '复制此链接',
+                });
+                if (!selected) return;
+                target = createResourceLinkActionItem(item, selected);
+            }
+            const text = getResourceCopyText(target);
             if (!text) return showToast('这条资源没有可复制的内容', { tone: 'warn', duration: 2400, placement: 'top-center' });
             try {
                 if (!navigator.clipboard?.writeText) throw new Error('当前浏览器不支持剪贴板接口');
