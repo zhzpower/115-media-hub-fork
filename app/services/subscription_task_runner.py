@@ -1931,6 +1931,22 @@ async def _run_subscription_task_quark(
                     "info",
                 )
 
+        if (
+            task["media_type"] == "tv"
+            and not _is_115_tv_file_level_selection(precise_selection)
+        ):
+            skipped_precise_mismatch_candidates += 1
+            await write_subscription_log(
+                (
+                    f"候选资源 #{index}（{episode_label}）未完成分享文件级精细识别"
+                    f"（标题无集数、分享清单未识别或总集数未配置），"
+                    "已跳过整包导入，避免把整季/全剧合集转存到目标季目录"
+                ),
+                "warn",
+            )
+            await maybe_wait_between_attempts()
+            continue
+
         attempted_candidates += 1
         candidate_folder_id = str(savepath_folder_id_cache.get(candidate_savepath, "") or "").strip()
         if not candidate_folder_id:
@@ -1950,6 +1966,8 @@ async def _run_subscription_task_quark(
             "auto_refresh": False,
             "extra": {
                 "job_source": "subscription_auto",
+                "subscription_task_name": task_name,
+                "subscription_run_id": subscription_run_id,
             },
         }
         if precise_selection:
