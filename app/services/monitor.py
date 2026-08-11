@@ -443,6 +443,32 @@ async def run_monitor_task(
             else:
                 await write_monitor_log(f"{source_label} 未识别到有效子目录，回退全任务路径刷新", "warn")
 
+        manual_required_scopes: List[Dict[str, Any]] = []
+        manual_required_first_level_dirs: Set[str] = set()
+        manual_required_force_all_first_level = False
+        if str(trigger or "").strip().lower() == "manual":
+            from .monitor_changes import get_manual_required_monitor_scopes
+
+            manual_required_scopes = await asyncio.to_thread(
+                get_manual_required_monitor_scopes,
+                task_name,
+                cfg=cfg,
+            )
+            manual_required_first_level_dirs = {
+                str(scope.get("first_level_dir_rel", "") or "")
+                for scope in manual_required_scopes
+                if str(scope.get("first_level_dir_rel", "") or "")
+            }
+            manual_required_force_all_first_level = any(
+                not str(scope.get("first_level_dir_rel", "") or "")
+                for scope in manual_required_scopes
+            )
+            if manual_required_scopes:
+                await write_monitor_log(
+                    f"需手动监控范围: {len(manual_required_scopes)} 条，本轮将强制扫描对应首层分支",
+                    "warn",
+                )
+
         if refresh_source_label and start_remote_path != task_scan_path:
             # 115 目录在新建后偶发短暂不可见，先刷新父目录再进入目标目录更稳妥。
             parent_remote_path = normalize_remote_path(os.path.dirname(start_remote_path))
@@ -471,6 +497,9 @@ async def run_monitor_task(
         active_dir_active = False
         visited_dir_rels: Set[str] = set()
         pending_first_level_success: Dict[str, Tuple[str, Optional[str]]] = {}
+        manual_required_root_scanned = False
+        manual_required_seen_first_level_dirs: Set[str] = set()
+        manual_required_failed_first_level_dirs: Set[str] = set()
         monitor_file_index_replaced = False
 
         if start_local_rel != task_root:
@@ -498,9 +527,17 @@ async def run_monitor_task(
                 # existing folders are visible during recursive scans.
                 modified, items = await list_remote_dir(cfg, remote_dir, True, task)
                 stats["success_dirs"] += 1
+                if manual_required_scopes and remote_dir == task_scan_path:
+                    manual_required_root_scanned = True
             except Exception as exc:
                 stats["failed_dirs"] += 1
                 _mark_monitor_dir_dirty(cursor, task_name, dir_rel)
+                failed_first_level_dir = dir_rel.split("/", 1)[0] if dir_rel else ""
+                if (
+                    manual_required_force_all_first_level
+                    or failed_first_level_dir in manual_required_first_level_dirs
+                ):
+                    manual_required_failed_first_level_dirs.add(failed_first_level_dir)
                 await write_monitor_log(f"读取目录失败: {remote_dir} ({exc})", "error")
                 if (
                     refresh_source_label
@@ -562,6 +599,8 @@ async def run_monitor_task(
 
                     child_state = _load_monitor_dir_state(cursor, task_name, child_dir_rel)
                     child_has_dirty = _monitor_dir_has_dirty_subtree(cursor, task_name, child_dir_rel)
+                    if is_task_root and child_dir_rel in manual_required_first_level_dirs:
+                        manual_required_seen_first_level_dirs.add(child_dir_rel)
                     if (
                         is_task_root
                         and task["skip_by_dir_mtime"]
@@ -571,6 +610,8 @@ async def run_monitor_task(
                         and child_state["entry_modified"] == modified_at
                         and not child_has_dirty
                         and not force_first_level_rescan
+                        and not manual_required_force_all_first_level
+                        and child_dir_rel not in manual_required_first_level_dirs
                     ):
                         stats["skipped_dirs"] += 1
                         stats["skipped_first_level_dirs"] += 1
@@ -772,6 +813,40 @@ async def run_monitor_task(
         monitor_file_index_replaced = True
         conn.close()
         conn = None
+        if manual_required_scopes:
+            from .monitor_changes import complete_manual_required_monitor_events
+
+            covered_first_level_dirs = (
+                set(pending_first_level_success)
+                & manual_required_first_level_dirs
+            ) - manual_required_failed_first_level_dirs
+            if manual_required_root_scanned:
+                covered_first_level_dirs.update(
+                    manual_required_first_level_dirs - manual_required_seen_first_level_dirs
+                )
+            completed_event_ids = [
+                int(scope.get("event_id", 0) or 0)
+                for scope in manual_required_scopes
+                if (
+                    str(scope.get("first_level_dir_rel", "") or "") in covered_first_level_dirs
+                    or (
+                        not str(scope.get("first_level_dir_rel", "") or "")
+                        and manual_required_root_scanned
+                        and stats["failed_dirs"] == 0
+                        and stats["skipped_first_level_dirs"] == 0
+                    )
+                )
+            ]
+            completed_manual_events = await asyncio.to_thread(
+                complete_manual_required_monitor_events,
+                task_name,
+                completed_event_ids,
+            )
+            if completed_manual_events > 0:
+                await write_monitor_log(
+                    f"已清除需手动监控提示: {completed_manual_events} 条",
+                    "success",
+                )
 
         await write_monitor_section("执行结果")
         await write_monitor_task_summary(stats, cleanup_enabled=cleanup_enabled)
@@ -849,6 +924,63 @@ async def run_monitor_task(
         await _finish_monitor_job(task_name, "monitor")
 
 
+def _single_line_monitor_change_path(value: Any) -> str:
+    normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    return " ".join(part.strip() for part in normalized.split("\n") if part.strip())
+
+
+def _monitor_change_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+async def _write_monitor_change_details(details: Any) -> None:
+    raw_details = details if isinstance(details, list) else []
+    for detail in raw_details:
+        if not isinstance(detail, dict):
+            continue
+        if detail.get("kind") == "file":
+            changes = detail.get("changes", [])
+            for change in changes if isinstance(changes, list) else []:
+                if not isinstance(change, dict):
+                    continue
+                action = str(change.get("action", "") or "")
+                label = {"delete": "删除 STRM", "generate": "生成 STRM"}.get(action, "")
+                path = _single_line_monitor_change_path(change.get("path"))
+                if not label or not path:
+                    continue
+                await write_monitor_log(
+                    f"{label}: {path}",
+                    "info" if action == "delete" else "success",
+                )
+            continue
+        if detail.get("kind") != "folder":
+            continue
+
+        operation = str(detail.get("operation", "") or "").strip().lower()
+        old_path = _single_line_monitor_change_path(detail.get("old_path"))
+        new_path = _single_line_monitor_change_path(detail.get("new_path"))
+        deleted = _monitor_change_count(detail.get("deleted", 0))
+        generated = _monitor_change_count(detail.get("generated", 0))
+        if old_path and new_path:
+            label = "文件夹复制" if operation == "copy" else "文件夹变更"
+            subject = f"{old_path} -> {new_path}"
+            counts = f"生成 {generated}" if operation == "copy" else f"删除 {deleted}，生成 {generated}"
+        elif old_path:
+            label = "文件夹删除"
+            subject = old_path
+            counts = f"删除 {deleted}"
+        elif new_path:
+            label = "文件夹新增"
+            subject = new_path
+            counts = f"生成 {generated}"
+        else:
+            continue
+        await write_monitor_log(f"{label}: {subject}（{counts}）", "info")
+
+
 async def run_monitor_change_task(
     task_name: str,
     trigger: str = "change",
@@ -880,28 +1012,51 @@ async def run_monitor_change_task(
         raw_event_ids = payload.get("event_ids", []) if isinstance(payload, dict) else []
         event_ids = raw_event_ids if isinstance(raw_event_ids, list) else None
         result = await process_monitor_change_events(task_name, cfg=cfg, event_ids=event_ids)
+        await _write_monitor_change_details(result.get("change_details"))
         summary_values = {
             key: int(result.get(key, 0) or 0)
-            for key in ("completed", "failed", "generated", "deleted", "directory_count", "file_count")
+            for key in (
+                "completed",
+                "failed",
+                "generated",
+                "deleted",
+                "directory_count",
+                "file_count",
+                "manual_required",
+            )
         }
         await write_monitor_log(
             (
                 "变更同步汇总: 完成 {completed}，失败 {failed}，生成 {generated}，"
-                "删除 {deleted}，局部读取目录 {directory_count}，文件 {file_count}"
+                "删除 {deleted}，局部读取目录 {directory_count}，文件 {file_count}，"
+                "需手动监控 {manual_required}"
             ).format(**summary_values),
-            "success" if int(result.get("failed", 0) or 0) == 0 else "warn",
+            "success"
+            if int(result.get("failed", 0) or 0) == 0
+            and int(result.get("manual_required", 0) or 0) == 0
+            else "warn",
         )
         for error_item in (result.get("errors", []) if isinstance(result.get("errors"), list) else [])[:10]:
             if not isinstance(error_item, dict):
                 continue
+            retryable = bool(error_item.get("retryable", True))
             await write_monitor_log(
-                "变更事件 #{event_id} 失败，已保留重试: {error}".format(
+                (
+                    "变更事件 #{event_id} 失败，已保留重试: {error}"
+                    if retryable
+                    else "变更事件 #{event_id} 失败: {error}"
+                ).format(
                     event_id=max(0, int(error_item.get("event_id", 0) or 0)),
                     error=str(error_item.get("error", "") or "未知错误"),
                 ),
                 "error",
             )
-        status_text = "变更同步完成" if int(result.get("failed", 0) or 0) == 0 else "变更同步部分失败"
+        if int(result.get("failed", 0) or 0) > 0:
+            status_text = "变更同步部分失败"
+        elif int(result.get("manual_required", 0) or 0) > 0:
+            status_text = "变更同步待手动监控"
+        else:
+            status_text = "变更同步完成"
         await write_monitor_task_footer(task_name, status_text)
         update_monitor_summary(status_text, task_name)
     except asyncio.CancelledError:
