@@ -27,6 +27,14 @@ class SubscriptionEpisodeNormalization:
     reason: str = ""
 
 
+# 资源标题里的“更新至/更至/更新到/更到 N集”是资源整体更新进度，不是某个文件的集数。
+# 文件名无法识别集数时，不能用这类进度表述强赋给单文件（如“更至106集”会把“100 纯享[4K]”误判为 E106）。
+_SUBSCRIPTION_EPISODE_PROGRESS_HINT_REGEX = re.compile(
+    r"(?:更新至|更至|更新到|更到)\s*[零〇一二三四五六七八九十两兩\d]{1,4}\s*(?:集|話|话)\b",
+    re.IGNORECASE,
+)
+
+
 def _normalize_subscription_candidate_link(link_url: Any) -> str:
     return str(link_url or "").strip()
 
@@ -432,6 +440,10 @@ def _extract_task_episodes_from_file_entry(
     for context_path in context_paths or []:
         normalized_context = normalize_relative_path(str(context_path or "").strip())
         if not normalized_context:
+            continue
+        # 资源标题里的“更新至/更至/更新到/更到 N集”是整体更新进度，不是单个文件的集数。
+        # 文件名自身无法识别时，不能用进度表述强赋集数（否则“100 纯享[4K]”会被“更至106集”误判为 E106）。
+        if _SUBSCRIPTION_EPISODE_PROGRESS_HINT_REGEX.search(normalized_context):
             continue
         full_context_name = normalize_relative_path(join_relative_path(normalized_context, normalized_file_name))
         context_result = _extract_task_episode_normalization_from_name(task, full_context_name)
