@@ -219,6 +219,7 @@ def _apply_subscription_episode_standard_renames(
 
     task_season = max(1, int(task.get("season", 1) or 1))
     existing_names = {str(entry.get("name", "") or "").strip().lower() for entry, _, _ in collected}
+    renamed_episode_keys: Set[Tuple[int, int]] = set()
     renamed_count = 0
     duplicate_count = 0
     oversize_count = 0
@@ -233,6 +234,11 @@ def _apply_subscription_episode_standard_renames(
             continue
         # 多季合一功能已下线：一律使用订阅任务的当前季
         season_no, episode_no = task_season, episode_value
+        episode_key = (season_no, episode_no)
+        if episode_key in renamed_episode_keys:
+            # 同一集已有其他文件改名（同集多版本），保持原名防止重复缓存
+            duplicate_count += 1
+            continue
         prefix = f"S{season_no:02d}E{episode_no:02d}"
         entry_name_lower = entry_name.lower()
         prefix_lower = prefix.lower()
@@ -252,6 +258,7 @@ def _apply_subscription_episode_standard_renames(
         except Exception:
             continue
         existing_names.add(new_name.lower())
+        renamed_episode_keys.add(episode_key)
         renamed_count += 1
 
     # 拍平季文件夹：转存内容自带的 Season xx / Sxx / 第x季 文件夹不保留，

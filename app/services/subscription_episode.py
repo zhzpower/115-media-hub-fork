@@ -96,6 +96,13 @@ def _is_subscription_numeric_episode_quality_suffix(suffix: str) -> bool:
     if not tokens:
         return False
 
+    # 剔除全部 token 后若仍有非分隔符残留（如中文标题“纯享”），说明不是纯质量后缀。
+    # 避免把“100 纯享[4K]”这类命名里的标题数字误判为集数。
+    residual = re.sub(r"[a-z0-9]+", "", normalized_suffix)
+    residual = re.sub(r"[\s._\-+()\[\]<>【】（）「」《》]+", "", residual)
+    if residual:
+        return False
+
     quality_tokens = {
         "4k",
         "uhd",
@@ -337,10 +344,18 @@ def _extract_numeric_episode_from_filename(file_name: str) -> int:
         stem_tail_numeric,
         re.IGNORECASE,
     )
-    if quality_tail_match and _is_subscription_numeric_episode_quality_suffix(quality_tail_match.group("suffix")):
-        value = max(0, int(quality_tail_match.group(1) or 0))
-        if 0 < value <= 5000:
-            return value
+    if quality_tail_match:
+        matched_fragment = str(quality_tail_match.group(0) or "")
+        # 带明确集数标记（“第N集”/“N集”）的命名直接按标记识别，如“第5集 纯享[4K]”。
+        has_episode_marker = bool(re.match(r"^\s*第", matched_fragment)) or bool(
+            re.search(r"[集话話]", matched_fragment)
+        )
+        if has_episode_marker or _is_subscription_numeric_episode_quality_suffix(
+            quality_tail_match.group("suffix")
+        ):
+            value = max(0, int(quality_tail_match.group(1) or 0))
+            if 0 < value <= 5000:
+                return value
     return 0
 
 
@@ -430,17 +445,25 @@ def _candidate_episode_values(
     candidate: Dict[str, Any],
     max_expand: int = 400,
     episode_upper_bound: int = 0,
+    start_episode: int = 0,
 ) -> Set[int]:
     payload = candidate if isinstance(candidate, dict) else {}
     episode = max(0, int(payload.get("episode", 0) or 0))
     range_start = max(0, int(payload.get("range_start", 0) or 0))
     range_end = max(0, int(payload.get("range_end", 0) or 0))
+    start = max(0, int(start_episode or 0))
     values: Set[int] = set()
     if range_end > 0:
-        values.update(_expand_episode_values(range_start, range_end, max_expand=max_expand))
-        if not values and range_end > 0:
-            values.add(range_end)
-    if episode > 0:
+        # 用户设置了“从第 x 集开始订阅”时，把大范围合集的起点抬到 start_episode，
+        # 避免把 start_episode 之前的旧集纳入目标（如 E1-E1000 + start=500 → E500-E1000）。
+        effective_start = range_start
+        if start > 1 and range_start > 0 and range_start < start:
+            effective_start = start
+        if effective_start <= range_end:
+            values.update(_expand_episode_values(effective_start, range_end, max_expand=max_expand))
+            if not values and range_end > 0:
+                values.add(range_end)
+    if episode > 0 and (start <= 1 or episode >= start):
         values.add(episode)
     return _clamp_episode_values(values, episode_upper_bound=episode_upper_bound)
 
@@ -480,8 +503,13 @@ def _candidate_missing_episode_values(
     candidate: Dict[str, Any],
     existing_episodes: Set[int],
     episode_upper_bound: int = 0,
+    start_episode: int = 0,
 ) -> Set[int]:
-    episode_values = _candidate_episode_values(candidate, episode_upper_bound=episode_upper_bound)
+    episode_values = _candidate_episode_values(
+        candidate,
+        episode_upper_bound=episode_upper_bound,
+        start_episode=start_episode,
+    )
     if not episode_values:
         return set()
     normalized_existing = _clamp_episode_values(existing_episodes or set(), episode_upper_bound=episode_upper_bound)
@@ -943,8 +971,12 @@ def _scan_quark_existing_tv_episodes(
         try:
             entries = list_quark_entries(normalized_cookie, cid)
         except Exception:
-            failed_dirs += 1
-            continue
+            # 瞬时 API 抖动整目录条目会丢失，重试一次再判定失败
+            try:
+                entries = list_quark_entries(normalized_cookie, cid)
+            except Exception:
+                failed_dirs += 1
+                continue
 
         scanned_dirs += 1
         for entry in entries:

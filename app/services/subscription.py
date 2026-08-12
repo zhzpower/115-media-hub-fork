@@ -623,9 +623,10 @@ def rebuild_subscription_task_progress(task_name: str) -> Dict[str, Any]:
     scan_scanned_dirs = max(0, int(scan_stats.get("scanned_dirs", 0) or 0))
     scan_failed_dirs = max(0, int(scan_stats.get("failed_dirs", 0) or 0))
     scan_scanned_entries = max(0, int(scan_stats.get("scanned_entries", 0) or 0))
-    scan_reliable = not (scan_scanned_dirs <= 0 and scan_failed_dirs > 0)
+    scan_truncated = bool(scan_stats.get("truncated", False))
+    scan_reliable = (not (scan_scanned_dirs <= 0 and scan_failed_dirs > 0)) and (not scan_truncated)
     if not scan_reliable:
-        raise RuntimeError("目标目录扫描结果不可靠，请稍后重试")
+        raise RuntimeError("目标目录扫描结果不可靠（截断或部分目录读取失败），请稍后重试")
 
     cfg = get_config()
     task = _load_subscription_task(cfg, normalized_task_name)

@@ -258,6 +258,7 @@ def _build_subscription_episode_batch_decision(
                 candidate,
                 normalized_existing,
                 episode_upper_bound=upper_bound,
+                start_episode=task_start_episode,
             )
         )
     if candidate_missing:
@@ -1290,6 +1291,7 @@ async def _run_subscription_task_quark(
     existing_folder_episodes: Set[int] = set()
     existing_episode_scan_stats: Dict[str, Any] = {}
     existing_episode_scan_ready = False
+    existing_episode_scan_reliable = False
     if task["media_type"] == "tv":
         upsert_subscription_task_state(task_name, status="running", progress=47, detail="正在读取夸克目标目录已落盘剧集")
         try:
@@ -1304,6 +1306,7 @@ async def _run_subscription_task_quark(
                 {max(0, int(item or 0)) for item in scan_episodes if max(0, int(item or 0)) > 0},
                 episode_upper_bound=single_season_episode_upper_bound,
             )
+            existing_episode_scan_ready = True
             existing_episode_scan_stats = {
                 "existing_episode_scan_ready": True,
                 "existing_episode_count": len(existing_folder_episodes),
@@ -1313,7 +1316,6 @@ async def _run_subscription_task_quark(
                 "existing_episode_failed_dirs": int(scan_result.get("failed_dirs", 0) or 0),
                 "existing_episode_scan_truncated": bool(scan_result.get("truncated", False)),
             }
-            existing_episode_scan_ready = True
             if existing_folder_episodes:
                 await write_subscription_log(
                     (
@@ -1335,27 +1337,38 @@ async def _run_subscription_task_quark(
                     f"夸克目录扫描有 {int(scan_result.get('failed_dirs', 0) or 0)} 个子目录读取失败，已自动忽略",
                     "warn",
                 )
-            if bool(scan_result.get("truncated", False)):
+            scan_truncated = bool(scan_result.get("truncated", False))
+            if scan_truncated:
                 await write_subscription_log("夸克目录扫描达到上限，已截断后续子目录（避免单次执行过慢）", "warn")
-            corrected_last_episode = max(existing_folder_episodes) if existing_folder_episodes else last_episode
-            if existing_folder_episodes:
-                corrected_last_episode = max(existing_folder_episodes)
-            elif int(existing_episode_scan_stats.get("existing_episode_scanned_entries", 0) or 0) <= 0:
-                corrected_last_episode = 0
-            if corrected_last_episode != last_episode:
-                previous_last_episode = last_episode
-                last_episode = corrected_last_episode
-                completed_locked = task["media_type"] == "tv" and known_total > 0 and last_episode >= known_total
-                upsert_subscription_task_state(
-                    task_name,
-                    media_type=task.get("media_type", "movie"),
-                    last_episode=last_episode,
-                    total_episodes=known_total,
-                )
+            scan_scanned_dirs = int(existing_episode_scan_stats.get("existing_episode_scanned_dirs", 0) or 0)
+            scan_failed_dirs = int(existing_episode_scan_stats.get("existing_episode_failed_dirs", 0) or 0)
+            existing_episode_scan_reliable = (not (scan_scanned_dirs <= 0 and scan_failed_dirs > 0)) and (not scan_truncated)
+            existing_episode_scan_stats["existing_episode_scan_reliable"] = existing_episode_scan_reliable
+            if not existing_episode_scan_reliable:
                 await write_subscription_log(
-                    f"已按夸克目标目录校准追更进度：E{previous_last_episode} -> E{last_episode}",
-                    "info",
+                    "夸克目标目录扫描不可靠（截断或部分目录读取失败），已回退历史进度判断，避免重复导入",
+                    "warn",
                 )
+            if existing_episode_scan_reliable:
+                corrected_last_episode = max(existing_folder_episodes) if existing_folder_episodes else last_episode
+                if existing_folder_episodes:
+                    corrected_last_episode = max(existing_folder_episodes)
+                elif int(existing_episode_scan_stats.get("existing_episode_scanned_entries", 0) or 0) <= 0:
+                    corrected_last_episode = 0
+                if corrected_last_episode != last_episode:
+                    previous_last_episode = last_episode
+                    last_episode = corrected_last_episode
+                    completed_locked = task["media_type"] == "tv" and known_total > 0 and last_episode >= known_total
+                    upsert_subscription_task_state(
+                        task_name,
+                        media_type=task.get("media_type", "movie"),
+                        last_episode=last_episode,
+                        total_episodes=known_total,
+                    )
+                    await write_subscription_log(
+                        f"已按夸克目标目录校准追更进度：E{previous_last_episode} -> E{last_episode}",
+                        "info",
+                    )
         except Exception as exc:
             existing_episode_scan_stats = {"existing_episode_scan_ready": False}
             await write_subscription_log(f"读取夸克目标目录已落盘剧集失败，回退历史进度判断：{exc}", "warn")
@@ -1473,9 +1486,11 @@ async def _run_subscription_task_quark(
         episode = max(0, int(candidate.get("episode", 0) or 0))
         total_detected = max(0, int(candidate.get("total", 0) or 0))
         candidate_season = max(0, int(candidate.get("season", 0) or 0))
+        task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
         candidate_episode_values = _candidate_episode_values(
             candidate,
             episode_upper_bound=single_season_episode_upper_bound,
+            start_episode=task_start_episode,
         )
         candidate_season_mismatch_deferred = bool(candidate.get("season_mismatch_deferred", False))
         if candidate_season_mismatch_deferred:
@@ -1533,6 +1548,7 @@ async def _run_subscription_task_quark(
                     candidate,
                     existing_folder_episodes,
                     episode_upper_bound=single_season_episode_upper_bound,
+                    start_episode=task_start_episode,
                 )
                 if missing_for_candidate:
                     await write_subscription_log(
@@ -1565,7 +1581,7 @@ async def _run_subscription_task_quark(
                 candidate_episode_values
                 and last_episode > 0
                 and max(candidate_episode_values) <= last_episode
-                and (not existing_episode_scan_ready)
+                and (not existing_episode_scan_reliable)
                 and (not completed_locked)
             ):
                 skipped_existing_candidates += 1
@@ -1724,6 +1740,7 @@ async def _run_subscription_task_quark(
                             episode_no
                             for episode_no in manifest_episodes
                             if episode_no not in existing_folder_episodes
+                            and (task_start_episode <= 1 or episode_no >= task_start_episode)
                         }
                         if fallback_missing_episode_values:
                             fallback_selection, fallback_stats = _build_tv_share_selection_from_manifest(
@@ -1841,6 +1858,7 @@ async def _run_subscription_task_quark(
                     episode_no
                     for episode_no in manifest_episodes
                     if episode_no not in existing_folder_episodes
+                    and (task_start_episode <= 1 or episode_no >= task_start_episode)
                 }
                 if manifest_missing_episode_values:
                     precise_selection, precise_stats = _build_tv_share_selection_from_manifest(
@@ -2531,7 +2549,11 @@ async def run_subscription_task(
         state = load_subscription_task_state(task_name, task.get("media_type", "movie"))
         last_episode = max(0, int(state.get("last_episode", 0) or 0))
         state_stats = state.get("stats", {}) if isinstance(state.get("stats"), dict) else {}
-        if task["media_type"] == "tv" and bool(state_stats.get("existing_episode_scan_ready", False)):
+        if (
+            task["media_type"] == "tv"
+            and bool(state_stats.get("existing_episode_scan_ready", False))
+            and (not bool(state_stats.get("existing_episode_scan_truncated", False)))
+        ):
             state_existing_max = max(0, int(state_stats.get("existing_episode_max", 0) or 0))
             state_existing_entries = max(0, int(state_stats.get("existing_episode_scanned_entries", 0) or 0))
             if state_existing_max > 0:
@@ -2969,7 +2991,8 @@ async def run_subscription_task(
             if existing_episode_scan_ready:
                 scan_scanned_dirs = int(existing_episode_scan_stats.get("existing_episode_scanned_dirs", 0) or 0)
                 scan_failed_dirs = int(existing_episode_scan_stats.get("existing_episode_failed_dirs", 0) or 0)
-                scan_reliable = not (scan_scanned_dirs <= 0 and scan_failed_dirs > 0)
+                scan_truncated = bool(existing_episode_scan_stats.get("existing_episode_scan_truncated", False))
+                scan_reliable = (not (scan_scanned_dirs <= 0 and scan_failed_dirs > 0)) and (not scan_truncated)
                 existing_episode_scan_reliable = scan_reliable
                 if scan_reliable:
                     ledger_sync = reconcile_subscription_episode_ledger(task_name, existing_folder_episodes)
@@ -3026,10 +3049,12 @@ async def run_subscription_task(
                 )
             missing_episode_candidates = 0
             existing_episode_candidates = 0
+            task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
             for candidate in attempt_candidates:
                 episode_values = _candidate_episode_values(
                     candidate,
                     episode_upper_bound=single_season_episode_upper_bound,
+                    start_episode=task_start_episode,
                 )
                 if not episode_values:
                     continue
@@ -3037,6 +3062,7 @@ async def run_subscription_task(
                     candidate,
                     existing_folder_episodes,
                     episode_upper_bound=single_season_episode_upper_bound,
+                    start_episode=task_start_episode,
                 )
                 if not missing_episode_values:
                     existing_episode_candidates += 1
@@ -3281,9 +3307,11 @@ async def run_subscription_task(
             candidate_season = max(0, int(candidate.get("season", 0) or 0))
             range_start = max(0, int(candidate.get("range_start", 0) or 0))
             range_end = max(0, int(candidate.get("range_end", 0) or 0))
+            task_start_episode = max(0, int(task.get("start_episode", 0) or 0))
             candidate_episode_values = _candidate_episode_values(
                 candidate,
                 episode_upper_bound=single_season_episode_upper_bound,
+                start_episode=task_start_episode,
             )
             candidate_season_mismatch_deferred = bool(candidate.get("season_mismatch_deferred", False))
             if candidate_season_mismatch_deferred:
@@ -3379,6 +3407,7 @@ async def run_subscription_task(
                             candidate,
                             existing_folder_episodes,
                             episode_upper_bound=single_season_episode_upper_bound,
+                            start_episode=task_start_episode,
                         )
                         if missing_for_candidate:
                             missing_ratio = len(missing_for_candidate) / max(1, len(candidate_episode_values))
@@ -3408,7 +3437,7 @@ async def run_subscription_task(
                 is_old_episode = episode < baseline_last_episode
                 is_same_episode_blocked = episode == baseline_last_episode and not completed_locked
                 range_backfill_candidate = range_start > 0 and range_end > 0 and range_start < baseline_last_episode
-                if (not existing_episode_scan_ready) and (is_old_episode or is_same_episode_blocked) and not range_backfill_candidate:
+                if (not existing_episode_scan_reliable) and (is_old_episode or is_same_episode_blocked) and not range_backfill_candidate:
                     skipped_episode_candidates += 1
                     await write_subscription_log(
                         f"候选资源 #{index}（评分 {score}）集数重复 {episode_label}，当前进度 E{baseline_last_episode}，继续尝试下一个",
@@ -3673,6 +3702,7 @@ async def run_subscription_task(
                     candidate,
                     existing_folder_episodes,
                     episode_upper_bound=single_season_episode_upper_bound,
+                    start_episode=task_start_episode,
                 )
                 needs_reimport = bool(missing_for_candidate)
                 if needs_reimport:
@@ -4017,6 +4047,13 @@ async def run_subscription_task(
                         episode_upper_bound=single_season_episode_upper_bound,
                     )
                     manifest_missing_episode_values = set(manifest_episode_values)
+                    # Apply user-configured start_episode filter: never import episodes before the threshold
+                    if task_start_episode > 1 and manifest_missing_episode_values:
+                        manifest_missing_episode_values = {
+                            episode_no
+                            for episode_no in manifest_missing_episode_values
+                            if episode_no >= task_start_episode
+                        }
                     if existing_episode_scan_ready and manifest_missing_episode_values:
                         manifest_missing_episode_values = {
                             episode_no
@@ -4121,6 +4158,7 @@ async def run_subscription_task(
                         candidate,
                         existing_folder_episodes,
                         episode_upper_bound=single_season_episode_upper_bound,
+                        start_episode=task_start_episode,
                     )
                     skip_due_overlap_fallback = False
                     if overlap_existing and missing_for_candidate:
