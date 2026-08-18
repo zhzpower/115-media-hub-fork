@@ -2,6 +2,86 @@
 
 All notable changes to this project will be documented in this file. The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] - 2026-08-17
+
+### 目录树任务化改造（官方导出生成目录树 + sha1 跳过 + 任务化 UI + CLI）
+
+- 废弃旧 `trees` 静态树源 / 定时 / MD5 全量模式，改为“目录树任务”模型：每个任务绑定一个 115 文件夹，调用官方 `files/export_dir` 生成树文件（网盘根目录，命名 `目录树-路径段…`），固定执行“导出 → 删旧（回收站）→ 原地重命名”，随后用远端文件 sha1 与上次比对，未变化则跳过下载 / 解析 / 写 STRM；默认增量，任务卡片提供“全量重写”，清理残留按任务 scope（folder_path 子树）。
+- 真实账号校准完成（根级 + 二级两次导出）：响应字段、UTF-16 首行 `|——根目录/|——父级`、根目录落盘、sha1 可用均确认，自动填充公式锁定为“排除层级=1 + 前缀=父级链（根级为空）”；完整链路实测 982 个媒体文件正确生成 STRM。
+- 设置页移除目录树配置，配置项迁移到同步页（sha1 跳过 / 清理残留全局开关），设置页章节序号重新编号；启动时若 `settings.json` 仍含旧 `trees/sync_mode/check_hash/cron_hour/last_hash` 字段，用归一化配置一次性重写并在任务日志提示。
+- 目录树任务页改为订阅任务风格：头部“+ 新增目录树任务 / 全部同步”按钮 + 任务列表卡片，新增 / 编辑统一走弹窗（复用订阅目录浏览，父文件夹路径前缀与排除层级自动推导、只读），进度条内嵌进任务卡片并按阶段实时推进、结束后复位，日志改为分割线风格并加入分步计时，修复日间主题下 `#page-task` 白字不可见问题。
+- 关键修复：移除 tree 定时调度时遗漏的 `startup.py` `asyncio.create_task(scheduler())` 引用导致的容器启动 NameError 重启循环；115 重命名接口对无扩展名目标自动补 `.txt`，统一用远程实际名 `树名 + .txt` 做删除 / 重命名 / 校验 / 按名读取，重命名后改用 `files/get_info` 按 file_id 直查并等待文件就绪。
+- CLI 新增 `tree list|create|update|delete|defaults|run|full|jobs`（`create` 移除 `--prefix/--exclude`，参数由所选文件夹自动推导），README CLI 段落与 CLI-API-AUDIT 同步。
+- 新增 `tests/test_115_export_dir.py`、`test_tree_tasks.py`、`test_tree_page_frontend.py`，完整 unittest 514 项、`compileall`、改动 JS `node --check`、`git diff --check` 均通过；Docker daemon 权限不足未重建，页面按钮 / 任务流转与 CLI 命令实测待补。
+
+## [0.7.2] - 2026-08-17
+
+### CLI：批量整理与监控任务选项支持
+
+- `scrape` 新增 `batch-preferences get|set|clear` 子命令（`--provider` 指定网盘），可读取 / 设置 / 清除该网盘的批量整理偏好；`rename-plan` 新增 `--file-name-mode`（keep/clean/standard）、`--no-rename-folders`、`--no-season-subfolder`、`--include-tmdb-id`、`--delete-ad-files`、`--title-language`、`--season`、`--episode-mode`、`--preserve-file-info` 参数，也可用 `--options-json` 直接传完整选项对象。
+- `monitor add` 新增 `--auto-scrape-on-new` 与 `--auto-scrape-options-json`，创建监控任务时即可配置“新增资源自动刮削整理”及其整理选项。
+- README CLI 段落补充上述命令用法与参数说明；交接记录规则新增“涉及 CLI 能力的改动须同步补齐 `cli.py` 支持与 README CLI 文档”。
+
+## [0.7.1] - 2026-08-17
+
+### 批量整理：操作分组、文件命名方式与选项记忆
+
+- 入口按钮统一为“批量整理”（与弹窗标题、任务中心任务名一致），相关提示文案同步更新。
+- 命名选项按操作顺序重排为「文件夹 → 文件命名 → 文件清理」三段：文件夹（重命名文件夹 / 创建 Season 子文件夹 / 写入 TMDB ID）、文件命名、文件清理（删除广告文件）。
+- 新增“文件命名方式”三档：按识别结果重命名（默认，行为不变）/ 仅清理广告信息（只剥离文件名中的广告网址与站点名称，保留清晰度、季集标记等原始信息）/ 保持原名（文件不重命名）。保持原名与仅清理档位下文件不移动，文件夹重命名照常生效；创建 Season 子文件夹作为独立结构操作，聚集剧集即使不重命名文件也会按季移入对应目录。
+- 批量整理选项记忆：新增服务端 `scraper_batch_preferences` 表与 `GET/POST /scraper/{provider}/batch/preferences` 接口，按网盘分别保存上次的整理选项（白名单归一化、空选项清除记忆）；页面加载或切换网盘时自动恢复，选项变更防抖 400ms 写回，选项区提供“恢复默认”按钮。
+
+### 监控任务：自动刮削整理按任务配置
+
+- “新增资源自动刮削整理”开关开启后，可在任务弹窗内配置该任务的自动整理选项（文件夹重命名 / Season 子文件夹 / TMDB ID / 文件命名方式 / 标题语言与季集识别 / 保留细节 / 删除广告文件），每个任务独立保存（`auto_scrape_options`）。
+- 未配置的旧任务保持原行为（中文标题、标准重命名、不删除广告文件）。
+
+## [0.7.0] - 2026-08-14
+
+### 新增：宿主机命令行 CLI（合并外部贡献 PR #5 并适配当前 API）
+
+- 新增 `cli.py`（约 2000 行）：25 个子命令覆盖 `status / version / search / channels / subscribe / jobs / settings / logs / cookies / sign / tmdb / monitor / tree / browse / share / scrape / watchlist / strm / resource / sources / api / providers / health / stats / daemon`，全部通过面板 HTTP API 操作，AI 代理或脚本可无需网页完成“搜索→订阅→转存→监控→STRM→播放”全流程。新增 `requirements-cli.txt` 与 README 用法说明（仅宿主机依赖，不影响容器镜像）。
+- 登录安全：不再静默使用默认 `admin/admin123` 自动登录，要求 `MH_USERNAME` / `MH_PASSWORD` 环境变量或交互式输入（密码与网页登录一致）；会话 Cookie 文件默认 `/tmp/.115_cookies.txt`（0600，可用 `MH_COOKIE_FILE` 覆盖）。`sources` / `daemon` 等容器运维命令需宿主机 Docker，容器名可用 `MH_CONTAINER` 覆盖。
+- 命令修复：`search --cancel` 改为显式标志（原 `search cancel` 会被当成关键词）；`subscribe remove` 改用 `/subscription/delete` 清除队列与运行记录；`monitor start/stop/remove` 按任务名操作；`scrape jobs-create` 改为真实三步流（identify → TMDB 选择（多候选时列出并要求 `--tmdb-id`）→ rename-plan → jobs/create）。
+- 二次审查修复：`logs` 尾数改用 `--tail N`（原 `logs <N>` 会被位置参数拒绝）；`resource delete` 改用 `--id`（原 ID 会被 quick-links 子操作吞掉）；115 分页回退把 `id` 字段纳入文件判定避免文件误判为目录；`browse tree` 只递归文件夹；identify/rename-plan 的路径解析错误不再吞掉而是返回真实原因；`scrape jobs-create` 计划未就绪时先列出冲突再退出；任务/资源 ID 非法时给出中文提示而非 traceback。
+- 细节体验修复：`subscribe add` 不传 `--savepath` 时按媒体类型从常用目录自动推断（修复剧集默认存 `/电影`）；`--schedule-weekdays` 非法 JSON、`settings` 数字字段、`tmdb detail`/`watchlist` 的 ID 非法时给出中文提示而非 traceback；`channels sync` 文案改为“已提交（后台执行）”；`daemon`/`health`/`sources` 自动识别 `115-media-hub` 与 `115-media-hub-test` 容器名；115 分页回退复用统一条目规范化 `_normalize_115_file_entry`，并把 `id` 兜底为文件 ID，避免两处语义漂移。
+- 后端适配：`/scraper/{provider}/rename|move|copy|delete` 增量支持可选 `path`（move/copy 另支持 `dest`）入参，完整保留现有 `entry/entries/request_id/parent_path/target_parent_path` 参数与监控同步事件；路径解析仅支持 115 并复用现有分页实现（`resolve_115_folder_id_by_path` + 新增 `resolve_115_entry_by_name`）；`identify` / `rename-plan` 支持纯路径条目，由服务端预解析。
+- 新增发现源注册表：`app/providers/discovery_base.py`（`DiscoveryProvider` 抽象 + `DiscoveryResult`）与 `app/providers/discovery_registry.py`（注册表 + 内置 Telegram / PanSou provider，异常隔离、重复注册保护），供 CLI `sources` 命令与未来扩展使用。
+
+感谢 [Li-Qifeng](https://github.com/Li-Qifeng) 贡献 CLI 扩展、CLI-API-AUDIT 字段审计与发现源注册表设计（PR #5）。
+
+## [0.6.2] - 2026-08-14
+
+- 任务中心手机端操作按钮不再向左溢出：按钮行改为可收缩并自动换行（去掉 `shrink-0`，改为 `min-w-0 flex-1 justify-end`），四个按钮放不下时换行显示而不是把页面撑破；同时精简按钮文案（取消任务→取消、重试任务→重试、立即触发刷新→立即刷新、无需手动刷新→无需刷新、当前目录不触发→未绑定监控），禁用态配色保持不变；≤640px 下按钮内边距与字号微调，绝大多数手机一行放下。
+- 搜索/识别提示条与搜索结果频道副标题里的长关键词（磁力链接、长 URL 等）改为中间省略显示（前 26 + 后 21 字符，共 48 字符），避免手机端长文本从右侧溢出或把页面压缩成窄条；命中数等逻辑仍使用完整关键词计算。提示条、副标题与导入弹窗“资源文案预览”增加 `overflow-wrap: anywhere` 兜底，极端窄屏下也会在框内换行。
+- 任务历史清理从页面请求中拆出：完成/失败记录超过保留上限（`RESOURCE_JOB_COMPLETED_KEEP=1000` / `RESOURCE_JOB_FAILED_KEEP=500`，均可环境变量调整）时，由后台周期任务自动清理，默认每 10 分钟一次（`RESOURCE_JOB_PRUNE_INTERVAL_SECONDS` 可调，范围 60–86400 秒）；打开资源中心/任务中心不再触发删除，任务状态恢复逻辑保持不变。新增 2 项回归测试，完整 unittest 382 项、compileall、改动 JS `node --check` 与 git diff --check 均通过；Docker 未重建。
+
+## [0.6.1] - 2026-08-13
+
+- 批量整理面板“搜索绑定”结果行显示 TMDB 封面，无封面显示占位，与单条手动搜索一致。
+- 刮削页手机端工具栏 6 个主按钮（区间选择/重命名/复制/移动/删除/识别整理）保持一行显示，不再折行占用过高。
+- 命名选项分组重排：原“目录处理”拆为“文件夹结构”（Season 子文件夹 → 写入 TMDB ID → 同步重命名）与“文件清理”（删除广告文件）。
+- 保留原文件名信息新增“语言/字幕”两类标签：支持国语/粤语/双语/台配、中字/简中/繁中/英字/双语字幕/内封外挂中字等，整短语优先、词边界安全（不误伤“我的英语老师”这类真实片名）；修复 `AAC.10bit` 把 10bit 误判成 1.0 声道的问题。
+- 批量整理任务名展示 TMDB 绑定信息：按实际执行条目命名，单条显示“标题 (年份)”，多条显示“首部标题 等 N 项”，无条目信息时维持“批量整理”。
+- 油猴脚本兼容 iOS（Userscripts）使用：存储读写兼容异步 `GM_getValue/GM_setValue` 并把任务/密钥预载入内存；`GM_xmlhttpRequest` 缺失或同步抛错时自动改用 `fetch`（含 torrent 二进制下载兜底）；http 页面无 WebCrypto 时用内置 SHA-256/HMAC 签名兜底。新增 7 项 node 回归测试。
+- 油猴脚本配置入口重构：取消全局右下角悬浮窗，任务管理器入口全部收进“115”按钮——未配置任务时点击任意“115”按钮直接打开任务管理器，已配置时任务选择器底部新增“任务管理”按钮；桌面端保留油猴菜单入口，避免浮窗影响所有网页。
+- 修复单任务时“115”按钮直接推送导致无法进入任务管理器的漏洞：即使只配置一个任务也始终弹出任务选择器（含“任务管理”入口），保证 iOS 无油猴菜单也能随时进配置。
+- 刮削标题清洗扩展：新增“国语配音”“中文字幕/中文配音/中文音轨/中文版”复合短语；单独出现的“中文/国语”按独立词（词边界）清洗并参与纯噪声过滤，不再残留为搜索关键词，且不误伤“我的中文老师”这类含“中文”的真实片名。
+
+## [0.6.0] - 2026-08-13
+### 新增
+- 批量整理：勾选条目后识别，自动匹配/建议/待确认三态；批量计划与任务执行，整理动作联动监控目录 STRM 精准同步；支持“库根拆分扫描”——选中整个影视库时按子目录拆成独立识别条目，分类容器（电影/电视剧/动漫等）递归下探，分层失败或没有媒体的文件夹跳过不处理，拆分方式可在识别弹窗顶部两段式切换（自动判断 / 整个文件夹 / 按子目录拆分）。
+- 识别核心升级：guessit 结构化发布名解析（站点前缀、路径、季集、发布组），TMDB 多候选打分（年份硬约束避免同名异年错配、别名/译名破平局、中英混排拆词分别匹配、多部曲拼回）；扩展中文发布站、发布页、字幕标签等附属噪声词库。
+- 剧集识别：`EP02` 等集数标记不再被年份抢占，支持“数字 + 单集标题”与纯数字序号，文件夹名 `S01` 参与季号识别。
+- 广告文件内置删除（默认关闭，删除进入网盘回收站，整理任务不回退删除）；非影视文件分类处理：字幕保留语言标记唯一命名、海报跟随片名、广告/标准封面保留。
+- 监控任务新增“新增资源自动刮削整理”开关：扫描到新增媒体文件后按父文件夹识别，只对置信度 ≥80 的自动匹配条目执行一次整理，失败仅记录日志。
+### 优化
+- 手动识别与批量识别合并为单一“识别整理”入口：自动识别优先，每行保留“改绑/搜索绑定”手动入口（含大爆炸选词），预览可返回修改绑定。
+- 预览交互：可执行文件夹淡蓝底色、新旧名称无变化项标记并跳过不入队列、隐藏文件操作按钮、退出预览红色样式、提醒内容直接可见、绑定条目封面铺满整行、弹窗标题与关闭按钮固定。
+- 刮削页 URL 记忆网盘与文件夹路径，刷新页面不丢失当前位置。
+- “需手动监控”提示可查看明细：监控任务卡片上的计数改为可点击入口，弹出明细弹窗，逐条显示事件号、操作类型（复制/移动/重命名/删除）、旧路径→新路径与处理提示；新增 `GET /monitor/manual-required` 查询接口；重新扫描该任务后自动补齐 STRM 并清除提示。同时修复事件表完整网盘路径未转换为挂载相对路径导致明细一直为空的问题。
+- 刮削页 URL 参数按 tab 归属管理：`provider/path/cid` 只在刮削 tab 保留，切换到其它 tab 时由路由自动清理，不再污染监控等页面的链接。
+
 ## [0.5.17] - 2026-08-12
 - 修复刮削绑定后标准剧集文件（如 `Show.S03E07.2160p...mp4`）无法识别集数的问题：自动集数解析改为文件或父路径带明确季号时优先使用该季号，不再因页面“未识别时默认季号”为 1 而按季号不匹配丢弃。
 - 完全没有明确季号时才使用“未识别时默认季号”兜底，与手动集数覆盖路径保持一致；新增标准季集、父目录季号、无季号兜底和多季连续编号映射回归测试。

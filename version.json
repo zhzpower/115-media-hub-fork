@@ -1,9 +1,9 @@
 {
-  "version": "0.5.17",
-  "buildDate": "2026-08-12T00:00:00+08:00",
+  "version": "0.8.0",
+  "buildDate": "2026-08-17T00:00:00+08:00",
   "notes": [
-    "修复刮削绑定后标准剧集文件无法识别集数：文件或父路径带明确季号时优先按文件自身季号识别，不再受页面默认季号影响",
-    "完全没有明确季号时才使用“未识别时默认季号”兜底，与手动集数覆盖路径保持一致"
+    "目录树任务化改造：废弃旧 trees 静态树源/定时/MD5 全量模式，改为文件夹任务模型，调用官方 files/export_dir 生成树文件并用远端 sha1 跳过未变化同步",
+    "设置页目录树配置迁移到同步页并自动清理旧字段；目录树任务页改为订阅任务风格（弹窗新增/编辑、进度条、分步计时日志）；CLI 补齐 tree list/create/update/delete/defaults/run/full/jobs"
   ],
   "changelogUrl": "https://github.com/xianer235/115-media-hub/blob/main/CHANGELOG.md",
   "projectUrl": "https://github.com/xianer235/115-media-hub"

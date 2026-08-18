@@ -1003,6 +1003,16 @@
                 .replaceAll("'", '&#39;');
         }
 
+        function truncateMiddleText(text, maxLength = 48, keepHead = 26, keepTail = 21) {
+            const raw = String(text || '').trim();
+            const chars = Array.from(raw);
+            if (chars.length <= maxLength) return raw;
+            const head = Math.max(1, Math.min(Math.floor(keepHead), maxLength - 1));
+            const tail = Math.max(1, Math.min(Math.floor(keepTail), maxLength - head - 1));
+            if (head + tail >= chars.length) return raw;
+            return `${chars.slice(0, head).join('')}…${chars.slice(-tail).join('')}`;
+        }
+
         function uniquePreserveOrder(values) {
             const seen = new Set();
             const result = [];
@@ -2157,32 +2167,6 @@
             return matched ? normalizeRemotePathInput(matched.prefix || '') : '';
         }
 
-        function addTreeRow(data = { path: '', prefix: '', exclude: 1 }) {
-            const container = document.getElementById('trees-container');
-            const row = document.createElement('div');
-            row.className = "tree-row grid grid-cols-12 gap-3 items-end bg-slate-900/50 p-4 rounded-2xl border border-slate-800 hover:border-slate-700 transition-colors";
-            const sourcePath = String(data.path || '').trim();
-            row.innerHTML = `
-                <div class="col-span-12 md:col-span-6">
-                    <span class="text-[10px] text-slate-500 ml-1 font-bold uppercase">115 目录树文件路径（相对 115 根目录）</span>
-                    <input class="t-url w-full bg-slate-950 border-slate-700 rounded-lg p-2.5 text-sm mt-1 outline-none focus:border-sky-500" value="${escapeHtml(sourcePath)}" placeholder="例如 目录树.txt 或 子目录/目录树.txt">
-                    <div class="text-[10px] text-slate-500 leading-4 mt-1">根目录填 目录树.txt；子目录填 子目录/目录树.txt。兼容 /目录树.txt、/115/目录树.txt、完整 URL。</div>
-                </div>
-                <div class="col-span-6 md:col-span-4">
-                    <span class="text-[10px] text-slate-500 ml-1 font-bold uppercase">父文件夹路径前缀 (选填)</span>
-                    <input class="t-prefix w-full bg-slate-950 border-slate-700 rounded-lg p-2.5 text-sm mt-1 outline-none focus:border-sky-500" value="${escapeHtml(data.prefix)}" placeholder="补全丢失的路径，如: 电影/漫威">
-                </div>
-                <div class="col-span-4 md:col-span-1">
-                    <span class="text-[10px] text-slate-500 ml-1 font-bold uppercase">排除层级</span>
-                    <input type="number" min="1" class="t-exclude w-full bg-slate-950 border-slate-700 rounded-lg p-2.5 text-sm mt-1 outline-none focus:border-sky-500" value="${Number(data.exclude || 1)}">
-                </div>
-                <div class="col-span-2 md:col-span-1">
-                    <button onclick="this.parentElement.parentElement.remove()" class="w-full bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white p-2.5 rounded-lg transition-colors text-sm font-bold">✕</button>
-                </div>
-            `;
-            container.appendChild(row);
-        }
-
         async function resetExtensions() {
             if (await showAppConfirm("确定要恢复默认扫描后缀名吗？\n(恢复后请手动点击下方的保存全部配置)")) {
                 document.getElementById('extensions').value = DEFAULT_EXTENSIONS;
@@ -2204,7 +2188,7 @@
                 return;
             }
             if (isRunning) return;
-            const data = await window.MediaHubApi.postJson('/start', { use_local: local, force_full: full }).catch(() => null);
+            const data = await window.MediaHubApi.postJson('/tree/sync-all', {}).catch(() => null);
             if (data?.status === 'started') updateButtonState(true);
         }
 
@@ -3283,7 +3267,7 @@
                     });
                 } else if (!text) {
                     if (directImport) {
-                        text = `资源识别执行中 · 关键词「${keyword || '...'}」 · 已开始`;
+                        text = `资源识别执行中 · 关键词「${truncateMiddleText(keyword || '...')}」 · 已开始`;
                     } else {
                         if (typeof buildResourceSearchStatusText === 'function') {
                             text = buildResourceSearchStatusText({
@@ -3299,7 +3283,7 @@
                             const latencyText = resourceSearchSource === 'pansou'
                                 ? '已开始'
                                 : (tgProgressText || 'TG 延迟检测中');
-                            text = `${sourceLabel} · 关键词「${keyword || '...'}」 · ${latencyText}`;
+                            text = `${sourceLabel} · 关键词「${truncateMiddleText(keyword || '...')}」 · ${latencyText}`;
                         }
                     }
                 }
@@ -3571,6 +3555,87 @@
             } catch (e) {}
         }
 
+        function syncMonitorAutoScrapeOptions() {
+            const enabled = !!document.getElementById('monitor_auto_scrape_on_new')?.checked;
+            const optionsEl = document.getElementById('monitor-auto-scrape-options');
+            if (optionsEl) optionsEl.classList.toggle('hidden', !enabled);
+            const standard = String(document.getElementById('monitor_asc_file_name_mode')?.value || 'standard') === 'standard';
+            const standardWrap = document.getElementById('monitor-asc-standard-wrap');
+            if (standardWrap) {
+                standardWrap.classList.toggle('hidden', !standard);
+                standardWrap.querySelectorAll('input, select').forEach((control) => {
+                    control.disabled = !standard;
+                });
+            }
+            const preserve = !!document.getElementById('monitor_asc_preserve_file_info')?.checked;
+            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
+                input.disabled = !preserve;
+            });
+        }
+
+        function collectMonitorAutoScrapeOptions() {
+            const preserveTags = {};
+            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
+                preserveTags[String(input.dataset.monitorAscTag || '').trim()] = !!input.checked;
+            });
+            return {
+                file_name_mode: String(document.getElementById('monitor_asc_file_name_mode')?.value || 'standard'),
+                title_language: String(document.getElementById('monitor_asc_title_language')?.value || 'auto'),
+                season: Math.max(1, Number(document.getElementById('monitor_asc_season')?.value || 1) || 1),
+                episode_mode: String(document.getElementById('monitor_asc_episode_mode')?.value || 'auto'),
+                include_tmdb_id: !!document.getElementById('monitor_asc_include_tmdb_id')?.checked,
+                use_season_subfolder: document.getElementById('monitor_asc_season_subfolder')?.checked !== false,
+                rename_selected_folders: document.getElementById('monitor_asc_rename_folders')?.checked !== false,
+                delete_ad_files: !!document.getElementById('monitor_asc_delete_ad_files')?.checked,
+                preserve_file_info: !!document.getElementById('monitor_asc_preserve_file_info')?.checked,
+                preserve_tags: preserveTags,
+            };
+        }
+
+        function applyMonitorAutoScrapeOptions(options = {}) {
+            const opts = options && typeof options === 'object' ? options : {};
+            const setCheck = (id, value) => {
+                const el = document.getElementById(id);
+                if (el) el.checked = !!value;
+            };
+            const setSelect = (id, value, allowed) => {
+                const el = document.getElementById(id);
+                if (el) el.value = allowed.includes(String(value || '')) ? String(value) : allowed[0];
+            };
+            setCheck('monitor_asc_rename_folders', opts.rename_selected_folders !== false);
+            setCheck('monitor_asc_season_subfolder', opts.use_season_subfolder !== false);
+            setCheck('monitor_asc_include_tmdb_id', opts.include_tmdb_id);
+            setCheck('monitor_asc_delete_ad_files', opts.delete_ad_files);
+            setCheck('monitor_asc_preserve_file_info', opts.preserve_file_info);
+            setSelect('monitor_asc_file_name_mode', opts.file_name_mode, ['standard', 'clean', 'keep']);
+            setSelect('monitor_asc_title_language', opts.title_language, ['auto', 'zh', 'en']);
+            setSelect('monitor_asc_episode_mode', opts.episode_mode, ['auto', 'seasonal', 'absolute']);
+            const seasonEl = document.getElementById('monitor_asc_season');
+            if (seasonEl) seasonEl.value = String(Math.max(1, Math.min(99, Number(opts.season || 1) || 1)));
+            const tags = (opts.preserve_tags && typeof opts.preserve_tags === 'object') ? opts.preserve_tags : {};
+            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
+                const key = String(input.dataset.monitorAscTag || '').trim();
+                if (Object.prototype.hasOwnProperty.call(tags, key)) input.checked = !!tags[key];
+            });
+            syncMonitorAutoScrapeOptions();
+        }
+
+        function resetMonitorAutoScrapeOptions() {
+            document.getElementById('monitor_asc_rename_folders').checked = true;
+            document.getElementById('monitor_asc_season_subfolder').checked = true;
+            document.getElementById('monitor_asc_include_tmdb_id').checked = false;
+            document.getElementById('monitor_asc_delete_ad_files').checked = false;
+            document.getElementById('monitor_asc_preserve_file_info').checked = false;
+            document.getElementById('monitor_asc_file_name_mode').value = 'standard';
+            document.getElementById('monitor_asc_title_language').value = 'auto';
+            document.getElementById('monitor_asc_episode_mode').value = 'auto';
+            document.getElementById('monitor_asc_season').value = '1';
+            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
+                input.checked = true;
+            });
+            syncMonitorAutoScrapeOptions();
+        }
+
         function currentMonitorFormData() {
             const rawScanPath = document.getElementById('monitor_scan_path').value.trim();
             return {
@@ -3581,6 +3646,8 @@
                 skip_by_dir_mtime: document.getElementById('monitor_skip_by_dir_mtime').checked,
                 strm_write_mode: document.getElementById('monitor_strm_write_mode')?.value || 'incremental',
                 sync_clean: document.getElementById('monitor_sync_clean').checked,
+                auto_scrape_on_new: document.getElementById('monitor_auto_scrape_on_new').checked,
+                auto_scrape_options: collectMonitorAutoScrapeOptions(),
                 incremental: !document.getElementById('monitor_sync_clean').checked,
                 retries: parseInt(document.getElementById('monitor_retries').value || '3', 10) || 3,
                 list_delay_ms: document.getElementById('monitor_list_delay_ms').value === ''
@@ -3853,6 +3920,8 @@
             document.getElementById('monitor_skip_by_dir_mtime').checked = false;
             document.getElementById('monitor_strm_write_mode').value = 'incremental';
             document.getElementById('monitor_sync_clean').checked = true;
+            document.getElementById('monitor_auto_scrape_on_new').checked = false;
+            resetMonitorAutoScrapeOptions();
             document.getElementById('monitor_retries').value = 3;
             document.getElementById('monitor_list_delay_ms').value = 250;
             document.getElementById('monitor_min_file_size_mb').value = 0;
@@ -3869,6 +3938,59 @@
         function closeMonitorModal() {
             hideLockedModal('monitor-modal');
         }
+
+        async function openMonitorManualRequired(taskName) {
+            const modal = document.getElementById('monitor-manual-required-modal');
+            const listEl = document.getElementById('monitor-manual-required-list');
+            if (!modal || !listEl) return;
+            modal.dataset.taskName = String(taskName || '').trim();
+            listEl.innerHTML = '<div class="text-slate-500 text-sm">加载中...</div>';
+            showLockedModal('monitor-manual-required-modal');
+            try {
+                const data = await window.MediaHubApi.getJson(`/monitor/manual-required?task_name=${encodeURIComponent(taskName || '')}`);
+                const items = Array.isArray(data.items) ? data.items : [];
+                if (!items.length) {
+                    listEl.innerHTML = '<div class="text-slate-400 text-sm">当前没有需手动监控的路径（可能已被扫描清除）。</div>';
+                } else {
+                    const OPERATION_LABELS = { copy: '复制', move: '移动', rename: '重命名', delete: '删除', create: '新建' };
+                    listEl.innerHTML = items.map((item, index) => {
+                        const opLabel = OPERATION_LABELS[item.operation] || item.operation || '变更';
+                        const oldPath = String(item.old_path || '').trim();
+                        const newPath = String(item.remote_path || item.new_path || '').trim();
+                        const pathLine = oldPath && newPath && oldPath !== newPath
+                            ? `${escapeHtml(oldPath)} → ${escapeHtml(newPath)}`
+                            : escapeHtml(newPath || oldPath || '--');
+                        return `
+                            <div class="py-2 px-1 border-b border-slate-800 last:border-0">
+                                <div class="flex items-center gap-2 text-xs text-slate-400">
+                                    <span class="rounded bg-amber-500/15 text-amber-300 px-1.5 py-0.5 font-bold">#${escapeHtml(String(item.event_id || ''))}</span>
+                                    <span>${escapeHtml(opLabel)}</span>
+                                    ${item.created_at ? `<span>· ${escapeHtml(String(item.created_at))}</span>` : ''}
+                                </div>
+                                <div class="font-semibold text-slate-200 mt-1 break-all">${index + 1}. ${pathLine}</div>
+                                <div class="text-xs text-slate-500 mt-1">该目录变更时内容清单未确认；重新扫描该任务后会自动补齐 STRM 并清除此提示。</div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+            } catch (error) {
+                listEl.innerHTML = `<div class="text-red-400 text-sm">加载失败：${escapeHtml(error.message || '未知错误')}</div>`;
+            }
+        }
+
+        function closeMonitorManualRequired() {
+            hideLockedModal('monitor-manual-required-modal');
+        }
+
+        async function rescanMonitorManualRequired() {
+            const taskName = String(document.getElementById('monitor-manual-required-modal')?.dataset.taskName || '').trim();
+            closeMonitorManualRequired();
+            if (taskName) await startMonitorTask(taskName);
+        }
+
+        window.openMonitorManualRequired = openMonitorManualRequired;
+        window.closeMonitorManualRequired = closeMonitorManualRequired;
+        window.rescanMonitorManualRequired = rescanMonitorManualRequired;
 
         function refreshWebhookHint() {
             const name = document.getElementById('monitor_name').value.trim() || '任务名';
@@ -3937,6 +4059,8 @@
             document.getElementById('monitor_sync_clean').checked = Object.prototype.hasOwnProperty.call(task, 'sync_clean')
                 ? !!task.sync_clean
                 : !task.incremental;
+            document.getElementById('monitor_auto_scrape_on_new').checked = !!task.auto_scrape_on_new;
+            applyMonitorAutoScrapeOptions(task.auto_scrape_options);
             document.getElementById('monitor_retries').value = task.retries ?? 3;
             document.getElementById('monitor_list_delay_ms').value = task.list_delay_ms ?? 250;
             document.getElementById('monitor_min_file_size_mb').value = task.min_file_size_mb ?? 0;
@@ -4098,9 +4222,13 @@
                 const pendingChanges = Math.max(0, Number(changeCount.pending || 0) || 0);
                 const failedChanges = Math.max(0, Number(changeCount.failed || 0) || 0);
                 const manualRequiredChanges = Math.max(0, Number(changeCount.manual_required || 0) || 0);
+                const manualRequiredTaskArg = String(taskName || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+                const manualRequiredLabel = manualRequiredChanges
+                    ? `<button type="button" class="monitor-manual-required-link" onclick="openMonitorManualRequired('${escapeHtml(manualRequiredTaskArg)}')">需手动监控 ${manualRequiredChanges}</button>`
+                    : '';
                 const changeLabels = [
                     pendingChanges ? `待同步 ${pendingChanges}` : '',
-                    manualRequiredChanges ? `需手动监控 ${manualRequiredChanges}` : '',
+                    manualRequiredLabel,
                     failedChanges ? `同步失败 ${failedChanges}` : '',
                 ].filter(Boolean);
                 const changeCountHtml = changeLabels.length
