@@ -1306,15 +1306,17 @@ async def _run_subscription_task_quark(
                 {max(0, int(item or 0)) for item in scan_episodes if max(0, int(item or 0)) > 0},
                 episode_upper_bound=single_season_episode_upper_bound,
             )
-            existing_episode_scan_ready = True
+            scan_failed_dirs = int(scan_result.get("failed_dirs", 0) or 0)
+            scan_truncated = bool(scan_result.get("truncated", False))
+            existing_episode_scan_ready = (scan_failed_dirs <= 0) and (not scan_truncated)
             existing_episode_scan_stats = {
-                "existing_episode_scan_ready": True,
+                "existing_episode_scan_ready": existing_episode_scan_ready,
                 "existing_episode_count": len(existing_folder_episodes),
                 "existing_episode_max": max(existing_folder_episodes) if existing_folder_episodes else 0,
                 "existing_episode_scanned_dirs": int(scan_result.get("scanned_dirs", 0) or 0),
                 "existing_episode_scanned_entries": int(scan_result.get("scanned_entries", 0) or 0),
-                "existing_episode_failed_dirs": int(scan_result.get("failed_dirs", 0) or 0),
-                "existing_episode_scan_truncated": bool(scan_result.get("truncated", False)),
+                "existing_episode_failed_dirs": scan_failed_dirs,
+                "existing_episode_scan_truncated": scan_truncated,
             }
             if existing_folder_episodes:
                 await write_subscription_log(
@@ -1624,7 +1626,7 @@ async def _run_subscription_task_quark(
                 if episode_upper >= start_episode:
                     precise_missing_episode_values = set(range(start_episode, episode_upper + 1))
 
-            if existing_episode_scan_ready and precise_missing_episode_values:
+            if existing_folder_episodes and precise_missing_episode_values:
                 precise_missing_episode_values = {
                     episode_no
                     for episode_no in precise_missing_episode_values
@@ -2078,7 +2080,10 @@ async def _run_subscription_task_quark(
                 )
                 if verify_scan_episodes:
                     existing_folder_episodes.update(verify_scan_episodes)
-                    existing_episode_scan_stats["existing_episode_scan_ready"] = True
+                    existing_episode_scan_stats["existing_episode_scan_ready"] = (
+                        int(verify_scan_result.get("failed_dirs", 0) or 0) <= 0
+                        and not bool(verify_scan_result.get("truncated", False))
+                    )
                     existing_episode_scan_stats["existing_episode_count"] = len(existing_folder_episodes)
                     existing_episode_scan_stats["existing_episode_max"] = (
                         max(existing_folder_episodes) if existing_folder_episodes else 0
