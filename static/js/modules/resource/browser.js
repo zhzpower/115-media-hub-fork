@@ -179,6 +179,9 @@
                 const directSelected = !!ctx.resourceShareSelected[normalized.id];
                 const coveredByAncestor = !directSelected ? ctx.getResourceShareCoveredAncestor(normalized) : null;
                 const effectiveSelected = directSelected || !!coveredByAncestor;
+                const modifiedText = manager?.formatModified
+                    ? manager.formatModified(getEntryModified(entry))
+                    : String(getEntryModified(entry) || '--');
                 return `
                     <div class="resource-browser-row">
                         <div class="resource-browser-name-cell">
@@ -200,6 +203,7 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="file-manager-cell--modified">${ctx.escapeHtml(modifiedText)}</div>
                         <div class="resource-browser-col-size">${normalized.is_dir ? '--' : ctx.escapeHtml(ctx.formatFileSizeText(entry?.size || 0))}</div>
                     </div>
                 `;
@@ -218,7 +222,7 @@
             });
         });
         const columns = buildManagerColumns(ctx, {
-            showModified: false,
+            showModified: true,
             showSize: true,
             linkFolders: true,
             openActionPrefix: 'resource-share',
@@ -237,7 +241,7 @@
         return manager.renderRows(normalizedEntries, columns, {
             emptyText: '这个目录下暂时没有可转存的内容。',
             rowClass: 'resource-browser-row',
-            rowAttrs: 'style="--file-manager-columns:minmax(0, 1fr) 96px;--file-manager-min-width:520px"',
+            rowAttrs: 'style="--file-manager-columns:minmax(0, 1fr) 142px 96px;--file-manager-min-width:640px"',
         });
     }
 
@@ -419,6 +423,8 @@
             const fileCount = Number(ctx.resourceFolderSummary?.file_count || 0);
             if (ctx.resourceFolderEntriesComplete) {
                 summary.innerText = `当前目录下共有 ${folderCount} 个文件夹 / ${fileCount} 个文件。`;
+            } else if (ctx.resourceFolderHasMore) {
+                summary.innerText = `已加载 ${folderCount} 个文件夹，可点击“加载更多文件夹”继续浏览。`;
             } else if (fileCount > 0) {
                 summary.innerText = `当前目录下共有 ${folderCount} 个文件夹 / ${fileCount} 个文件，默认优先加载文件夹以提升打开速度。`;
             } else {
@@ -453,6 +459,13 @@
                     minWidth: '560px',
                     emptyText: '当前目录没有子文件夹。',
                 }));
+            }
+            if (ctx.resourceFolderHasMore) {
+                lines.push(
+                    `<div class="resource-browser-load-more-row">` +
+                    `<button type="button" data-resource-folder-action="load-more-folders" class="resource-browser-load-more-btn ${ctx.resourceFolderLoadingMore ? 'btn-disabled' : ''}" ${ctx.resourceFolderLoadingMore ? 'disabled' : ''}>${ctx.resourceFolderLoadingMore ? '加载中...' : '加载更多文件夹'}</button>` +
+                    `</div>`
+                );
             }
             const fileCount = Number(ctx.resourceFolderSummary?.file_count || 0);
             if (ctx.resourceFolderFilesLoading) {

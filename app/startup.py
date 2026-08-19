@@ -12,9 +12,16 @@ from .services.monitor_changes import (
     recover_monitor_change_events,
     queue_ready_monitor_change_tasks,
 )
-from .services.resource import schedule_resource_job_refresh
+from .services.resource import (
+    is_resource_offline_link_type,
+    offline_completion_watcher,
+    pending_offline_job_counts_by_monitor,
+    poll_offline_resource_jobs_once,
+    schedule_resource_job_refresh,
+)
 from .services.sign115 import refresh_sign115_status, run_sign115_job
 from .services.subscription import queue_subscription_job
+from .services.scraper import requeue_scraper_jobs_on_startup
 
 
 MEMORY_HOUSEKEEPING_INTERVAL_SECONDS = max(
@@ -68,12 +75,19 @@ async def startup() -> None:
     # Reconcile mutations left between the remote operation and local STRM
     # processing before normal schedulers start issuing scans.
     recover_monitor_change_events(cfg=get_config())
+    try:
+        requeue_scraper_jobs_on_startup()
+    except Exception:
+        logging.exception("Failed to requeue scraper jobs on startup")
     os.makedirs(LOG_DIR, exist_ok=True)
     restore_runtime_logs_from_files()
 
     for job in list_resource_jobs(limit=200):
         if job.get("status") == "submitted" and job.get("auto_refresh") and not str(job.get("last_triggered_at", "")).strip():
-            submit_background(schedule_resource_job_refresh, int(job["id"]), label="resource-refresh-recover")
+            if is_resource_offline_link_type(job.get("link_type", "")):
+                submit_background(poll_offline_resource_jobs_once, label="offline-watch-recover")
+            else:
+                submit_background(schedule_resource_job_refresh, int(job["id"]), label="resource-refresh-recover")
     submit_background(refresh_sign115_status, force_remote=False, trigger="startup", label="sign115-startup-status")
 
     async def monitor_scheduler() -> None:
@@ -84,6 +98,12 @@ async def startup() -> None:
             prev_next_runs = dict(monitor_next_run)
             tasks = cfg.get("monitor_tasks", [])
             active_names = {task.get("name", "") for task in tasks if task.get("name")}
+            has_cron_task = any(
+                int(task.get("cron_minutes", 0) or 0) > 0 for task in tasks if task.get("name")
+            )
+            pending_offline_counts = (
+                pending_offline_job_counts_by_monitor() if has_cron_task else {}
+            )
 
             for dead_name in list(monitor_last_run.keys()):
                 if dead_name not in active_names:
@@ -104,7 +124,18 @@ async def startup() -> None:
                 next_ts = monitor_last_run[name] + (cron_minutes * 60)
                 monitor_next_run[name] = datetime.fromtimestamp(next_ts).strftime("%H:%M:%S")
                 if now >= next_ts:
-                    queue_monitor_job(name, "cron")
+                    if pending_offline_counts.get(name, 0) > 0:
+                        monitor_last_run[name] = now
+                        monitor_next_run[name] = datetime.fromtimestamp(
+                            now + (cron_minutes * 60)
+                        ).strftime("%H:%M:%S")
+                        await write_monitor_log(
+                            f"存在 {pending_offline_counts[name]} 个未完成的 115 离线导入任务，"
+                            "本次定时扫描顺延至下载完成后自动触发",
+                            "warn",
+                        )
+                    else:
+                        queue_monitor_job(name, "cron")
             queue_ready_monitor_change_tasks(cfg=cfg)
             if monitor_next_run != prev_next_runs:
                 schedule_ui_state_push(0)
@@ -217,6 +248,7 @@ async def startup() -> None:
             await asyncio.sleep(RESOURCE_JOB_PRUNE_INTERVAL_SECONDS)
 
     asyncio.create_task(monitor_scheduler())
+    asyncio.create_task(offline_completion_watcher())
     asyncio.create_task(subscription_scheduler())
     asyncio.create_task(sign115_scheduler())
     asyncio.create_task(memory_housekeeper())
