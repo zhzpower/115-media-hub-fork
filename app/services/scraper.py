@@ -358,7 +358,7 @@ def _extract_copy_destination_cids(
     return updates
 
 
-SCRAPER_JOB_LIMIT_DEFAULT = 20
+SCRAPER_JOB_LIMIT_DEFAULT = 10
 SCRAPER_SCAN_MAX_DIRS = 80
 SCRAPER_SCAN_MAX_ENTRIES = 1200
 SCRAPER_BATCH_RENAME_CHUNK_SIZE = 100
@@ -2170,6 +2170,12 @@ def _build_scraper_target_path(
             )
         if not season_folder_allowed:
             return normalize_relative_path(join_relative_path(organize_root, file_name)), ""
+        source_parent_is_season = bool(source_relative_parent_path) and is_subscription_season_folder_name(
+            os.path.basename(source_relative_parent_path.replace("\\", "/"))
+        )
+        if organize_inside_source_folder and source_parent_is_season:
+            # 文件已在源目录的 Season 子目录内：原地重命名，不再嵌套一层 Season。
+            return normalize_relative_path(join_relative_path(organize_root, file_name)), ""
         return normalize_relative_path(join_relative_path(organize_root, f"Season {season_no:02d}", file_name)), ""
     if keep_original_name:
         file_name = (
@@ -2536,6 +2542,19 @@ def build_scraper_rename_plan(
     plan_options["base_path"] = base_path
     plan_options["organize_into_media_folder"] = folder_mode
     plan_options["preserve_source_parent_path"] = not folder_mode
+    # 选中的本身就是 Season 子目录时，不重命名目录（避免把 Season 01 改成片名），文件原地整理。
+    selected_folder_names = [
+        str(item.get("name", "") or "")
+        for item in selected
+        if isinstance(item, dict) and bool(item.get("is_dir", False))
+    ]
+    selected_season_folder = bool(
+        folder_mode
+        and len(selected_folder_names) == 1
+        and is_subscription_season_folder_name(selected_folder_names[0])
+    )
+    if selected_season_folder:
+        plan_options["rename_selected_folders"] = False
     # 文件夹条目不重命名文件夹时，文件仍整理在源文件夹内部，避免留下空的旧文件夹。
     plan_options["organize_inside_source_folder"] = bool(
         folder_mode and not bool(plan_options.get("rename_selected_folders", True))
@@ -3031,19 +3050,45 @@ def _serialize_scraper_job_row(row: Any, actions: Optional[List[Dict[str, Any]]]
     }
 
 
-def get_scraper_jobs_state(limit: int = SCRAPER_JOB_LIMIT_DEFAULT, job_id: int = 0) -> Dict[str, Any]:
+def get_scraper_jobs_state(
+    limit: int = SCRAPER_JOB_LIMIT_DEFAULT,
+    job_id: int = 0,
+    page: int = 1,
+    status_filter: str = "",
+) -> Dict[str, Any]:
     ensure_db()
+    page_size = max(1, min(int(limit or SCRAPER_JOB_LIMIT_DEFAULT), 100))
+    page_number = max(1, int(page or 1))
+    normalized_filter = str(status_filter or "all").strip().lower()
+    filter_sql = "1 = 1"
+    filter_params: Tuple[Any, ...] = ()
+    if normalized_filter == "active":
+        filter_sql = "status IN ('pending', 'running', 'rollback_running')"
+    elif normalized_filter == "completed":
+        filter_sql = "status = 'completed'"
+    elif normalized_filter == "failed":
+        filter_sql = "status IN ('failed', 'partial', 'rollback_failed')"
+    elif normalized_filter == "rollback":
+        filter_sql = "status = 'rolled_back'"
+    else:
+        normalized_filter = "all"
     with db_connection() as conn:
         cursor = conn.cursor()
         if job_id > 0:
             cursor.execute("SELECT * FROM scraper_jobs WHERE id = ?", (int(job_id),))
             rows = cursor.fetchall()
         else:
+            cursor.execute(f"SELECT COUNT(1) AS count FROM scraper_jobs WHERE {filter_sql}", filter_params)
+            total = int((cursor.fetchone() or {"count": 0})["count"] or 0)
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page_number = min(page_number, total_pages)
             cursor.execute(
-                "SELECT * FROM scraper_jobs ORDER BY id DESC LIMIT ?",
-                (max(1, min(100, int(limit or SCRAPER_JOB_LIMIT_DEFAULT))),),
+                f"SELECT * FROM scraper_jobs WHERE {filter_sql} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (*filter_params, page_size, (page_number - 1) * page_size),
             )
             rows = cursor.fetchall()
+        if job_id > 0:
+            total = len(rows)
         job_ids = [int(row["id"] or 0) for row in rows]
         actions_by_job: Dict[int, List[Dict[str, Any]]] = {jid: [] for jid in job_ids}
         if job_ids:
@@ -3074,6 +3119,15 @@ def get_scraper_jobs_state(limit: int = SCRAPER_JOB_LIMIT_DEFAULT, job_id: int =
         "jobs": jobs,
         "active_jobs": [item for item in jobs if str(item.get("status", "") or "") in SCRAPER_JOB_ACTIVE_STATUSES],
         "job_counts": counts,
+        "pagination": {
+            "status": normalized_filter,
+            "page": page_number,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "has_prev": page_number > 1,
+            "has_next": page_number < max(1, (total + page_size - 1) // page_size),
+        },
     }
 
 

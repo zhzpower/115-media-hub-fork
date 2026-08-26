@@ -149,7 +149,7 @@
         let resourceJobLoadError = '';
         let resourceJobCalibrationPending = false;
         let taskCenterTab = 'resource';
-        let scraperJobState = { jobs: [], job_counts: {}, active_jobs: [] };
+        let scraperJobState = { jobs: [], job_counts: {}, active_jobs: [], pagination: {} };
         let scraperJobFilter = 'all';
         let scraperJobExpanded = new Set();
         let scraperJobLoading = false;
@@ -328,8 +328,8 @@
         const RESOURCE_FOLDER_PAGE_LIMIT = 300;
         const RESOURCE_SHARE_BRANCH_CACHE_TTL_MS = 1000 * 60 * 10;
         const RESOURCE_SHARE_BROWSE_PAGE_LIMIT = 40;
-        const RESOURCE_JOB_PAGE_SIZE = 20;
-        const RESOURCE_JOB_PAGE_MAX_SIZE = 25000;
+        const RESOURCE_JOB_PAGE_SIZE = 10;
+        const RESOURCE_JOB_PAGE_MAX_SIZE = 100;
         const SUBSCRIPTION_WEEKDAY_LABELS = {
             1: '周一',
             2: '周二',
@@ -1230,6 +1230,17 @@
 
         function decorateSummaryMetric(segment) {
             const raw = String(segment || '').trim();
+            const parenMatch = raw.match(/^(.*?)\s*（(.*)）$/);
+            if (parenMatch) {
+                const head = decorateSummaryMetric(parenMatch[1]);
+                const inner = String(parenMatch[2] || '')
+                    .split(/[/，]/)
+                    .map(part => String(part || '').trim())
+                    .filter(Boolean)
+                    .map(decorateSummaryMetric)
+                    .join('<span class="text-slate-500"> / </span>');
+                return `${head}<span class="text-slate-400">（</span>${inner}<span class="text-slate-400">）</span>`;
+            }
             const match = raw.match(/^(.*?)(\d+)$/);
             if (!match) return escapeHtml(raw);
 
@@ -1248,7 +1259,19 @@
                 '删除 STRM': 'summary-delete',
                 '删除空目录': 'summary-delete',
                 '删除失败': 'summary-fail',
-                '索引清理': 'summary-delete'
+                '索引清理': 'summary-delete',
+                '事件': 'summary-info',
+                '完成': 'summary-positive',
+                '失败': 'summary-fail',
+                '生成': 'summary-positive',
+                '删除': 'summary-delete',
+                '生成 STRM': 'summary-positive',
+                '删除 STRM': 'summary-delete',
+                '局部读取目录': 'summary-info',
+                '文件': 'summary-info',
+                '需手动监控': 'summary-fail',
+                '需补扫': 'summary-fail',
+                '丢弃': 'summary-skip'
             };
             const colorClass = classMap[label];
             if (!colorClass) return escapeHtml(raw);
@@ -1259,17 +1282,19 @@
 
         function decorateMonitorSummaryText(text) {
             const raw = String(text || '');
-            const match = raw.match(/^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+)?(生成汇总:|清理汇总:)\s*(.*)$/);
+            const match = raw.match(/^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+)?(生成汇总:|清理汇总:|首层汇总:|变更同步汇总:)\s*(.*)$/);
             if (!match) return escapeHtml(raw);
 
             const timestamp = escapeHtml(match[1] || '');
             const prefix = escapeHtml(match[2]);
             const metrics = String(match[3] || '')
-                .split(' | ')
+                .split(/[|，]/)
+                .map(part => String(part || '').trim())
+                .filter(Boolean)
                 .map(decorateSummaryMetric)
                 .join('<span class="text-slate-500"> | </span>');
 
-            return `${timestamp}${prefix} ${metrics}`;
+            return `<span class="text-slate-400">${timestamp}${prefix} </span>${metrics}`;
         }
 
         function parseTaskDividerText(text) {
@@ -1319,7 +1344,7 @@
             const level = item?.level || 'info';
             const text = String(item?.text || '');
             if (level === 'task-divider') return formatMonitorTaskDividerHtml(text);
-            if (level === 'info' && (text.includes('生成汇总:') || text.includes('清理汇总:'))) {
+            if (text.includes('生成汇总:') || text.includes('清理汇总:') || text.includes('首层汇总:') || text.includes('变更同步汇总:')) {
                 return decorateMonitorSummaryText(text);
             }
             return escapeHtml(text);
@@ -1896,17 +1921,20 @@
                 addWhenMatched: isResourceJobActiveStatus(job?.status || ''),
             });
             const selectedChanged = selectedResourceItem && Number(selectedResourceItem?.id || 0) === resourceId;
+            const pageSize = Math.max(1, Number(resourceState?.job_pagination?.page_size || 10) || 10);
+            const nextPageJobs = nextJobsResult.jobs.slice(0, pageSize);
             const changed = nextItems !== currentItems
                 || nextChannelSections !== currentChannelSections
                 || nextSearchSections !== currentSearchSections
                 || nextJobsResult.changed
+                || nextPageJobs.length !== nextJobsResult.jobs.length
                 || nextActiveJobsResult.changed
                 || selectedChanged;
             if (!changed) return false;
             resourceState = {
                 ...resourceState,
                 items: nextItems,
-                jobs: nextJobsResult.jobs,
+                jobs: nextPageJobs,
                 active_jobs: nextActiveJobsResult.jobs,
                 channel_sections: nextChannelSections,
                 search_sections: nextSearchSections,
