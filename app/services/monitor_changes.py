@@ -27,12 +27,23 @@ from ..runtime_files import (
 from .strm_files import delete_managed_strm_file, managed_strm_file_path, remove_empty_parent_dirs
 
 
-MONITOR_CHANGE_MAX_RETRIES = 5
+MONITOR_CHANGE_MAX_RETRIES = 3
 MONITOR_CHANGE_RETRY_BASE_SECONDS = 5
 MONITOR_CHANGE_COMPLETED_RETENTION_DAYS = 30
 # Increment when a deployed handler changes how an event is interpreted.  A
 # maxed-out event from an older handler gets one fresh attempt after startup.
 MONITOR_CHANGE_HANDLER_REVISION = 1
+
+_DISCARDABLE_MONITOR_CHANGE_ERROR_PREFIXES = (
+    "精准同步索引清单路径无效或越界",
+    "精准同步索引清单格式无效",
+    "精准同步索引清单条目无效",
+    "精准同步索引清单目标路径无效或越界",
+    "精准同步旧路径无效或不完整",
+    "精准同步新路径无效或不完整",
+    "精准同步路径不完整，已保留旧 STRM",
+    "监控任务不存在",
+)
 
 _CHANGE_OPERATIONS = {"create", "copy", "move", "rename", "delete"}
 _CHANGE_OPERATION_ALIASES = {
@@ -1469,6 +1480,96 @@ def _build_committed_change_detail(
     return {"kind": "file", "changes": changes} if changes else {}
 
 
+def _event_added_media_items(
+    cfg: Dict[str, Any],
+    task: Dict[str, Any],
+    plan: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """收集变更同步实际新增的媒体文件，供自动刮削复用（不要求真实 fid，路径占位即可）。"""
+    if not plan.get("add_new"):
+        return []
+    if not bool(task.get("auto_scrape_on_new", False)):
+        return []
+    if bool(plan.get("is_dir", False)):
+        sources = plan.get("indexed_files", [])
+    else:
+        provider_path = str(plan.get("new_path", "") or "")
+        sources = (
+            [
+                {
+                    "target_path": provider_path,
+                    "size": _nonnegative_int(plan.get("size", 0)),
+                }
+            ]
+            if provider_path
+            else []
+        )
+    items: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for source in sources if isinstance(sources, list) else []:
+        provider_path = str(source.get("target_path", "") or "")
+        if not provider_path:
+            continue
+        context = _task_path_context(cfg, task, provider_path)
+        if not context:
+            continue
+        remote_rel = str(context.get("remote_rel_path", "") or "")
+        if not remote_rel or remote_rel in seen:
+            continue
+        seen.add(remote_rel)
+        items.append(
+            {
+                "fid": provider_path,
+                "name": os.path.basename(provider_path.replace("\\", "/")),
+                "size": _nonnegative_int(source.get("size", 0)),
+                "remote_rel": remote_rel,
+            }
+        )
+    return items
+
+
+def _event_strm_path_effects(
+    cfg: Dict[str, Any],
+    task: Dict[str, Any],
+    plan: Dict[str, Any],
+    *,
+    effective_plan: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[str], List[str]]:
+    """返回事件删除/生成的 STRM 本地路径列表，供批次内按净效果统计。"""
+    active_plan = effective_plan if isinstance(effective_plan, dict) and effective_plan else plan
+    deleted_paths: List[str] = []
+    generated_paths: List[str] = []
+    if plan.get("remove_old"):
+        if plan.get("is_dir"):
+            for item in plan.get("indexed_files", []) if isinstance(plan.get("indexed_files"), list) else []:
+                context = _task_path_context(cfg, task, str(item.get("source_path", "") or ""))
+                local = str((context or {}).get("local_rel_path", "") or "")
+                if local:
+                    deleted_paths.append(local)
+        else:
+            old_context = plan.get("old_context") if isinstance(plan.get("old_context"), dict) else {}
+            local = str(old_context.get("local_rel_path", "") or "")
+            if local:
+                deleted_paths.append(local)
+    if active_plan.get("add_new"):
+        if active_plan.get("is_dir"):
+            for item in (
+                active_plan.get("indexed_files", [])
+                if isinstance(active_plan.get("indexed_files"), list)
+                else []
+            ):
+                context = _task_path_context(cfg, task, str(item.get("target_path", "") or ""))
+                local = str((context or {}).get("local_rel_path", "") or "")
+                if local:
+                    generated_paths.append(local)
+        else:
+            new_context = active_plan.get("new_context") if isinstance(active_plan.get("new_context"), dict) else {}
+            local = str(new_context.get("local_rel_path", "") or "")
+            if local:
+                generated_paths.append(local)
+    return deleted_paths, generated_paths
+
+
 async def _apply_precise_event(
     conn: Any,
     cfg: Dict[str, Any],
@@ -1524,6 +1625,17 @@ async def _apply_precise_event(
 
     _sync_event_baselines(conn, cfg, task, plan)
     stats["change_detail"] = _build_committed_change_detail(plan, stats)
+    stats["new_media_items"] = (
+        _event_added_media_items(cfg, task, plan)
+        if int(stats.get("generated", 0) or 0) > 0
+        else []
+    )
+    stats["manual_required_path"] = (
+        str(plan.get("new_path", "") or "")
+        if int(stats.get("manual_required", 0) or 0) > 0
+        else ""
+    )
+    stats["deleted_paths"], stats["generated_paths"] = _event_strm_path_effects(cfg, task, plan)
     return stats
 
 
@@ -1707,6 +1819,22 @@ async def _reconcile_event(
         stats,
         effective_new_context=add_context,
     )
+    stats["new_media_items"] = (
+        _event_added_media_items(cfg, task, effective_plan)
+        if int(stats.get("generated", 0) or 0) > 0
+        else []
+    )
+    stats["manual_required_path"] = (
+        str(effective_plan.get("new_path", "") or plan.get("new_path", "") or "")
+        if int(stats.get("manual_required", 0) or 0) > 0
+        else ""
+    )
+    stats["deleted_paths"], stats["generated_paths"] = _event_strm_path_effects(
+        cfg,
+        task,
+        plan,
+        effective_plan=effective_plan,
+    )
     return stats
 
 
@@ -1741,6 +1869,11 @@ def _is_one_shot_scraper_sync(event: Dict[str, Any]) -> bool:
     )
 
 
+def _is_discardable_monitor_change_error(error: Any) -> bool:
+    message = str(error or "").strip()
+    return any(message.startswith(prefix) for prefix in _DISCARDABLE_MONITOR_CHANGE_ERROR_PREFIXES)
+
+
 async def process_monitor_change_events(
     task_name: str = "",
     *,
@@ -1758,9 +1891,13 @@ async def process_monitor_change_events(
         "directory_count": 0,
         "file_count": 0,
         "manual_required": 0,
+        "discarded": 0,
         "errors": [],
         "change_details": [],
+        "new_media_items": [],
+        "manual_required_paths": [],
     }
+    strm_state: Dict[str, str] = {}
     with db_connection() as conn:
         events = _load_ready_events(conn, task_name=task_name, event_ids=event_ids)
         for event in events:
@@ -1820,8 +1957,42 @@ async def process_monitor_change_events(
                 change_detail = stats.get("change_detail")
                 if isinstance(change_detail, dict) and change_detail:
                     result["change_details"].append(change_detail)
-                for key in ("generated", "skipped", "deleted", "directory_count", "file_count", "manual_required"):
-                    result[key] += int(stats.get(key, 0) or 0)
+                result["skipped"] += int(stats.get("skipped", 0) or 0)
+                result["directory_count"] += int(stats.get("directory_count", 0) or 0)
+                result["file_count"] += int(stats.get("file_count", 0) or 0)
+                result["manual_required"] += int(stats.get("manual_required", 0) or 0)
+                for path in (
+                    stats.get("deleted_paths", [])
+                    if isinstance(stats.get("deleted_paths"), list)
+                    else []
+                ):
+                    if strm_state.get(path) == "generated":
+                        # 批次内先生成又被删除的中间态 STRM：相互抵消，不计入净删除/生成。
+                        del strm_state[path]
+                        result["generated"] -= 1
+                    else:
+                        strm_state[path] = "deleted"
+                        result["deleted"] += 1
+                for path in (
+                    stats.get("generated_paths", [])
+                    if isinstance(stats.get("generated_paths"), list)
+                    else []
+                ):
+                    if strm_state.get(path) == "deleted":
+                        del strm_state[path]
+                        result["deleted"] -= 1
+                    else:
+                        strm_state[path] = "generated"
+                        result["generated"] += 1
+                event_new = stats.get("new_media_items", [])
+                if (
+                    isinstance(event_new, list)
+                    and not str(event.get("source_action", "") or "").strip().startswith("scraper-job:")
+                ):
+                    result["new_media_items"].extend(event_new)
+                manual_path = str(stats.get("manual_required_path", "") or "").strip()
+                if manual_path and manual_path not in result["manual_required_paths"]:
+                    result["manual_required_paths"].append(manual_path)
             except Exception as exc:
                 conn.rollback()
                 restore_errors = _restore_strm_file_states(file_journal)
@@ -1829,8 +2000,19 @@ async def process_monitor_change_events(
                 if restore_errors:
                     error_text = f"{error_text}; STRM 回滚失败: {'; '.join(restore_errors)}"
                 retryable = not _is_one_shot_scraper_sync(event)
-                if retryable:
-                    retry_count = max(0, int(event.get("retry_count", 0) or 0)) + 1
+                retry_count = max(0, int(event.get("retry_count", 0) or 0)) + 1
+                discard = (
+                    not restore_errors
+                    and (
+                        not retryable
+                        or _is_discardable_monitor_change_error(error_text)
+                        or retry_count >= MONITOR_CHANGE_MAX_RETRIES
+                    )
+                )
+                if discard:
+                    conn.execute("DELETE FROM monitor_change_events WHERE id = ?", (event_id,))
+                    result["discarded"] += 1
+                else:
                     backoff = min(3600, MONITOR_CHANGE_RETRY_BASE_SECONDS * (2 ** max(0, retry_count - 1)))
                     conn.execute(
                         """
@@ -1848,12 +2030,15 @@ async def process_monitor_change_events(
                             event_id,
                         ),
                     )
-                else:
-                    conn.execute("DELETE FROM monitor_change_events WHERE id = ?", (event_id,))
                 conn.commit()
-                result["failed"] += 1
+                if not discard:
+                    result["failed"] += 1
                 result["errors"].append(
-                    {"event_id": event_id, "error": error_text, "retryable": retryable}
+                    {
+                        "event_id": event_id,
+                        "error": error_text,
+                        "retryable": not discard,
+                    }
                 )
     return result
 
@@ -2014,6 +2199,19 @@ def recover_monitor_change_events(*, cfg: Optional[Dict[str, Any]] = None, enque
               AND source_action LIKE 'scraper-job:%'
             """
         )
+        discarded = 0
+        cursor.execute(
+            """
+            SELECT id, last_error
+            FROM monitor_change_events
+            WHERE status = 'failed' AND needs_reconcile = 0
+            """
+        )
+        for row in cursor.fetchall():
+            if not _is_discardable_monitor_change_error(row[1]):
+                continue
+            cursor.execute("DELETE FROM monitor_change_events WHERE id = ?", (int(row[0] or 0),))
+            discarded += max(0, int(cursor.rowcount or 0))
         cursor.execute(
             """
             SELECT id, status, operation, needs_reconcile, entry_snapshot_json
@@ -2104,7 +2302,12 @@ def recover_monitor_change_events(*, cfg: Optional[Dict[str, Any]] = None, enque
     deleted = cleanup_completed_monitor_change_events()
     if enqueue and task_names:
         _enqueue_task_names(task_names)
-    return {"recovered": recovered, "queued_tasks": sorted(set(task_names)), "deleted_completed": deleted}
+    return {
+        "recovered": recovered,
+        "discarded": discarded,
+        "queued_tasks": sorted(set(task_names)),
+        "deleted_completed": deleted,
+    }
 
 
 def queue_ready_monitor_change_tasks(*, cfg: Optional[Dict[str, Any]] = None) -> List[str]:

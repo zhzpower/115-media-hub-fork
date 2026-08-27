@@ -1,6 +1,20 @@
 const SCRAPER_JOB_ACTIVE_STATUSES = new Set(['pending', 'running', 'rollback_running']);
 const SCRAPER_ENTRY_PAGE_LIMIT = 300;
 
+function renderJobPageButtons(page, totalPages, maxVisible = 5) {
+    const currentPage = Math.max(1, Number(page || 1) || 1);
+    const lastPage = Math.max(1, Number(totalPages || 1) || 1);
+    const visibleCount = Math.max(1, Math.min(lastPage, Number(maxVisible || 5) || 5));
+    const halfWindow = Math.floor(visibleCount / 2);
+    const firstPage = Math.max(1, Math.min(lastPage, currentPage - halfWindow));
+    const endPage = Math.min(lastPage, firstPage + visibleCount - 1);
+    const startPage = Math.max(1, endPage - visibleCount + 1);
+    return Array.from({ length: endPage - startPage + 1 }, (_, index) => {
+        const pageNumber = startPage + index;
+        return `<button type="button" data-scraper-action="jobs-page-number" data-scraper-job-page="${pageNumber}" class="resource-job-page-button ${pageNumber === currentPage ? 'resource-job-page-button-active' : ''}" ${pageNumber === currentPage ? 'aria-current="page"' : ''}>${pageNumber}</button>`;
+    }).join('');
+}
+
 function getScraperProviderOptions() {
     const meta = window.providerMeta || [];
     return meta
@@ -66,6 +80,8 @@ const state = {
     planRequestSeq: 0,
     executeBusy: false,
     jobs: [],
+    jobsPage: 1,
+    jobsPagination: {},
     jobsBusy: false,
     jobsPollTimer: 0,
 };
@@ -1676,7 +1692,7 @@ function renderJobs() {
         list.innerHTML = '<div class="scraper-empty-row">暂无刮削任务记录。</div>';
         return;
     }
-    list.innerHTML = state.jobs.map((job) => {
+    const rowsHtml = state.jobs.map((job) => {
         const actions = Array.isArray(job.actions) ? job.actions : [];
         const actionPreview = actions.slice(0, 4).map(action => `
             <div class="scraper-job-action">
@@ -1705,6 +1721,22 @@ function renderJobs() {
             </div>
         `;
     }).join('');
+    const pagination = state.jobsPagination || {};
+    const total = Number(pagination.total || 0) || 0;
+    const totalPages = Math.max(1, Number(pagination.total_pages || 1) || 1);
+    const page = Math.max(1, Number(pagination.page || state.jobsPage || 1) || 1);
+    const paginationHtml = total > 0 ? `
+        <div class="resource-browser-load-more-row">
+            <div class="resource-job-pagination-controls">
+            <button type="button" data-scraper-action="jobs-page-prev" class="resource-browser-load-more-btn" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+            <div class="resource-job-pagination-pages resource-job-pagination-pages-desktop" aria-label="刮削任务页码">${renderJobPageButtons(page, totalPages, 5)}</div>
+            <div class="resource-job-pagination-pages resource-job-pagination-pages-mobile" aria-label="刮削任务页码">${renderJobPageButtons(page, totalPages, 3)}</div>
+            <button type="button" data-scraper-action="jobs-page-next" class="resource-browser-load-more-btn" ${page >= totalPages ? 'disabled' : ''}>下一页</button>
+            </div>
+            <span class="resource-job-pagination-label">共 ${escapeHtml(String(total))} 条</span>
+        </div>
+    ` : '';
+    list.innerHTML = `${rowsHtml}${paginationHtml}`;
 }
 
 function applyProvidersFromMeta() {
@@ -2892,6 +2924,7 @@ async function buildBatchPlan() {
         })),
     };
     state.batchPlanContext = requestPayload;
+    state.planOptionsSnapshot = JSON.stringify(requestPayload.options || {});
     try {
         const data = await window.MediaHubApi.postJson('/scraper/batch/plan', requestPayload);
         applyPlanResponse(data);
@@ -3020,6 +3053,7 @@ async function buildPlan() {
         showToast(error.message || '无法生成预览', { tone: 'warn', duration: 2400, placement: 'top-center' });
         return;
     }
+    state.planOptionsSnapshot = JSON.stringify(payload.options || {});
     showToast('正在识别文件并生成预览...', { tone: 'info', duration: 1800, placement: 'top-center' });
     try {
         const data = await requestPlan(payload, { resetPlan: true });
@@ -3099,6 +3133,12 @@ async function updateManualEpisode(actionIndex, { clear = false } = {}) {
 
 async function executePlan() {
     if (!state.plan) return;
+    const currentOptions = JSON.stringify(state.plan?.tmdb?.batch ? collectBatchOptions() : collectOptions());
+    if (state.planOptionsSnapshot && currentOptions !== state.planOptionsSnapshot) {
+        showToast('批量整理选项已变更，已按新选项重新生成预览，请确认后再次执行', { tone: 'warn', duration: 3200, placement: 'top-center' });
+        void buildPlan();
+        return;
+    }
     const selectedActions = (Array.isArray(state.plan.actions) ? state.plan.actions : [])
         .filter(action => action.ready && state.planSelections.has(Number(action.action_index || 0)));
     if (!selectedActions.length) {
@@ -3161,12 +3201,15 @@ async function executePlan() {
     }
 }
 
-async function refreshJobs() {
+async function refreshJobs({ page = state.jobsPage || 1 } = {}) {
     state.jobsBusy = true;
     renderJobs();
     try {
-        const data = await window.MediaHubApi.getJson('/scraper/jobs/state?limit=5');
+        const normalizedPage = Math.max(1, Number(page || 1) || 1);
+        const data = await window.MediaHubApi.getJson(`/scraper/jobs/state?page=${normalizedPage}&page_size=10&status=all`);
         state.jobs = Array.isArray(data.jobs) ? data.jobs : [];
+        state.jobsPage = normalizedPage;
+        state.jobsPagination = data.pagination && typeof data.pagination === 'object' ? data.pagination : {};
     } catch (error) {
         showToast(`读取任务记录失败：${error.message || '未知错误'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
     } finally {
@@ -3228,7 +3271,7 @@ function hasActiveJobs() {
 function scheduleJobsPoll() {
     if (state.jobsPollTimer) return;
     state.jobsPollTimer = window.setInterval(async () => {
-        await refreshJobs();
+        await refreshJobs({ page: 1 });
         if (!hasActiveJobs()) {
             window.clearInterval(state.jobsPollTimer);
             state.jobsPollTimer = 0;
@@ -3382,6 +3425,16 @@ function handleClick(event) {
     const rollbackButton = event.target.closest('[data-scraper-rollback-job]');
     if (rollbackButton) {
         void rollbackJob(rollbackButton.dataset.scraperRollbackJob);
+        return;
+    }
+    const jobsPageButton = event.target.closest('[data-scraper-action="jobs-page-prev"], [data-scraper-action="jobs-page-next"], [data-scraper-action="jobs-page-number"]');
+    if (jobsPageButton) {
+        const currentPage = Number(state.jobsPagination?.page || state.jobsPage || 1) || 1;
+        const action = jobsPageButton.dataset.scraperAction;
+        const targetPage = action === 'jobs-page-number'
+            ? Number(jobsPageButton.dataset.scraperJobPage || currentPage)
+            : currentPage + (action === 'jobs-page-next' ? 1 : -1);
+        void refreshJobs({ page: targetPage });
         return;
     }
     const batchAcceptBtn = event.target.closest('[data-batch-accept]');

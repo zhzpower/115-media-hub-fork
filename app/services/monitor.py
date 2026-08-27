@@ -1,3 +1,5 @@
+import re
+
 from ..background import submit_background
 from ..core import *  # noqa: F401,F403
 from ..db import retry_sqlite_locked
@@ -9,6 +11,56 @@ from .strm_files import delete_managed_strm_file, managed_strm_file_path, remove
 MONITOR_DIR_MISSING_RELEASE_CONFIRMATIONS = 2
 MONITOR_SCAN_SAVEPATHS_MAX = 50
 _monitor_dispatch_pending = False
+
+
+def build_monitor_scope_line(
+    task: Dict[str, Any],
+    trigger: str,
+    *,
+    hinted_path: str = "",
+    resolved_paths: Optional[List[str]] = None,
+    manual_scope_count: int = 0,
+    manual_force_all: bool = False,
+) -> str:
+    """构建任务开始后的扫描范围摘要行。"""
+    scan_path = normalize_remote_path(str((task or {}).get("scan_path", "") or ""))
+    if manual_force_all:
+        return "范围: 需补扫全任务（首层强制扫描）"
+    if manual_scope_count > 0:
+        return f"范围: 需补扫首层分支 {max(0, int(manual_scope_count or 0))} 条"
+    normalized_trigger = str(trigger or "").strip().lower()
+    if normalized_trigger in ("webhook", "resource"):
+        raw_hint = str(hinted_path or "").strip()
+        path = normalize_remote_path(raw_hint) if raw_hint else ""
+        return f"范围: {path}" if raw_hint and path else f"范围: 全任务 {scan_path}"
+    if normalized_trigger == "manual":
+        paths: List[str] = []
+        for raw_path in resolved_paths if isinstance(resolved_paths, list) else []:
+            path = normalize_remote_path(str(raw_path or "").strip())
+            if path and path not in paths:
+                paths.append(path)
+        if paths:
+            preview = ", ".join(paths[:5])
+            if len(paths) > 5:
+                preview += "..."
+            return f"范围: {preview}"
+        return f"范围: 全任务 {scan_path}"
+    return f"范围: 全任务 {scan_path}"
+
+
+def build_monitor_conclusion_line(stats: Dict[str, Any], auto_summary: Any = "") -> str:
+    """构建执行成功前的结论摘要行。"""
+    auto_text = "-"
+    auto_raw = str(auto_summary or "").strip()
+    if auto_raw:
+        matched = re.search(r"已自动整理\s*(\d+)\s*项", auto_raw)
+        auto_text = f"{matched.group(1)} 项" if matched else "已执行"
+    return (
+        f"结论: 新增/更新 {max(0, int((stats or {}).get('generated', 0) or 0))} | "
+        f"跳过 {max(0, int((stats or {}).get('skipped', 0) or 0))} | "
+        f"自动整理 {auto_text} | "
+        f"清理 {max(0, int((stats or {}).get('deleted_files', 0) or 0))}"
+    )
 
 
 def _claim_monitor_job(task_name: str) -> bool:
@@ -578,6 +630,8 @@ async def run_monitor_task(
         min_bytes = int(task["min_file_size_mb"] * 1024 * 1024)
         start_remote_paths: List[str] = [task_scan_path]
         refresh_source_label = ""
+        hinted_path = ""
+        resolved_paths: List[str] = []
         if trigger in ("webhook", "resource") and payload:
             hinted_path = extract_webhook_refresh_path(task, payload, cfg)
             source_label = "Webhook" if trigger == "webhook" else "资源导入"
@@ -651,6 +705,17 @@ async def run_monitor_task(
                     f"需手动监控范围: {len(manual_required_scopes)} 条，本轮将强制扫描对应首层分支",
                     "warn",
                 )
+        await write_monitor_log(
+            build_monitor_scope_line(
+                task,
+                trigger,
+                hinted_path=hinted_path,
+                resolved_paths=resolved_paths,
+                manual_scope_count=len(manual_required_scopes),
+                manual_force_all=manual_required_force_all_first_level,
+            ),
+            "info",
+        )
 
         if refresh_source_label:
             parent_refresh_paths: List[str] = []
@@ -1058,6 +1123,7 @@ async def run_monitor_task(
                     "success",
                 )
 
+        auto_summary = "-"
         if bool(task.get("auto_scrape_on_new")) and new_media_items:
             try:
                 auto_message = await asyncio.to_thread(
@@ -1066,12 +1132,14 @@ async def run_monitor_task(
                     task,
                     list(new_media_items),
                 )
+                auto_summary = auto_message
                 await write_monitor_log(f"自动整理: {auto_message}", "success")
             except Exception as exc:
                 await write_monitor_log(f"自动整理失败: {exc}", "error")
 
         await write_monitor_section("执行结果")
         await write_monitor_task_summary(stats, cleanup_enabled=cleanup_enabled)
+        await write_monitor_log(build_monitor_conclusion_line(stats, auto_summary), "success")
         try:
             notify_result = await push_monitor_success_notification(
                 cfg=cfg,
@@ -1234,30 +1302,58 @@ async def run_monitor_change_task(
         raw_event_ids = payload.get("event_ids", []) if isinstance(payload, dict) else []
         event_ids = raw_event_ids if isinstance(raw_event_ids, list) else None
         result = await process_monitor_change_events(task_name, cfg=cfg, event_ids=event_ids)
+        if (
+            max(0, int(result.get("completed", 0) or 0))
+            + max(0, int(result.get("failed", 0) or 0))
+            + max(0, int(result.get("discarded", 0) or 0))
+        ) <= 0:
+            await write_monitor_log("无待处理变更，本轮跳过", "info")
+            status_text = "变更同步完成"
+            await write_monitor_task_footer(task_name, status_text)
+            update_monitor_summary(status_text, task_name)
+            return
         await _write_monitor_change_details(result.get("change_details"))
-        summary_values = {
-            key: int(result.get(key, 0) or 0)
-            for key in (
-                "completed",
-                "failed",
-                "generated",
-                "deleted",
-                "directory_count",
-                "file_count",
-                "manual_required",
-            )
-        }
+        completed = max(0, int(result.get("completed", 0) or 0))
+        failed = max(0, int(result.get("failed", 0) or 0))
+        discarded = max(0, int(result.get("discarded", 0) or 0))
+        generated = max(0, int(result.get("generated", 0) or 0))
+        deleted = max(0, int(result.get("deleted", 0) or 0))
+        directory_count = max(0, int(result.get("directory_count", 0) or 0))
+        manual_required = max(0, int(result.get("manual_required", 0) or 0))
+        summary_text = (
+            f"变更同步汇总: 事件 {completed + failed + discarded}"
+            f"（完成 {completed} / 失败 {failed} / 丢弃 {discarded}） | "
+            f"生成 STRM {generated} | 删除 STRM {deleted} | 局部读取目录 {directory_count}"
+        )
+        if manual_required > 0:
+            summary_text += f" | 需补扫 {manual_required}"
         await write_monitor_log(
-            (
-                "变更同步汇总: 完成 {completed}，失败 {failed}，生成 {generated}，"
-                "删除 {deleted}，局部读取目录 {directory_count}，文件 {file_count}，"
-                "需手动监控 {manual_required}"
-            ).format(**summary_values),
+            summary_text,
             "success"
-            if int(result.get("failed", 0) or 0) == 0
-            and int(result.get("manual_required", 0) or 0) == 0
+            if failed == 0 and manual_required == 0
             else "warn",
         )
+        new_media_items = result.get("new_media_items", [])
+        if bool(task.get("auto_scrape_on_new")) and isinstance(new_media_items, list) and new_media_items:
+            try:
+                auto_message = await asyncio.to_thread(
+                    _auto_scrape_new_media_items,
+                    cfg,
+                    task,
+                    list(new_media_items),
+                )
+                await write_monitor_log(f"自动整理: {auto_message}", "success")
+            except Exception as exc:
+                await write_monitor_log(f"自动整理失败: {exc}", "error")
+        auto_rescan_queued = 0
+        manual_paths = result.get("manual_required_paths", [])
+        if int(result.get("manual_required", 0) or 0) > 0 and isinstance(manual_paths, list) and manual_paths:
+            auto_rescan_queued = _queue_auto_rescan_for_manual_required(cfg, manual_paths)
+            if auto_rescan_queued > 0:
+                path_preview = "、".join([str(path) for path in manual_paths[:5]])
+                await write_monitor_log(f"已自动安排补扫目录：{path_preview}（无需手动操作）", "info")
+            else:
+                await write_monitor_log("自动补扫排队失败，请手动触发扫描确认", "warn")
         for error_item in (result.get("errors", []) if isinstance(result.get("errors"), list) else [])[:10]:
             if not isinstance(error_item, dict):
                 continue
@@ -1266,7 +1362,7 @@ async def run_monitor_change_task(
                 (
                     "变更事件 #{event_id} 失败，已保留重试: {error}"
                     if retryable
-                    else "变更事件 #{event_id} 失败: {error}"
+                    else "变更事件 #{event_id} 已结束，不再重试: {error}"
                 ).format(
                     event_id=max(0, int(error_item.get("event_id", 0) or 0)),
                     error=str(error_item.get("error", "") or "未知错误"),
@@ -1276,7 +1372,7 @@ async def run_monitor_change_task(
         if int(result.get("failed", 0) or 0) > 0:
             status_text = "变更同步部分失败"
         elif int(result.get("manual_required", 0) or 0) > 0:
-            status_text = "变更同步待手动监控"
+            status_text = "变更同步待自动补扫" if auto_rescan_queued > 0 else "变更同步待手动监控"
         else:
             status_text = "变更同步完成"
         await write_monitor_task_footer(task_name, status_text)
@@ -1599,3 +1695,20 @@ def queue_monitor_dir_scan(cfg: Dict[str, Any], provider: str, paths: List[str])
             {"task_name": task_name, "status": status, "matched": len(entry["savepaths"])}
         )
     return {"ok": True, "tasks": result_tasks, "unmatched": unmatched}
+
+
+def _queue_auto_rescan_for_manual_required(cfg: Dict[str, Any], paths: Any) -> int:
+    """为变更同步未知清单的文件夹自动排队补扫；返回成功排队的任务数。"""
+    normalized_paths: List[str] = []
+    for raw_path in paths if isinstance(paths, list) else []:
+        path = normalize_relative_path(str(raw_path or "").strip())
+        if path and path not in normalized_paths:
+            normalized_paths.append(path)
+    if not normalized_paths:
+        return 0
+    try:
+        result = queue_monitor_dir_scan(cfg, "115", normalized_paths)
+    except Exception:
+        return 0
+    tasks = result.get("tasks") if isinstance(result, dict) and isinstance(result.get("tasks"), list) else []
+    return len(tasks)
