@@ -374,6 +374,21 @@ def _format_notify_episode_summary(episodes: List[int]) -> str:
     return f"E{normalized[0]}-E{normalized[-1]}"
 
 
+def _format_notify_episode_title_summary(episodes: List[int]) -> str:
+    normalized = sorted(
+        {
+            max(0, int(item or 0))
+            for item in (episodes or [])
+            if max(0, int(item or 0)) > 0
+        }
+    )
+    if not normalized:
+        return ""
+    if len(normalized) <= 6:
+        return "&".join([f"E{value}" for value in normalized])
+    return f"E{normalized[0]}-E{normalized[-1]}"
+
+
 def _escape_notify_font_text(value: Any) -> str:
     text = str(value or "")
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -432,14 +447,24 @@ def _build_subscription_success_markdown(
     savepath_label = _compact_text(normalize_relative_path(savepath) or "--", 128)
     now_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    episode_summary = _format_notify_episode_summary(notify_episodes) if media_type == "tv" else ""
+    if media_type == "tv":
+        title_episode_summary = _format_notify_episode_title_summary(notify_episodes)
+        headline = (
+            f"{task_label} 新增{title_episode_summary} 成功"
+            if title_episode_summary
+            else f"{task_label} 订阅更新成功"
+        )
+    else:
+        headline = f"{task_label} 入库成功"
+
     lines = [
-        "### 订阅更新成功",
+        f"### {headline}",
         f"> 时间：{now_label}",
         f"> 任务：{task_label}（{media_label}）",
         f"> 网盘：{provider_label} | 导入方式：{link_type_label}",
     ]
     if media_type == "tv":
-        episode_summary = _format_notify_episode_summary(notify_episodes)
         highlighted_episode_summary = (
             _format_notify_highlight(episode_summary, "warning") if episode_summary else "--"
         )
