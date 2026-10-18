@@ -5,11 +5,16 @@ from pathlib import Path
 from unittest import mock
 
 from app import core
+from app.routes import subscription as subscription_routes
 from app.services import subscription_task_runner as runner
+from app.services import subscription_runner as runner_module
+from app.services import scraper as scraper_service
 
 
 MAGNET_LINK = "magnet:?xt=urn:btih:AF33BD45B385B16A4BEF434C760E0182&dn=test"
+MAGNET_LINK_B = "magnet:?xt=urn:btih:BB44CE56C496C27B5CFE545D871F1293&dn=test2"
 ED2K_LINK = "ed2k://|file|test.mkv|104857600|0123456789abcdef0123456789abcdef|/"
+ED2K_LINK_WITH_SPACE = "ed2k://|file|Some Movie 2024.mkv|104857600|0123456789abcdef0123456789abcdef|/"
 
 ROOT = Path(__file__).resolve().parents[1]
 UI_PATH = ROOT / "static/js/modules/subscription/ui.js"
@@ -315,7 +320,7 @@ class OfflineImportPipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(move_call.args[2], "target-cid")
         queue_job.assert_called_once()
         self.assertEqual(queue_job.call_args.args[0], "监控电影")
-        self.assertEqual(queue_job.call_args.args[1], "resource")
+        self.assertEqual(queue_job.call_args.args[1], "subscription")
 
     async def test_pipeline_submit_failure_returns_failure(self):
         provider = self.build_provider()
@@ -356,6 +361,170 @@ class OfflineImportPipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["last_failed_detail"], "115 离线任务提交失败")
         self.assertEqual(result["failed_attempts"], 1)
 
+    async def test_pipeline_rescans_staging_until_late_file_appears(self):
+        """115 报「完成」时文件可能还没出现在目录列表里，宽限期内重扫应该能捞到。"""
+        provider = self.build_provider()
+        staging_calls = []
+
+        def list_entries(cookie, cid):
+            if cid != "staging-cid":
+                return []
+            staging_calls.append(cid)
+            if len(staging_calls) < 2:
+                return []
+            return [
+                {
+                    "id": "file-1",
+                    "name": "测试电影.2024.1080p.mkv",
+                    "size": 1000,
+                    "is_dir": False,
+                    "modified_at": "",
+                }
+            ]
+
+        provider.list_entries.side_effect = list_entries
+        with mock.patch.object(
+            runner, "SUBSCRIPTION_OFFLINE_STAGING_RESCAN_INTERVAL_SECONDS", 0.01, create=True
+        ), mock.patch.object(runner, "create_resource_job", return_value=77), mock.patch.object(
+            runner, "update_resource_job"
+        ), mock.patch.object(
+            runner, "match_monitor_task_for_savepath", return_value={}
+        ), mock.patch.object(
+            runner, "create_subscription_match"
+        ), mock.patch.object(
+            runner, "write_subscription_log", new_callable=mock.AsyncMock
+        ), mock.patch.object(runner, "upsert_subscription_task_state"), mock.patch.object(
+            runner, "check_subscription_cancelled"
+        ), mock.patch.object(
+            runner, "now_text", return_value="2026-10-07 15:20:00"
+        ), mock.patch.object(runner, "safe_json_dumps", side_effect=lambda value: "{}"):
+            result = await runner._run_subscription_manual_offline_import(
+                task=self.task,
+                task_name="测试任务",
+                cfg={"mount_points": [], "monitor_tasks": []},
+                provider_meta=provider,
+                cookie="cookie-115",
+                candidate=self.candidate,
+                item=self.item,
+                link_type="magnet",
+                staging_root="云下载/磁力中转",
+                effective_savepath="电影/测试电影 2024",
+                base_savepath="电影",
+                folder_id="target-cid",
+                monitor_task_name="",
+                last_episode=0,
+                known_total=0,
+                single_season_episode_upper_bound=0,
+                existing_folder_episodes=set(),
+                existing_episode_scan_ready=False,
+                subscription_run_id="run-3",
+                batch_refresh_enabled=False,
+                import_timeout_seconds=10,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertGreaterEqual(len(staging_calls), 2)
+        provider.move_entries.assert_called_once()
+
+    async def test_pipeline_reports_wait_time_when_staging_stays_empty(self):
+        """宽限期内一直扫空时仍判失败，但失败详情要带上已等待时长。"""
+        provider = self.build_provider()
+        provider.list_entries.side_effect = lambda cookie, cid: []
+        with mock.patch.object(
+            runner, "SUBSCRIPTION_OFFLINE_STAGING_GRACE_SECONDS", 0, create=True
+        ), mock.patch.object(
+            runner, "SUBSCRIPTION_OFFLINE_STAGING_RESCAN_INTERVAL_SECONDS", 0, create=True
+        ), mock.patch.object(runner, "create_resource_job", return_value=78), mock.patch.object(
+            runner, "update_resource_job"
+        ), mock.patch.object(
+            runner, "write_subscription_log", new_callable=mock.AsyncMock
+        ), mock.patch.object(runner, "upsert_subscription_task_state"), mock.patch.object(
+            runner, "check_subscription_cancelled"
+        ), mock.patch.object(
+            runner, "now_text", return_value="2026-10-07 15:21:00"
+        ), mock.patch.object(runner, "safe_json_dumps", side_effect=lambda value: "{}"):
+            result = await runner._run_subscription_manual_offline_import(
+                task=self.task,
+                task_name="测试任务",
+                cfg={},
+                provider_meta=provider,
+                cookie="cookie-115",
+                candidate=self.candidate,
+                item=self.item,
+                link_type="magnet",
+                staging_root="云下载/磁力中转",
+                effective_savepath="电影/测试电影 2024",
+                base_savepath="电影",
+                folder_id="target-cid",
+                monitor_task_name="",
+                last_episode=0,
+                known_total=0,
+                single_season_episode_upper_bound=0,
+                existing_folder_episodes=set(),
+                existing_episode_scan_ready=False,
+                subscription_run_id="run-4",
+                batch_refresh_enabled=False,
+                import_timeout_seconds=10,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("已等待", result["last_failed_detail"])
+        provider.move_entries.assert_not_called()
+
+    async def test_pipeline_stops_rescanning_after_max_attempts(self):
+        """中转目录一直扫空时，重扫次数要有上限，不能一直等下去。"""
+        provider = self.build_provider()
+        staging_calls = []
+
+        def list_entries(cookie, cid):
+            if cid == "staging-cid":
+                staging_calls.append(cid)
+            return []
+
+        provider.list_entries.side_effect = list_entries
+        with mock.patch.object(
+            runner, "SUBSCRIPTION_OFFLINE_STAGING_GRACE_SECONDS", 0.05, create=True
+        ), mock.patch.object(
+            runner, "SUBSCRIPTION_OFFLINE_STAGING_RESCAN_INTERVAL_SECONDS", 0.01, create=True
+        ), mock.patch.object(
+            runner, "SUBSCRIPTION_OFFLINE_STAGING_MAX_ATTEMPTS", 3, create=True
+        ), mock.patch.object(runner, "create_resource_job", return_value=79), mock.patch.object(
+            runner, "update_resource_job"
+        ), mock.patch.object(
+            runner, "write_subscription_log", new_callable=mock.AsyncMock
+        ), mock.patch.object(runner, "upsert_subscription_task_state"), mock.patch.object(
+            runner, "check_subscription_cancelled"
+        ), mock.patch.object(
+            runner, "now_text", return_value="2026-10-07 15:22:00"
+        ), mock.patch.object(runner, "safe_json_dumps", side_effect=lambda value: "{}"):
+            result = await runner._run_subscription_manual_offline_import(
+                task=self.task,
+                task_name="测试任务",
+                cfg={},
+                provider_meta=provider,
+                cookie="cookie-115",
+                candidate=self.candidate,
+                item=self.item,
+                link_type="magnet",
+                staging_root="云下载/磁力中转",
+                effective_savepath="电影/测试电影 2024",
+                base_savepath="电影",
+                folder_id="target-cid",
+                monitor_task_name="",
+                last_episode=0,
+                known_total=0,
+                single_season_episode_upper_bound=0,
+                existing_folder_episodes=set(),
+                existing_episode_scan_ready=False,
+                subscription_run_id="run-5",
+                batch_refresh_enabled=False,
+                import_timeout_seconds=10,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(staging_calls), 3)
+        provider.move_entries.assert_not_called()
+
 
 def run_subscription_ui(expression, provider_meta=None):
     provider_meta = provider_meta or []
@@ -391,7 +560,211 @@ process.stdout.write(JSON.stringify(result));
     return json.loads(completed.stdout)
 
 
+class SubscriptionOrganizeDefaultsTest(unittest.TestCase):
+    """订阅「入库后整理」默认口径：默认开启、standard 命名、中文标题（覆盖引擎默认 auto）。"""
+
+    def test_defaults_enable_tv_organize_with_chinese_standard_naming(self):
+        task = core.normalize_subscription_task({"name": "剧集", "media_type": "tv", "title": "示例剧"})
+        self.assertTrue(task["organize_on_import"])
+        options = task["organize_options"]
+        self.assertEqual(options["title_language"], "zh")
+        self.assertEqual(options["file_name_mode"], "standard")
+        self.assertEqual(options["episode_mode"], "auto")
+        self.assertFalse(options["delete_ad_files"])
+
+    def test_explicit_options_win_over_defaults(self):
+        task = core.normalize_subscription_task(
+            {
+                "name": "剧集",
+                "media_type": "tv",
+                "title": "示例剧",
+                "organize_on_import": False,
+                "organize_options": {"title_language": "en", "file_name_mode": "keep", "delete_ad_files": True},
+            }
+        )
+        self.assertFalse(task["organize_on_import"])
+        self.assertEqual(task["organize_options"]["title_language"], "en")
+        self.assertEqual(task["organize_options"]["file_name_mode"], "keep")
+        self.assertTrue(task["organize_options"]["delete_ad_files"])
+
+
+class SubscriptionOrganizeRunnerTest(unittest.IsolatedAsyncioTestCase):
+    class _Future:
+        def result(self, timeout=None):
+            return None
+
+    def _task(self, **overrides):
+        base = {
+            "media_type": "tv",
+            "organize_on_import": True,
+            "tmdb_id": 1234,
+            "tmdb_media_type": "tv",
+            "tmdb_title": "示例剧",
+            "tmdb_year": "2024",
+        }
+        base.update(overrides)
+        return base
+
+    def _provider(self, files):
+        provider = mock.MagicMock()
+        provider.list_entries.return_value = list(files)
+        return provider
+
+    async def _organize(self, task, provider, imported_entries):
+        with mock.patch.object(runner, "write_subscription_log", new_callable=mock.AsyncMock):
+            return await runner._organize_subscription_imported_files(
+                task=task,
+                provider_meta=provider,
+                cookie="cookie",
+                provider="115",
+                target_cid="target-cid",
+                target_savepath="电视剧/示例剧",
+                imported_entries=imported_entries,
+            )
+
+    async def test_tv_renames_imported_files_in_place(self):
+        provider = self._provider(
+            [{"fid": "f1", "name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}]
+        )
+        captured = {}
+
+        def fake_plan(payload):
+            captured["payload"] = payload
+            return {
+                "actions": [{"ready": True, "issue": "", "entry_id": "f1"}],
+                "ready_count": 1,
+            }
+
+        with mock.patch.object(scraper_service, "build_scraper_rename_plan", side_effect=fake_plan), \
+                mock.patch.object(scraper_service, "create_scraper_job_from_plan", return_value={"job_id": 9}), \
+                mock.patch.object(scraper_service, "submit_scraper_job", return_value=self._Future()), \
+                mock.patch.object(
+                    scraper_service,
+                    "get_scraper_jobs_state",
+                    return_value={"jobs": [{"status": "completed", "succeeded_actions": 1, "failed_actions": 0}]},
+                ):
+            organized = await self._organize(
+                self._task(),
+                provider,
+                [{"name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}],
+            )
+
+        self.assertTrue(organized)
+        payload = captured["payload"]
+        self.assertEqual(payload["provider"], "115")
+        self.assertEqual(payload["base_cid"], "target-cid")
+        self.assertEqual(payload["base_path"], "电视剧/示例剧")
+        self.assertEqual(payload["tmdb"]["tmdb_id"], 1234)
+        self.assertEqual(payload["tmdb"]["tmdb_media_type"], "tv")
+        # 单文件条目落在目标目录里：原地改名的输入。
+        self.assertEqual(len(payload["entries"]), 1)
+        entry = payload["entries"][0]
+        self.assertEqual(entry["id"], "f1")
+        self.assertEqual(entry["parent_id"], "target-cid")
+        self.assertEqual(entry["parent_path"], "电视剧/示例剧")
+        self.assertFalse(entry["is_dir"])
+
+    async def test_movie_subscription_is_not_renamed(self):
+        with mock.patch.object(scraper_service, "build_scraper_rename_plan") as plan:
+            organized = await self._organize(
+                self._task(media_type="movie", tmdb_media_type="movie"),
+                self._provider([{"fid": "f1", "name": "示例电影.mkv", "size": 1000, "is_dir": False}]),
+                [{"name": "示例电影.mkv", "size": 1000, "is_dir": False}],
+            )
+        self.assertFalse(organized)
+        plan.assert_not_called()
+
+    async def test_disabled_switch_skips_rename(self):
+        with mock.patch.object(scraper_service, "build_scraper_rename_plan") as plan:
+            organized = await self._organize(
+                self._task(organize_on_import=False),
+                self._provider([{"fid": "f1", "name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}]),
+                [{"name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}],
+            )
+        self.assertFalse(organized)
+        plan.assert_not_called()
+
+    async def test_missing_tmdb_id_skips_rename(self):
+        with mock.patch.object(scraper_service, "build_scraper_rename_plan") as plan:
+            organized = await self._organize(
+                self._task(tmdb_id=0),
+                self._provider([{"fid": "f1", "name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}]),
+                [{"name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}],
+            )
+        self.assertFalse(organized)
+        plan.assert_not_called()
+
+    async def test_missing_target_file_keeps_original_name(self):
+        with mock.patch.object(scraper_service, "build_scraper_rename_plan") as plan:
+            organized = await self._organize(
+                self._task(),
+                self._provider([]),
+                [{"name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}],
+            )
+        self.assertFalse(organized)
+        plan.assert_not_called()
+
+    async def test_empty_plan_keeps_original_name(self):
+        provider = self._provider(
+            [{"fid": "f1", "name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}]
+        )
+        with mock.patch.object(scraper_service, "build_scraper_rename_plan", return_value={"actions": []}), \
+                mock.patch.object(scraper_service, "create_scraper_job_from_plan") as create:
+            organized = await self._organize(
+                self._task(),
+                provider,
+                [{"name": "示例剧.S01E01.mkv", "size": 1000, "is_dir": False}],
+            )
+        self.assertFalse(organized)
+        create.assert_not_called()
+
+
 class SubscriptionOfflineFrontendTest(unittest.TestCase):
+    def test_multiline_magnet_paste_returns_all_entries(self):
+        provider_meta = [{"name": "115", "label": "115网盘", "link_type": "115share"}]
+        text = f"{MAGNET_LINK}\n{MAGNET_LINK_B}"
+        provider_meta = [{"name": "115", "label": "115网盘", "link_type": "115share"}]
+        text = f"{MAGNET_LINK}\n{MAGNET_LINK_B}"
+        result = run_subscription_ui(
+            f"extractSubscriptionLinkEntries({json.dumps(text)}, '115')",
+            provider_meta=provider_meta,
+        )
+        self.assertEqual([item["link_url"] for item in result], [MAGNET_LINK, MAGNET_LINK_B])
+        self.assertEqual(result[0]["raw_text"], MAGNET_LINK)
+        self.assertEqual(result[1]["raw_text"], MAGNET_LINK_B)
+
+    def test_multiline_share_links_keep_their_own_receive_code(self):
+        provider_meta = [{"name": "115", "label": "115网盘", "link_type": "115share"}]
+        text = "https://115.com/s/aaa111\n提取码：abcd\nhttps://115.com/s/bbb222\n提取码：efgh"
+        result = run_subscription_ui(
+            f"extractSubscriptionLinkEntries({json.dumps(text)}, '115')",
+            provider_meta=provider_meta,
+        )
+        self.assertEqual(
+            [item["link_url"] for item in result],
+            ["https://115.com/s/aaa111", "https://115.com/s/bbb222"],
+        )
+        self.assertEqual(result[0]["raw_text"], "https://115.com/s/aaa111\n提取码：abcd")
+        self.assertEqual(result[1]["raw_text"], "https://115.com/s/bbb222\n提取码：efgh")
+
+    def test_ed2k_link_with_spaces_in_name_is_not_truncated(self):
+        provider_meta = [{"name": "115", "label": "115网盘", "link_type": "115share"}]
+        text = f"{ED2K_LINK_WITH_SPACE}\n{MAGNET_LINK}"
+        result = run_subscription_ui(
+            f"extractSubscriptionLinkEntries({json.dumps(text)}, '115')",
+            provider_meta=provider_meta,
+        )
+        self.assertEqual([item["link_url"] for item in result], [ED2K_LINK_WITH_SPACE, MAGNET_LINK])
+
+    def test_quark_entries_skip_magnet_lines(self):
+        provider_meta = [{"name": "quark", "label": "夸克网盘", "link_type": "quark"}]
+        text = f"{MAGNET_LINK}\nhttps://pan.quark.cn/s/abc123"
+        result = run_subscription_ui(
+            f"extractSubscriptionLinkEntries({json.dumps(text)}, 'quark')",
+            provider_meta=provider_meta,
+        )
+        self.assertEqual([item["link_url"] for item in result], ["https://pan.quark.cn/s/abc123"])
+
     def test_115_scan_link_extracts_magnet(self):
         provider_meta = [{"name": "115", "label": "115网盘", "link_type": "115share"}]
         result = run_subscription_ui(
@@ -414,3 +787,167 @@ class SubscriptionOfflineFrontendTest(unittest.TestCase):
         self.assertIn("magnet_staging_root", settings_js)
         self.assertIn("云下载/磁力中转", settings_js)
         self.assertIn("settings-magnet-provider-container", settings_html)
+
+
+class SubscriptionQueueBatchTest(unittest.TestCase):
+    def test_queue_jobs_appends_all_candidates_and_kicks_once(self):
+        queue = []
+        status = {"running": False, "queued": []}
+        kicked = []
+        with mock.patch.object(runner_module, "subscription_queue", queue), mock.patch.object(
+            runner_module, "subscription_status", status
+        ), mock.patch.object(runner_module, "schedule_ui_state_push"), mock.patch.object(
+            runner_module,
+            "submit_background",
+            side_effect=lambda fn, *args, **kwargs: kicked.append((fn, args, kwargs)),
+        ):
+            result = runner_module.queue_subscription_jobs(
+                "测试任务",
+                "manual_link",
+                [
+                    {"link_url": MAGNET_LINK, "link_type": "magnet"},
+                    {"link_url": MAGNET_LINK_B, "link_type": "magnet"},
+                    {"link_url": MAGNET_LINK, "link_type": "magnet"},
+                ],
+            )
+        self.assertEqual(result, "started")
+        self.assertEqual([item["manual_candidate"]["link_url"] for item in queue], [MAGNET_LINK, MAGNET_LINK_B])
+        self.assertEqual(status["queued"], ["测试任务", "测试任务"])
+        self.assertEqual(len(kicked), 1)
+        self.assertEqual(kicked[0][0], runner_module.start_next_subscription_job)
+
+    def test_queue_jobs_while_running_does_not_kick_again(self):
+        queue = []
+        status = {"running": True, "queued": []}
+        with mock.patch.object(runner_module, "subscription_queue", queue), mock.patch.object(
+            runner_module, "subscription_status", status
+        ), mock.patch.object(runner_module, "schedule_ui_state_push"), mock.patch.object(
+            runner_module, "submit_background"
+        ) as submit:
+            result = runner_module.queue_subscription_jobs(
+                "测试任务", "manual_link", [{"link_url": MAGNET_LINK, "link_type": "magnet"}]
+            )
+        self.assertEqual(result, "queued")
+        self.assertEqual(len(queue), 1)
+        submit.assert_not_called()
+
+    def test_single_queue_helper_still_enqueues_empty_candidate(self):
+        queue = []
+        status = {"running": False, "queued": []}
+        with mock.patch.object(runner_module, "subscription_queue", queue), mock.patch.object(
+            runner_module, "subscription_status", status
+        ), mock.patch.object(runner_module, "schedule_ui_state_push"), mock.patch.object(
+            runner_module, "submit_background"
+        ):
+            result = runner_module.queue_subscription_job("测试任务", "cron")
+        self.assertEqual(result, "started")
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(queue[0]["manual_candidate"], {})
+
+
+class FakeJsonRequest:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def json(self):
+        return self.payload
+
+
+def build_115_provider_meta():
+    provider = mock.MagicMock()
+    provider.label = "115网盘"
+    provider.link_type = "115share"
+    provider.supports_subscription = True
+    provider.supports_offline = True
+    return provider
+
+
+class SubscriptionStartWithLinkRouteTest(unittest.IsolatedAsyncioTestCase):
+    def endpoint(self):
+        endpoint = next(
+            (
+                route.endpoint
+                for route in subscription_routes.router.routes
+                if getattr(route, "path", "") == "/subscription/start_with_link"
+                and "POST" in getattr(route, "methods", set())
+            ),
+            None,
+        )
+        self.assertIsNotNone(endpoint, "POST /subscription/start_with_link 尚未注册")
+        return endpoint
+
+    async def run_endpoint(self, payload, provider_meta=None):
+        endpoint = self.endpoint()
+        config = {"subscription_tasks": [build_task()]}
+        queued = []
+
+        def fake_queue(task_name, trigger, candidates):
+            queued.append((task_name, trigger, list(candidates)))
+            return "queued"
+
+        with mock.patch.object(subscription_routes, "get_config", return_value=config), mock.patch(
+            "app.providers.registry.get_or_none", return_value=provider_meta or build_115_provider_meta()
+        ), mock.patch.object(subscription_routes, "queue_subscription_jobs", side_effect=fake_queue):
+            response = await endpoint(FakeJsonRequest(payload))
+        return response, queued
+
+    async def test_multiple_offline_links_queue_one_job_each(self):
+        response, queued = await self.run_endpoint(
+            {
+                "name": "测试任务",
+                "links": [
+                    {"link_url": MAGNET_LINK, "raw_text": MAGNET_LINK},
+                    {"link_url": ED2K_LINK_WITH_SPACE, "raw_text": ED2K_LINK_WITH_SPACE},
+                ],
+            }
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["submitted"], 2)
+        self.assertEqual(len(queued), 1)
+        task_name, trigger, candidates = queued[0]
+        self.assertEqual(task_name, "测试任务")
+        self.assertEqual(trigger, "manual_link")
+        self.assertEqual([item["link_url"] for item in candidates], [MAGNET_LINK, ED2K_LINK_WITH_SPACE])
+        self.assertEqual([item["link_type"] for item in candidates], ["magnet", "ed2k"])
+
+    async def test_legacy_single_link_field_still_works(self):
+        response, queued = await self.run_endpoint({"name": "测试任务", "link_url": MAGNET_LINK})
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["submitted"], 1)
+        self.assertEqual(queued[0][2][0]["link_url"], MAGNET_LINK)
+
+    async def test_duplicate_links_are_deduped(self):
+        response, queued = await self.run_endpoint(
+            {
+                "name": "测试任务",
+                "links": [{"link_url": MAGNET_LINK}, {"link_url": MAGNET_LINK}],
+            }
+        )
+        self.assertEqual(response["submitted"], 1)
+        self.assertEqual(len(queued[0][2]), 1)
+
+    async def test_invalid_link_returns_400_with_reason(self):
+        response, queued = await self.run_endpoint(
+            {"name": "测试任务", "links": [{"link_url": "https://pan.quark.cn/s/abc123"}]}
+        )
+        self.assertEqual(response.status_code, 400)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["msg"], "请填写 115 分享链接")
+        self.assertEqual(queued, [])
+
+    async def test_partial_invalid_links_submit_the_valid_ones(self):
+        response, queued = await self.run_endpoint(
+            {
+                "name": "测试任务",
+                "links": [
+                    {"link_url": "https://pan.quark.cn/s/abc123"},
+                    {"link_url": MAGNET_LINK},
+                ],
+            }
+        )
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["submitted"], 1)
+        self.assertEqual([item["link_url"] for item in queued[0][2]], [MAGNET_LINK])
+        self.assertEqual(len(response["skipped"]), 1)
+        self.assertEqual(response["skipped"][0]["msg"], "请填写 115 分享链接")

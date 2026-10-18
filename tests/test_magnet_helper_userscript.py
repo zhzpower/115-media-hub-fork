@@ -361,3 +361,248 @@ context.fetch = async () => ({ ok: true, status: 200, text: async () => 'ok2' })
         self.assertTrue(result["hasPicker"])
         self.assertTrue(result["hasManage"])
         self.assertEqual(result["pickedId"], "t1")
+
+    def test_exclude_hosts_normalize_and_match(self):
+        # 排除域名应统一归一化为 hostname，裸域名同时匹配子域名，且带协议/端口/路径/通配符都能识别。
+        setup = "context.window = {};"
+        result = run_userscript(
+            """
+(() => {
+  const entries = [
+    'https://Hub.Example.com:8443/path?x=1',
+    '*.nas.local',
+    '/cgi-bin/foo',
+    'EXAMPLE.COM',
+    'example.com',
+    ''
+  ];
+  const normalized = api.normalizeExcludeHostList(entries);
+  return {
+    normalized,
+    ipv6: api.normalizeExcludeHost('[::1]:18080'),
+    current: api.currentHostname(),
+    match: api.isHostExcluded('hub.example.com', entries),
+    exact: api.isHostExcluded('example.com', entries),
+    sub: api.isHostExcluded('a.b.example.com', entries),
+    nas: api.isHostExcluded('nas.local', entries),
+    other: api.isHostExcluded('other.com', entries),
+    noHost: api.isHostExcluded('', entries)
+  };
+})()
+""",
+            setup,
+        )
+        self.assertEqual(result["normalized"], ["hub.example.com", "nas.local", "example.com"])
+        self.assertEqual(result["ipv6"], "[::1]")
+        self.assertEqual(result["current"], "")
+        self.assertTrue(result["match"])
+        self.assertTrue(result["exact"])
+        self.assertTrue(result["sub"])
+        self.assertTrue(result["nas"])
+        self.assertFalse(result["other"])
+        self.assertFalse(result["noHost"])
+
+    def test_exclude_hosts_persist_and_reload(self):
+        # 排除域名应可保存到 GM 存储，并在下一次启动 loadPersistedState 时回读。
+        setup = """
+const store = {};
+const writes = [];
+context.GM_getValue = async (key, fallback) => (key in store ? store[key] : fallback);
+context.GM_setValue = async (key, value) => { store[key] = value; writes.push([key, value]); };
+"""
+        result = run_userscript(
+            """
+(async () => {
+  await api.loadPersistedState();
+  api.saveExcludeHosts(['http://hub.example.com:18080', 'example.com', 'example.com', '  ']);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const afterSave = api.getExcludeHosts();
+  // 模拟下一次启动重新加载
+  await api.loadPersistedState();
+  const afterReload = api.getExcludeHosts();
+  return {
+    afterSave,
+    afterReload,
+    writes,
+    excluded: api.isHostExcluded('a.example.com', afterReload)
+  };
+})()
+""",
+            setup,
+        )
+        self.assertEqual(result["afterSave"], ["hub.example.com", "example.com"])
+        self.assertEqual(result["afterReload"], ["hub.example.com", "example.com"])
+        self.assertEqual(result["writes"][0][0], "magnet_push_exclude_hosts_v1")
+        self.assertTrue(result["excluded"])
+
+    def test_exclude_hosts_ui_marked_in_userscript(self):
+        # 任务管理器中必须包含“排除域名”设置区与保存按钮，用户在菜单里即可配置。
+        source = USERSCRIPT_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "mh-manager-exclude",
+            "mh-manager-exclude-save",
+            "不生效的网页（排除域名）",
+            "保存排除域名",
+        ):
+            self.assertIn(marker, source)
+
+
+class MagnetHelperPickerCopyTest(unittest.TestCase):
+    """点 115 后的任务选择弹窗里，复制磁力按钮与推送选项同层级。"""
+
+    def _setup(self):
+        return DOM_SETUP + """
+const copied = [];
+context.navigator = { clipboard: { writeText: async (value) => { copied.push(value); } } };
+"""
+
+    def _open_picker_source(self, source_link):
+        return f"""
+(async () => {{
+  const pickPromise = api.chooseTask(
+    [{{ id: 't1', name: '电影', webhookUrl: 'http://x/webhook/电影', savepath: '自存' }}],
+    {json.dumps(source_link)}
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const picker = registry.find((el) => el.id === 'mh-task-picker-overlay');
+  const html = picker ? picker.innerHTML : '';
+  const cancelBtn = makeEl('button');
+  cancelBtn.dataset.mhPickerAction = 'cancel';
+  cancelBtn.closest = () => cancelBtn;
+  picker._listeners.click({{ target: cancelBtn, preventDefault() {{}} }});
+  await pickPromise;
+  return {{ html }};
+}})()
+"""
+
+    def test_task_picker_has_copy_magnet_row_for_magnet(self):
+        result = run_userscript(self._open_picker_source("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef"), self._setup())
+        html = result["html"]
+        self.assertIn('data-mh-picker-action="copy-magnet"', html)
+        self.assertIn("复制磁力链接", html)
+        self.assertIn("不推送", html)
+        # 已经是磁力时不需要转换提示
+        self.assertNotIn("torrent 链接会先自动转成磁力", html)
+
+    def test_task_picker_copy_row_mentions_torrent_conversion(self):
+        result = run_userscript(self._open_picker_source("https://example.com/abc.torrent"), self._setup())
+        self.assertIn("torrent 链接会先自动转成磁力", result["html"])
+
+    def test_task_picker_copy_magnet_copies_and_keeps_dialog_open(self):
+        magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef"
+        result = run_userscript(
+            f"""
+(async () => {{
+  const pickPromise = api.chooseTask(
+    [{{ id: 't1', name: '电影', webhookUrl: 'http://x/webhook/电影', savepath: '自存' }}],
+    {json.dumps(magnet)}
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const picker = registry.find((el) => el.id === 'mh-task-picker-overlay');
+  const copyBtn = makeEl('button');
+  copyBtn.dataset.mhPickerAction = 'copy-magnet';
+  copyBtn.closest = () => copyBtn;
+  picker._listeners.click({{ target: copyBtn, preventDefault() {{}} }});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const stillOpen = !!registry.find((el) => el.id === 'mh-task-picker-overlay');
+  const copiedCount = copied.length;
+  const copyText = copyBtn.textContent;
+  const copyDisabled = !!copyBtn.disabled;
+  const cancelBtn = makeEl('button');
+  cancelBtn.dataset.mhPickerAction = 'cancel';
+  cancelBtn.closest = () => cancelBtn;
+  picker._listeners.click({{ target: cancelBtn, preventDefault() {{}} }});
+  const picked = await pickPromise;
+  return {{ copied, copiedCount, copyText, copyDisabled, stillOpen, picked }};
+}})()
+""",
+            self._setup(),
+        )
+        self.assertEqual(result["copied"], [magnet])
+        self.assertEqual(result["copyText"], "已复制磁力链接")
+        self.assertTrue(result["copyDisabled"])
+        # 复制不应该关闭弹窗，用户仍可继续选任务推送
+        self.assertTrue(result["stillOpen"])
+        self.assertIsNone(result["picked"])
+
+    def test_task_manager_allows_empty_savepath_for_inbox_push(self):
+        """保存路径可以留空：绑定接收夹任务时后台默认落到接收夹，脚本不该在本地拦下来。"""
+        result = run_userscript(
+            "({"
+            "  emptySavepath: api.validateManagerTask({ name: '接收', webhookUrl: 'http://x/webhook/接收', savepath: '' }),"
+            "  missingName: api.validateManagerTask({ name: '', webhookUrl: 'http://x/webhook/接收', savepath: '接收' }),"
+            "  badUrl: api.validateManagerTask({ name: '接收', webhookUrl: '不是地址', savepath: '接收' })"
+            "})"
+        )
+        self.assertEqual(result["emptySavepath"], "")
+        self.assertIn("任务名称", result["missingName"])
+        self.assertIn("http", result["badUrl"])
+
+    def _push_setup(self, gm_behavior):
+        """GM 通道行为由入参决定；fetch 固定成功，便于检查兜底那次请求用的是哪份签名。"""
+        return self._setup() + f"""
+const attempts = [];
+context.GM_getValue = (key, fallback) => (key === 'magnet_push_secret_v2' ? 's3cret' : fallback);
+context.GM_setValue = () => {{}};
+context.GM_xmlhttpRequest = (opts) => {{
+  attempts.push({{ via: 'gm', headers: opts.headers }});
+  {gm_behavior}
+}};
+context.fetch = async (url, init) => {{
+  attempts.push({{ via: 'fetch', headers: init.headers }});
+  return {{ ok: true, status: 200, text: async () => '{{"ok":true}}' }};
+}};
+"""
+
+    def _push_expression(self):
+        return """
+(async () => {
+  await api.loadPersistedState();
+  const button = makeEl('button');
+  await api.pushMagnet(
+    { name: '接收', webhookUrl: 'http://hub/webhook/接收', savepath: '' },
+    'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef',
+    button
+  );
+  const toast = registry.find((el) => el.id === 'mh-core-toast');
+  return {
+    attempts: attempts.map((item) => ({
+      via: item.via,
+      ts: (item.headers || {})['X-Webhook-Ts'] || '',
+      nonce: (item.headers || {})['X-Webhook-Nonce'] || '',
+      sign: (item.headers || {})['X-Webhook-Sign'] || ''
+    })),
+    toast: toast ? toast.textContent : '',
+    buttonText: button.textContent
+  };
+})()
+"""
+
+    def test_push_resigns_when_gm_falls_back_to_fetch(self):
+        """GM 失败后走 fetch 兜底必须换一份新签名，否则服务端会判「签名已被使用」。"""
+        result = run_userscript(
+            self._push_expression(),
+            self._push_setup("setTimeout(() => opts.onerror({ error: 'boom' }), 0);"),
+        )
+
+        self.assertEqual([item["via"] for item in result["attempts"]], ["gm", "fetch"])
+        first, second = result["attempts"]
+        self.assertTrue(first["sign"] and second["sign"])
+        self.assertNotEqual(first["nonce"], second["nonce"])
+        self.assertNotEqual(first["sign"], second["sign"])
+        self.assertEqual(result["buttonText"], "115")
+
+    def test_push_reports_duplicate_submit_instead_of_generic_failure(self):
+        """409 是「同一条磁力 + 同一个保存路径已在处理」，不是错误；提示要说明可能已提交成功。"""
+        result = run_userscript(
+            self._push_expression(),
+            self._push_setup(
+                "setTimeout(() => opts.onload({ status: 409, responseText: "
+                "'{\"ok\":false,\"msg\":\"该磁力已在处理中，请勿重复提交。\"}' }), 0);"
+            ),
+        )
+
+        self.assertEqual([item["via"] for item in result["attempts"]], ["gm"])
+        self.assertIn("已提交过", result["toast"])
+        self.assertIn("任务中心", result["toast"])
+        self.assertEqual(result["buttonText"], "115")

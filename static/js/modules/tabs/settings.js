@@ -1,9 +1,253 @@
 export async function ensureTabData(context) {
     context.moduleVisitState.settings = true;
+    initSettingsSectionNav();
+    refreshSettingsSectionSummaries();
 }
 
 let latestCookieHealthState = {};
+let latestSettingsSensitiveMeta = {};
 const cookieHealthBusyProviders = new Set();
+
+const SETTINGS_OPEN_SECTION_STORAGE_KEY = 'settings-open-section';
+const SETTINGS_OPEN_SECTION_ALL = 'all';
+const SETTINGS_OPEN_SECTION_NONE = 'none';
+
+function settingsSectionCards() {
+    return Array.from(document.querySelectorAll('#page-settings [data-settings-section]'));
+}
+
+function settingsSectionKey(card) {
+    return String(card?.dataset?.settingsSection || '').trim();
+}
+
+function setSettingsSectionOpen(card, open) {
+    if (!card) return;
+    const nextOpen = !!open;
+    card.classList.toggle('is-open', nextOpen);
+    const head = card.querySelector('.settings-section-head');
+    if (head) head.setAttribute('aria-expanded', nextOpen ? 'true' : 'false');
+    const body = card.querySelector('.settings-section-body');
+    if (body) body.hidden = !nextOpen;
+}
+
+function readRememberedSettingsSection() {
+    try {
+        return String(localStorage.getItem(SETTINGS_OPEN_SECTION_STORAGE_KEY) || '').trim();
+    } catch (e) {
+        return '';
+    }
+}
+
+function rememberSettingsSection(value) {
+    try {
+        const next = String(value || '').trim();
+        if (next) localStorage.setItem(SETTINGS_OPEN_SECTION_STORAGE_KEY, next);
+        else localStorage.removeItem(SETTINGS_OPEN_SECTION_STORAGE_KEY);
+    } catch (e) {
+        /* 隐身模式等禁用 localStorage 的场景下忽略记忆失败 */
+    }
+}
+
+function syncSettingsSectionNavState(activeKey) {
+    const key = String(activeKey || '').trim();
+    document.querySelectorAll('#settings-section-nav [data-settings-section-target]').forEach((item) => {
+        const isActive = !!key && item.getAttribute('data-settings-section-target') === key;
+        item.classList.toggle('is-active', isActive);
+        if (isActive) item.setAttribute('aria-current', 'true');
+        else item.removeAttribute('aria-current');
+    });
+}
+
+function settingsSectionScrollOffset() {
+    const toolbar = document.querySelector('.shell-toolbar');
+    const navbar = document.getElementById('settings-section-navbar');
+    const toolbarHeight = toolbar ? toolbar.getBoundingClientRect().height : 0;
+    const navbarHeight = navbar ? navbar.getBoundingClientRect().height : 0;
+    return toolbarHeight + navbarHeight + 16;
+}
+
+export function openSettingsSection(sectionKey, { scroll = true, remember = true } = {}) {
+    const cards = settingsSectionCards();
+    if (!cards.length) return;
+    const target = cards.find(card => settingsSectionKey(card) === sectionKey) || cards[0];
+    cards.forEach((card) => setSettingsSectionOpen(card, card === target));
+    const targetKey = settingsSectionKey(target);
+    syncSettingsSectionNavState(targetKey);
+    if (remember) rememberSettingsSection(targetKey);
+    if (!scroll) return;
+    const top = target.getBoundingClientRect().top + window.scrollY - settingsSectionScrollOffset();
+    window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+}
+
+export function expandAllSettingsSections() {
+    settingsSectionCards().forEach((card) => setSettingsSectionOpen(card, true));
+    syncSettingsSectionNavState('');
+    rememberSettingsSection(SETTINGS_OPEN_SECTION_ALL);
+}
+
+export function collapseAllSettingsSections() {
+    settingsSectionCards().forEach((card) => setSettingsSectionOpen(card, false));
+    syncSettingsSectionNavState('');
+    rememberSettingsSection(SETTINGS_OPEN_SECTION_NONE);
+}
+
+function settingsValue(id) {
+    const el = document.getElementById(id);
+    return el ? String(el.value || '').trim() : '';
+}
+
+function settingsChecked(id) {
+    return !!document.getElementById(id)?.checked;
+}
+
+function settingsLineCount(id) {
+    return settingsValue(id).split('\n').map(line => line.trim()).filter(Boolean).length;
+}
+
+function buildAuthSectionSummary() {
+    const meta = Array.isArray(window.providerMeta) ? window.providerMeta : [];
+    const parts = [];
+    if (meta.length) {
+        const enabled = meta.filter(p => settingsChecked('provider_enabled_' + p.name)).length;
+        parts.push(`启用 ${enabled}/${meta.length} 个网盘`);
+    }
+    const health = latestCookieHealthState && typeof latestCookieHealthState === 'object'
+        ? latestCookieHealthState['115']
+        : null;
+    const healthState = String(health?.state || '').trim().toLowerCase();
+    if (healthState === 'valid') parts.push('115 认证有效');
+    else if (healthState === 'invalid' || healthState === 'error') parts.push('115 认证异常');
+    else if (health?.configured || latestSettingsSensitiveMeta.cookie_115) parts.push('115 已配置');
+    else parts.push('115 未配置');
+    parts.push(settingsChecked('sign115_enabled') ? '签到已开' : '签到关闭');
+    return parts.join(' · ');
+}
+
+function buildSettingsSectionSummary(key) {
+    switch (key) {
+        case 'auth':
+            return buildAuthSectionSummary();
+        case 'strm': {
+            const base = settingsValue('strm_proxy_base_url');
+            const rate = settingsValue('api_115_rate_limit_seconds');
+            return [base ? '对外地址已填' : '未填对外地址', rate ? `限频 ${rate}s` : ''].filter(Boolean).join(' · ');
+        }
+        case 'tg': {
+            const total = String(document.getElementById('resource-source-total-count')?.textContent || '0').trim();
+            const search = String(document.getElementById('resource-source-search-count')?.textContent || '0').trim();
+            return `频道 ${total} 个 · 参与搜索 ${search} 个`;
+        }
+        case 'pansou':
+            if (!settingsChecked('pansou_enabled')) return '未启用';
+            return `已启用 · ${settingsValue('pansou_base_url') || '未填服务地址'}`;
+        case 'proxy': {
+            if (!settingsChecked('tg_proxy_enabled')) return '未启用';
+            const protocol = settingsValue('tg_proxy_protocol') || 'http';
+            const host = settingsValue('tg_proxy_host') || '未填地址';
+            const port = settingsValue('tg_proxy_port');
+            return `已启用 · ${protocol}://${host}${port ? ':' + port : ''}`;
+        }
+        case 'tmdb':
+            if (!settingsChecked('tmdb_enabled')) return '未启用';
+            return `已启用 · ${settingsValue('tmdb_language') || 'zh-CN'} / ${settingsValue('tmdb_region') || 'CN'}`;
+        case 'ai': {
+            if (!settingsChecked('ai_match_enabled')) return '未启用';
+            const model = settingsValue('ai_match_model') || '未填模型';
+            const concurrency = settingsValue('ai_match_max_concurrency') || '3';
+            const confidence = settingsValue('ai_match_min_confidence') || '60';
+            return `已启用 · ${model} · 并发 ${concurrency} · 阈值 ${confidence}`;
+        }
+        case 'notify': {
+            const channel = settingsValue('notify_channel') === 'wecom_app' ? '企业微信应用' : '企业微信群机器人';
+            const switches = ['notify_push_enabled', 'notify_monitor_enabled'].filter(id => settingsChecked(id)).length;
+            return `${channel} · ${switches}/2 个推送开关`;
+        }
+        case 'security': {
+            const account = settingsValue('username') ? '账号已填' : '账号未填';
+            const secretConfigured = !!settingsValue('webhook_secret') || !!latestSettingsSensitiveMeta.webhook_secret;
+            return `${account} · ${secretConfigured ? '签名密钥已配置' : '签名密钥未配置'}`;
+        }
+        case 'filter':
+            return `复合词 ${settingsLineCount('scraper_noise_phrases')} 条 · 独立词 ${settingsLineCount('scraper_standalone_noise_words')} 条`;
+        default:
+            return '';
+    }
+}
+
+export function refreshSettingsSectionSummaries() {
+    settingsSectionCards().forEach((card) => {
+        const key = settingsSectionKey(card);
+        const target = card.querySelector(`[data-settings-summary="${key}"]`);
+        if (!target) return;
+        target.textContent = buildSettingsSectionSummary(key);
+    });
+}
+
+export function initSettingsSectionNav() {
+    const page = document.getElementById('page-settings');
+    const nav = document.getElementById('settings-section-nav');
+    const cards = settingsSectionCards();
+    if (!page || !nav || !cards.length) return;
+
+    if (page.dataset.settingsSectionNavReady !== '1') {
+        page.dataset.settingsSectionNavReady = '1';
+        nav.innerHTML = cards.map((card) => {
+            const key = settingsSectionKey(card);
+            const step = String(card.dataset.settingsStep || '').trim();
+            const label = String(card.dataset.settingsNavLabel || card.dataset.settingsTitle || key).trim();
+            return '<button type="button" class="settings-section-nav-item" data-settings-section-target="' + escapeHtml(key) + '">' +
+                '<span class="settings-section-nav-index">' + escapeHtml(step) + '</span>' +
+                '<span>' + escapeHtml(label) + '</span></button>';
+        }).join('');
+        nav.addEventListener('click', (event) => {
+            const item = event.target.closest('[data-settings-section-target]');
+            if (!item) return;
+            event.preventDefault();
+            openSettingsSection(item.getAttribute('data-settings-section-target'));
+        });
+        cards.forEach((card) => {
+            const head = card.querySelector('.settings-section-head');
+            if (!head) return;
+            head.addEventListener('click', () => {
+                // 卡片头是纯开关（可以同时展开多个）；分区条点击才是单开跳转。
+                const willOpen = !card.classList.contains('is-open');
+                setSettingsSectionOpen(card, willOpen);
+                if (willOpen) {
+                    syncSettingsSectionNavState(settingsSectionKey(card));
+                    rememberSettingsSection(settingsSectionKey(card));
+                    return;
+                }
+                const stillOpen = settingsSectionCards().filter(item => item.classList.contains('is-open'));
+                if (stillOpen.length === 1) {
+                    syncSettingsSectionNavState(settingsSectionKey(stillOpen[0]));
+                    rememberSettingsSection(settingsSectionKey(stillOpen[0]));
+                    return;
+                }
+                if (!stillOpen.length) {
+                    syncSettingsSectionNavState('');
+                    rememberSettingsSection(SETTINGS_OPEN_SECTION_NONE);
+                }
+            });
+        });
+        page.addEventListener('change', (event) => {
+            if (!event.target || !event.target.closest('#page-settings')) return;
+            refreshSettingsSectionSummaries();
+        });
+
+        const remembered = readRememberedSettingsSection();
+        if (remembered === SETTINGS_OPEN_SECTION_ALL) {
+            expandAllSettingsSections();
+        } else if (remembered === SETTINGS_OPEN_SECTION_NONE) {
+            collapseAllSettingsSections();
+        } else {
+            const initial = cards.find(card => settingsSectionKey(card) === remembered) || cards[0];
+            cards.forEach((card) => setSettingsSectionOpen(card, card === initial));
+            syncSettingsSectionNavState(settingsSectionKey(initial));
+            rememberSettingsSection(settingsSectionKey(initial));
+        }
+    }
+    refreshSettingsSectionSummaries();
+}
 
 function escapeHtml(value = '') {
     return String(value ?? '')
@@ -76,6 +320,20 @@ function formatFavoriteDirLines(items = []) {
         .join('\n');
 }
 
+function parseKeywordLines(value = '', maxItems = 200) {
+    const seen = new Set();
+    return String(value || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean)
+        .filter(item => {
+            if (seen.has(item)) return false;
+            seen.add(item);
+            return true;
+        })
+        .slice(0, Math.max(1, Number(maxItems) || 200));
+}
+
 export function renderResourceFavoriteDirSettings(favoriteDirs = {}) {
     const grid = document.getElementById('resource-favorite-dir-settings-grid');
     if (!grid) return;
@@ -138,6 +396,15 @@ function collectSettingsPayload({
         'tmdb_image_base_url',
         'tmdb_language',
         'tmdb_region',
+        'ai_match_base_url',
+        'ai_match_api_key',
+        'ai_match_model',
+        'ai_match_timeout_seconds',
+        'ai_match_temperature',
+        'ai_match_max_concurrency',
+        'ai_match_thinking_mode',
+        'ai_match_min_confidence',
+        'ai_match_cache_ttl_hours',
         'pansou_base_url',
         'pansou_username',
         'pansou_password',
@@ -165,8 +432,11 @@ function collectSettingsPayload({
     cfg.notify_push_enabled = !!document.getElementById('notify_push_enabled')?.checked;
     cfg.notify_monitor_enabled = !!document.getElementById('notify_monitor_enabled')?.checked;
     cfg.tmdb_enabled = !!document.getElementById('tmdb_enabled')?.checked;
+    cfg.ai_match_enabled = !!document.getElementById('ai_match_enabled')?.checked;
     cfg.pansou_enabled = !!document.getElementById('pansou_enabled')?.checked;
     cfg.resource_favorite_dirs = collectResourceFavoriteDirs();
+    cfg.scraper_noise_phrases = parseKeywordLines(document.getElementById('scraper_noise_phrases')?.value);
+    cfg.scraper_standalone_noise_words = parseKeywordLines(document.getElementById('scraper_standalone_noise_words')?.value);
 
     // Dynamically collect provider cookies
     const meta = window.providerMeta || [];
@@ -186,6 +456,17 @@ function collectSettingsPayload({
 
     const rawTmdbCacheTtl = parseInt(document.getElementById('tmdb_cache_ttl_hours')?.value || '', 10);
     cfg.tmdb_cache_ttl_hours = Math.min(720, Math.max(1, Number.isFinite(rawTmdbCacheTtl) ? rawTmdbCacheTtl : 24));
+
+    const rawAiTimeout = parseInt(document.getElementById('ai_match_timeout_seconds')?.value || '', 10);
+    cfg.ai_match_timeout_seconds = Math.min(120, Math.max(3, Number.isFinite(rawAiTimeout) ? rawAiTimeout : 20));
+    const rawAiTemperature = parseFloat(document.getElementById('ai_match_temperature')?.value || '');
+    cfg.ai_match_temperature = Math.min(2, Math.max(0, Number.isFinite(rawAiTemperature) ? rawAiTemperature : 0));
+    const rawAiConcurrency = parseInt(document.getElementById('ai_match_max_concurrency')?.value || '', 10);
+    cfg.ai_match_max_concurrency = Math.min(8, Math.max(1, Number.isFinite(rawAiConcurrency) ? rawAiConcurrency : 3));
+    const rawAiMinConfidence = parseInt(document.getElementById('ai_match_min_confidence')?.value || '', 10);
+    cfg.ai_match_min_confidence = Math.min(100, Math.max(0, Number.isFinite(rawAiMinConfidence) ? rawAiMinConfidence : 60));
+    const rawAiCacheTtl = parseInt(document.getElementById('ai_match_cache_ttl_hours')?.value || '', 10);
+    cfg.ai_match_cache_ttl_hours = Math.min(720, Math.max(0, Number.isFinite(rawAiCacheTtl) ? rawAiCacheTtl : 24));
 
     const rawTgThreads = parseInt(document.getElementById('tg_channel_threads')?.value || '', 10);
     cfg.tg_channel_threads = Math.min(20, Math.max(1, Number.isFinite(rawTgThreads) ? rawTgThreads : 6));
@@ -497,6 +778,172 @@ export async function testNotifyPush({
     if (typeof renderNotifyTestStatus === 'function') renderNotifyTestStatus();
 }
 
+function escapeAiMatchHtml(value) {
+    return String(value === null || value === undefined ? '' : value).replace(/[&<>"']/g, (ch) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+    ));
+}
+
+let _aiMatchUsageState = null;
+
+export function renderAiMatchTestStatus({ aiMatchTestState } = {}) {
+    const state = aiMatchTestState || {};
+    const btn = document.getElementById('ai-match-test-btn');
+    const statusEl = document.getElementById('ai-match-test-status');
+    if (btn) {
+        btn.disabled = !!state.loading;
+        btn.classList.toggle('btn-disabled', !!state.loading);
+        btn.textContent = state.loading ? '测试中...' : '测试 AI 可用性';
+    }
+    if (!statusEl) return;
+    if (state.loading) {
+        statusEl.className = 'tg-proxy-status tg-proxy-status--loading';
+        statusEl.innerHTML = `
+            <div class="tg-proxy-status-title">正在测试 AI 接口</div>
+            <div class="tg-proxy-status-meta">正在用一条实际样例请求验证地址 / Key / 模型 / JSON 输出，请稍候...</div>
+        `;
+        statusEl.classList.remove('hidden');
+        return;
+    }
+    if (state.ok === true) {
+        const usage = state.usage && typeof state.usage === 'object' ? state.usage : {};
+        statusEl.className = 'tg-proxy-status tg-proxy-status--success';
+        statusEl.innerHTML = `
+            <div class="tg-proxy-status-title">AI 可用 · 耗时 ${escapeAiMatchHtml(String(state.latency_ms || 0))} ms</div>
+            <div class="tg-proxy-status-meta">${escapeAiMatchHtml(state.base_url || '')} · 模型 ${escapeAiMatchHtml(state.model || '')}${state.thinking_disabled ? ' · 已关闭思考模式' : ''}</div>
+            <div class="tg-proxy-status-note">样例识别结果：关键词「${escapeAiMatchHtml(state.keyword || '--')}」 年份 ${escapeAiMatchHtml(state.year || '--')} 类型 ${escapeAiMatchHtml(state.media_type || '--')} · 本次 ${escapeAiMatchHtml(String(usage.total_tokens || 0))} tokens</div>
+        `;
+        statusEl.classList.remove('hidden');
+        return;
+    }
+    if (state.ok === false) {
+        statusEl.className = 'tg-proxy-status tg-proxy-status--error';
+        statusEl.innerHTML = `
+            <div class="tg-proxy-status-title">AI 测试失败</div>
+            <div class="tg-proxy-status-meta">${escapeAiMatchHtml(state.message || '未知错误')}</div>
+        `;
+        statusEl.classList.remove('hidden');
+        return;
+    }
+    statusEl.classList.add('hidden');
+    statusEl.textContent = '';
+}
+
+export async function testAiMatchConnection({
+    getCurrentAiMatchConfig,
+    getAiMatchTestState,
+    setAiMatchTestState,
+    renderAiMatchTestStatus,
+} = {}) {
+    const currentState = typeof getAiMatchTestState === 'function' ? getAiMatchTestState() : {};
+    if (currentState?.loading) return;
+    if (typeof setAiMatchTestState === 'function') {
+        setAiMatchTestState({
+            loading: true,
+            ok: null,
+            message: '',
+            latency_ms: 0,
+            base_url: '',
+            model: '',
+            keyword: '',
+            year: '',
+            media_type: '',
+            thinking_disabled: false,
+            usage: null,
+        });
+    }
+    if (typeof renderAiMatchTestStatus === 'function') renderAiMatchTestStatus();
+    try {
+        const data = await window.MediaHubApi.postJson(
+            '/settings/ai_match/test',
+            typeof getCurrentAiMatchConfig === 'function' ? getCurrentAiMatchConfig() : {}
+        );
+        if (typeof setAiMatchTestState === 'function') {
+            setAiMatchTestState({
+                loading: false,
+                ok: true,
+                message: '',
+                latency_ms: Number(data?.latency_ms || 0),
+                base_url: String(data?.base_url || ''),
+                model: String(data?.model || ''),
+                keyword: String(data?.keyword || ''),
+                year: String(data?.year || ''),
+                media_type: String(data?.media_type || ''),
+                thinking_disabled: !!data?.thinking_disabled,
+                usage: data?.usage || null,
+            });
+        }
+    } catch (e) {
+        const payload = e && typeof e === 'object' && e.payload && typeof e.payload === 'object' ? e.payload : {};
+        if (typeof setAiMatchTestState === 'function') {
+            setAiMatchTestState({
+                loading: false,
+                ok: false,
+                message: String(payload.msg || payload.error || (e instanceof Error ? e.message : e) || 'AI 测试失败'),
+                latency_ms: Number(payload.latency_ms || 0),
+                base_url: String(payload.base_url || ''),
+                model: String(payload.model || ''),
+                keyword: '',
+                year: '',
+                media_type: '',
+                thinking_disabled: false,
+                usage: payload.usage || null,
+            });
+        }
+    }
+    if (typeof renderAiMatchTestStatus === 'function') renderAiMatchTestStatus();
+    try {
+        await loadAiMatchUsage();
+    } catch (_) { /* 用量刷新失败不影响测试结论 */ }
+}
+
+export function renderAiMatchUsage(usage = _aiMatchUsageState) {
+    const el = document.getElementById('ai-match-usage');
+    if (!el) return;
+    el.className = 'tg-proxy-status';
+    const data = usage && typeof usage === 'object' ? usage : null;
+    if (!data) {
+        el.innerHTML = '<div class="tg-proxy-status-meta">暂无记录。跑一次批量识别或点上面的测试按钮后，这里会显示累计用量。</div>';
+        return;
+    }
+    const calls = Number(data.calls || 0);
+    const cacheHits = Number(data.cache_hits || 0);
+    const prompt = Number(data.prompt_tokens || 0);
+    const completion = Number(data.completion_tokens || 0);
+    const total = Number(data.total_tokens || 0);
+    const cacheHitTokens = Number(data.prompt_cache_hit_tokens || 0);
+    const lastCall = String(data.last_call_at || '').trim() || '--';
+    const lastError = String(data.last_error || '').trim();
+    el.innerHTML = `
+        <div class="tg-proxy-status-title">累计调用 ${escapeAiMatchHtml(String(calls))} 次（缓存命中 ${escapeAiMatchHtml(String(cacheHits))} 次）</div>
+        <div class="tg-proxy-status-meta">输入 ${escapeAiMatchHtml(String(prompt))} tokens（其中缓存命中 ${escapeAiMatchHtml(String(cacheHitTokens))}） · 输出 ${escapeAiMatchHtml(String(completion))} tokens · 合计 ${escapeAiMatchHtml(String(total))} tokens</div>
+        <div class="tg-proxy-status-note">最近调用：${escapeAiMatchHtml(lastCall)}${lastError ? ` · 最近错误：${escapeAiMatchHtml(lastError)}` : ''}</div>
+    `;
+}
+
+export async function loadAiMatchUsage() {
+    try {
+        const data = await window.MediaHubApi.getJson('/settings/ai_match/usage');
+        _aiMatchUsageState = data?.usage && typeof data.usage === 'object' ? data.usage : null;
+    } catch (_) {
+        _aiMatchUsageState = null;
+    }
+    renderAiMatchUsage(_aiMatchUsageState);
+}
+
+export async function resetAiMatchUsage({ showToast } = {}) {
+    try {
+        const data = await window.MediaHubApi.postJson('/settings/ai_match/usage/reset', {});
+        _aiMatchUsageState = data?.usage && typeof data.usage === 'object' ? data.usage : null;
+    } catch (_) {
+        _aiMatchUsageState = null;
+    }
+    renderAiMatchUsage(_aiMatchUsageState);
+    if (typeof showToast === 'function') {
+        showToast('AI 用量统计已重置', { tone: 'info', duration: 2200, placement: 'top-center' });
+    }
+}
+
 export async function refreshCookieHealthStatus({
     force = false,
     applyCookieHealthState,
@@ -594,6 +1041,7 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
     if (!meta.length) return;
 
     const sm = sensitiveMeta && typeof sensitiveMeta === 'object' ? sensitiveMeta : {};
+    latestSettingsSensitiveMeta = sm;
 
     container.innerHTML = meta.map(p => {
         const enabled = p.enabled;
@@ -608,7 +1056,7 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
             ? ((!!sm[mixedUsernameKey] && !!sm[mixedPasswordKey]) || !!sm[cookieKey])
             : !!sm[cookieKey];
         const placeholder = p.auth_type === 'refresh_token'
-            ? '粘贴 refresh_token'
+            ? (p.name === 'aliyun' ? '粘贴 access_token / refresh_token' : '粘贴 refresh_token')
             : p.auth_type === 'password'
             ? '输入 ' + p.label + ' 账号'
             : p.auth_type === 'password_cookie'
@@ -616,8 +1064,10 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
             : '粘贴 ' + p.label + ' Cookie';
 
         let authHint = '';
-        if (p.auth_type === 'refresh_token') {
-            authHint = '<a href="https://aliyuntoken.vercel.app/" target="_blank" class="text-xs text-blue-400 hover:text-blue-300">获取 refresh_token（手机扫码）</a>';
+        if (p.auth_type === 'refresh_token' && p.name === 'aliyun') {
+            authHint = '<span class="text-xs text-slate-500">内置扫码授权后可自动填写（长期 access_token）；也可粘贴旧 refresh_token</span>';
+        } else if (p.auth_type === 'refresh_token') {
+            authHint = '<a href="https://aliyuntoken.vercel.app/" target="_blank" class="text-xs text-blue-400 hover:text-blue-300">备用：用第三方工具获取 refresh_token（不推荐）</a>';
         } else if (p.auth_type === 'oauth2') {
             authHint = '<span class="text-xs text-slate-500">Cookie + OAuth2 自动续期</span>';
         } else if (p.auth_type === 'password') {
@@ -638,40 +1088,403 @@ export function renderProviderAuthBlocks(cfg, sensitiveMeta) {
             ? '<span class="w-2 h-2 rounded-full bg-emerald-400 inline-block ml-1" title="已配置"></span>'
             : '<span class="w-2 h-2 rounded-full bg-slate-600 inline-block ml-1" title="未配置"></span>';
 
+        const isScanProvider = p.name === '115' || p.name === 'aliyun';
+
+        const manualInputs = p.auth_type === 'password'
+            ? ('<input id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="' + placeholder + '">' +
+               '<input id="' + passwordKey + '" type="password" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 密码">')
+            : p.auth_type === 'password_cookie'
+            ? ('<input id="' + mixedUsernameKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 账号">' +
+               '<input id="' + mixedPasswordKey + '" type="password" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 密码">' +
+               '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>')
+            : '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>';
+
+        const canCopyCredential = ['cookie', 'password_cookie', 'refresh_token'].includes(p.auth_type);
+        const copyStatusId = 'provider-copy-status-' + p.name;
+        const copyButton = canCopyCredential
+            ? '<button type="button" id="provider-copy-' + p.name + '" onclick="copyProviderCredential(\'' + p.name + '\')" ' +
+              'class="text-xs text-slate-400 hover:text-slate-200 bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors' + (isConfigured ? '' : ' opacity-50 cursor-not-allowed') + '"' +
+              (isConfigured ? '' : ' disabled title="未配置凭证"') + '>复制凭证</button>' +
+              '<span id="' + copyStatusId + '" class="text-xs text-slate-500"></span>'
+            : '';
+        const healthRow = '<div class="mt-2 flex items-center gap-2">' +
+            '<button type="button" onclick="testProviderCookie(\'' + p.name + '\')" class="text-xs text-slate-400 hover:text-slate-200 bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors">健康检查</button>' +
+            '<span id="provider-health-' + p.name + '" class="text-xs text-slate-500"></span>' +
+            copyButton +
+        '</div>';
+
+        const scanBlock = p.name === '115'
+            ? '<div id="pan115-qr-wrap">' +
+                '<div class="flex items-center justify-between mb-2">' +
+                    '<div class="flex items-center gap-2">' +
+                        '<span class="text-[11px] leading-4 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-400/30">推荐</span>' +
+                        '<span class="text-sm font-medium text-slate-200">扫码登录</span>' +
+                    '</div>' +
+                    '<button type="button" id="pan115-qr-btn" onclick="start115QrLogin()" class="text-xs text-slate-200 hover:text-white bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors">获取二维码</button>' +
+                '</div>' +
+                '<p class="text-[11px] leading-relaxed text-slate-500 mb-2">用不常用设备（微信/支付宝小程序、电视端）扫码，自动写入 Cookie，不挤掉你现有登录。</p>' +
+                '<div class="mb-2">' +
+                    '<label class="text-[11px] text-slate-500 block mb-1" for="pan115-qr-client">扫码客户端</label>' +
+                    '<select id="pan115-qr-client" class="w-full bg-slate-900 border-slate-700 rounded-xl p-2 text-sm">' +
+                        '<option value="wechatmini" selected>微信小程序</option>' +
+                    '</select>' +
+                '</div>' +
+                '<div id="pan115-qr" class="hidden">' +
+                    '<img id="pan115-qr-image" class="w-44 h-44 bg-white rounded-xl p-1" alt="115 扫码二维码" />' +
+                    '<div id="pan115-qr-status" class="text-xs text-slate-500 mt-2"></div>' +
+                '</div>' +
+            '</div>'
+            : p.name === 'aliyun'
+            ? '<div id="aliyun-oauth-wrap">' +
+                '<div class="flex items-center justify-between mb-2">' +
+                    '<div class="flex items-center gap-2">' +
+                        '<span class="text-[11px] leading-4 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-400/30">推荐</span>' +
+                        '<span class="text-sm font-medium text-slate-200">扫码授权</span>' +
+                    '</div>' +
+                    '<button type="button" id="aliyun-oauth-btn" onclick="startAliyunOAuth()" class="text-xs text-slate-200 hover:text-white bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors">获取授权码</button>' +
+                '</div>' +
+                '<p class="text-[11px] leading-relaxed text-slate-500 mb-2">官方 OAuth 授权，扫码后自动写入长期 access_token，有效约 30 天，到期重扫一次即可。</p>' +
+                '<div class="flex items-center gap-2">' +
+                    '<input id="aliyun-oauth-code" class="flex-1 min-w-0 bg-slate-900 border-slate-700 rounded-xl p-3 text-sm font-mono" placeholder="粘贴授权码（code）" />' +
+                    '<button type="button" id="aliyun-oauth-bind-btn" onclick="bindAliyunCode()" class="shrink-0 text-xs text-slate-200 hover:text-white bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded-lg transition-colors">绑定并保存</button>' +
+                '</div>' +
+                '<div id="aliyun-oauth-status" class="text-xs text-slate-500 mt-2"></div>' +
+            '</div>'
+            : '';
+
+        const manualLabel = scanBlock
+            ? '<div class="flex items-center gap-2 mb-1">' +
+                '<span class="text-[11px] leading-4 px-1.5 py-0.5 rounded bg-slate-700/40 text-slate-400 border border-slate-600">备用</span>' +
+                '<span class="text-xs text-slate-400">手动粘贴 ' + (p.name === 'aliyun' ? 'access_token / refresh_token' : 'Cookie') + '</span>' +
+              '</div>'
+            : '';
+
         return '<div class="provider-auth-block mb-3 bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">' +
-            '<div class="flex items-center justify-between p-3 cursor-pointer" onclick="toggleProviderBlock(\'' + p.name + '\')">' +
+            '<div data-provider-header="' + p.name + '" class="flex items-center justify-between p-3 cursor-pointer" role="button" aria-expanded="false" onclick="toggleProviderBlock(\'' + p.name + '\')">' +
                 '<div class="flex items-center gap-3">' +
                     '<span class="text-sm text-slate-200">' + p.label + '</span>' +
                     statusDot +
                     tagsHtml +
                 '</div>' +
-                '<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation()">' +
-                    '<input type="checkbox" id="provider_enabled_' + p.name + '" ' + (enabled ? 'checked' : '') + ' onchange="toggleProviderEnabled(\'' + p.name + '\', this.checked)" class="sr-only peer">' +
-                    '<div class="provider-toggle w-9 h-5 bg-slate-600 rounded-full peer peer-checked:bg-emerald-500/70 peer-focus:ring-2 peer-focus:ring-emerald-400/30 after:content-[\'\'] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>' +
-                '</label>' +
+                '<div class="flex items-center gap-2">' +
+                    '<svg class="provider-chevron" data-provider-chevron="' + p.name + '" viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">' +
+                        '<path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
+                    '</svg>' +
+                    '<label class="relative inline-flex items-center cursor-pointer" onclick="event.stopPropagation()">' +
+                        '<input type="checkbox" id="provider_enabled_' + p.name + '" ' + (enabled ? 'checked' : '') + ' onchange="toggleProviderEnabled(\'' + p.name + '\', this.checked)" class="sr-only peer">' +
+                        '<div class="provider-toggle w-9 h-5 bg-slate-600 rounded-full peer peer-checked:bg-emerald-500/70 peer-focus:ring-2 peer-focus:ring-emerald-400/30 after:content-[\'\'] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>' +
+                    '</label>' +
+                '</div>' +
             '</div>' +
             '<div id="provider-block-body-' + p.name + '" class="p-3 pt-0 border-t border-slate-700/50 hidden">' +
-                authHint +
-                (p.auth_type === 'password'
-                    ? ('<input id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="' + placeholder + '">' +
-                       '<input id="' + passwordKey + '" type="password" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 密码">')
-                    : p.auth_type === 'password_cookie'
-                    ? ('<input id="' + mixedUsernameKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 账号">' +
-                       '<input id="' + mixedPasswordKey + '" type="password" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2" placeholder="输入 ' + p.label + ' 密码">' +
-                       '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>')
-                    : '<textarea id="' + cookieKey + '" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-2 font-mono" rows="3" placeholder="' + placeholder + '"></textarea>') +
-                '<div class="mt-2 flex items-center gap-2">' +
-                    '<button type="button" onclick="testProviderCookie(\'' + p.name + '\')" class="text-xs text-slate-400 hover:text-slate-200 bg-slate-700 hover:bg-slate-600 px-3 py-1 rounded-lg transition-colors">健康检查</button>' +
-                    '<span id="provider-health-' + p.name + '" class="text-xs text-slate-500"></span>' +
-                '</div>' +
+                (scanBlock
+                    ? scanBlock +
+                      '<div class="mt-3 pt-3 border-t border-slate-700/50">' + manualLabel + manualInputs + '</div>' +
+                      healthRow
+                    : authHint + manualInputs + healthRow) +
             '</div>' +
         '</div>';
     }).join('');
+
+    populatePan115QrClients();
+}
+
+let _pan115QrTimer = null;
+let _pan115QrAttempts = 0;
+const _PAN115_QR_DEFAULT_CLIENTS = [
+    ['wechatmini', '微信小程序（推荐，默认）'],
+    ['alipaymini', '支付宝小程序（推荐）'],
+    ['tv', '电视端 TV（推荐）'],
+    ['qandroid', '安卓 Q 版'],
+    ['android', '安卓 App'],
+    ['ios', 'iOS App'],
+    ['web', '网页端 Web（不推荐，会顶掉现有登录）'],
+];
+
+function _fillPan115QrClientDefaults(selectEl) {
+    if (!selectEl) return;
+    selectEl.innerHTML = _PAN115_QR_DEFAULT_CLIENTS.map(([value, label]) =>
+        '<option value="' + escapeHtml(value) + '"' + (value === 'wechatmini' ? ' selected' : '') + '>' + escapeHtml(label) + '</option>'
+    ).join('');
+}
+
+async function populatePan115QrClients() {
+    const selectEl = document.getElementById('pan115-qr-client');
+    if (!selectEl) return;
+    try {
+        const data = await window.MediaHubApi.getJson('/settings/providers/115/qrcode/apps');
+        const apps = Array.isArray(data?.apps) ? data.apps : [];
+        if (apps.length) {
+            selectEl.innerHTML = apps.map((a) =>
+                '<option value="' + escapeHtml(a.value) + '"' + (a.default ? ' selected' : '') + '>' +
+                escapeHtml(a.label) + (a.rec ? '（推荐）' : '') + '</option>'
+            ).join('');
+            return;
+        }
+    } catch (_) { /* fall through to defaults */ }
+    _fillPan115QrClientDefaults(selectEl);
+}
+
+function _pan115QrSetStatus(text, isError = false) {
+    const statusEl = document.getElementById('pan115-qr-status');
+    if (statusEl) {
+        statusEl.textContent = text;
+        statusEl.className = 'text-xs mt-2 ' + (isError ? 'text-red-400' : 'text-slate-500');
+    }
+}
+
+function _pan115QrResetButton() {
+    const btn = document.getElementById('pan115-qr-btn');
+    if (btn) {
+        btn.disabled = false;
+        btn.innerText = '获取二维码';
+    }
+}
+
+function _pan115QrStop() {
+    if (_pan115QrTimer) {
+        clearInterval(_pan115QrTimer);
+        _pan115QrTimer = null;
+    }
+}
+
+function _pan115QrClientValue() {
+    const selectEl = document.getElementById('pan115-qr-client');
+    return selectEl ? (selectEl.value || 'wechatmini') : 'wechatmini';
+}
+
+async function start115QrLogin() {
+    const wrap = document.getElementById('pan115-qr');
+    const img = document.getElementById('pan115-qr-image');
+    const btn = document.getElementById('pan115-qr-btn');
+    if (!wrap || !img) return;
+    _pan115QrStop();
+    _pan115QrAttempts = 0;
+    if (btn) {
+        btn.disabled = true;
+        btn.innerText = '获取中…';
+    }
+    _pan115QrSetStatus('正在获取二维码…');
+    wrap.classList.remove('hidden');
+    try {
+        const data = await window.MediaHubApi.getJson('/settings/providers/115/qrcode/token');
+        if (!data?.ok) throw new Error(data?.error || '获取二维码失败');
+        const uid = data.uid, time = data.time, sign = data.sign;
+        img.src = '/settings/providers/115/qrcode/image?uid=' + encodeURIComponent(uid);
+        _pan115QrSetStatus('请使用 115 App 或所选客户端扫码（默认微信小程序）');
+        _pan115QrTimer = setInterval(() => poll115QrLogin(uid, time, sign), 2000);
+    } catch (e) {
+        _pan115QrSetStatus('✗ 获取二维码失败：' + (e?.message || e), true);
+        _pan115QrResetButton();
+    }
+}
+
+async function poll115QrLogin(uid, time, sign) {
+    _pan115QrAttempts += 1;
+    try {
+        const data = await window.MediaHubApi.getJson(
+            '/settings/providers/115/qrcode/status?uid=' + encodeURIComponent(uid) +
+            '&time=' + encodeURIComponent(time) +
+            '&sign=' + encodeURIComponent(sign)
+        );
+        const code = Number(data?.status);
+        if (code === 0) {
+            _pan115QrSetStatus('等待扫码…');
+        } else if (code === 1) {
+            _pan115QrSetStatus('已扫码，请在手机上确认…');
+        } else if (code === 2) {
+            _pan115QrStop();
+            await finish115QrLogin(uid);
+            return;
+        } else if (code === -1) {
+            _pan115QrStop();
+            _pan115QrSetStatus('二维码已过期，请重新获取', true);
+            _pan115QrResetButton();
+        } else if (code === -2) {
+            _pan115QrStop();
+            _pan115QrSetStatus('已取消扫码', true);
+            _pan115QrResetButton();
+        } else {
+            _pan115QrStop();
+            _pan115QrSetStatus('二维码状态异常，请重新获取', true);
+            _pan115QrResetButton();
+        }
+    } catch (e) {
+        _pan115QrStop();
+        _pan115QrSetStatus('轮询失败：' + (e?.message || e), true);
+        _pan115QrResetButton();
+    }
+    if (_pan115QrAttempts >= 90) {
+        _pan115QrStop();
+        _pan115QrSetStatus('二维码已超时，请重新获取', true);
+        _pan115QrResetButton();
+    }
+}
+
+async function finish115QrLogin(uid) {
+    _pan115QrSetStatus('扫码成功，正在绑定设备并保存 Cookie…');
+    try {
+        const app = _pan115QrClientValue();
+        const data = await window.MediaHubApi.postJson('/settings/providers/115/qrcode/result', { uid, app });
+        if (data?.ok) {
+            _pan115QrSetStatus('✓ 已绑定「' + (data.app || app) + '」，Cookie 已保存，正在检测…');
+            if (typeof window.checkCookieHealthProvider === 'function') {
+                window.checkCookieHealthProvider('115');
+            }
+            if (typeof window.renderProviderAuthBlocks === 'function' && typeof window.MediaHubApi === 'object') {
+                window.MediaHubApi.getJson('/get_settings').then((cfg) => {
+                    if (cfg && typeof window.renderProviderAuthBlocks === 'function') {
+                        window.renderProviderAuthBlocks(cfg, cfg.sensitive_configured || {});
+                    }
+                }).catch(() => {});
+            }
+        } else {
+            _pan115QrSetStatus('✗ 保存失败：' + (data?.error || '请重试'), true);
+        }
+    } catch (e) {
+        _pan115QrSetStatus('✗ 保存失败：' + (e?.message || e), true);
+    }
+    _pan115QrResetButton();
+}
+
+let _aliyunOAuthState = null;
+
+function setAliyunOAuthStatus(text, isError = false) {
+    const statusEl = document.getElementById('aliyun-oauth-status');
+    if (statusEl) {
+        statusEl.textContent = text;
+        statusEl.className = 'text-xs ' + (isError ? 'text-red-400' : 'text-slate-500');
+    }
+}
+
+async function startAliyunOAuth() {
+    const authBtn = document.getElementById('aliyun-oauth-btn');
+    if (authBtn) {
+        authBtn.disabled = true;
+        authBtn.innerText = '生成中…';
+    }
+    try {
+        const codeEl = document.getElementById('aliyun-oauth-code');
+        if (codeEl) codeEl.value = '';
+        const data = await window.MediaHubApi.getJson('/settings/providers/aliyun/oauth/start');
+        if (!data?.ok) throw new Error(data?.error || '获取授权失败');
+        _aliyunOAuthState = { state: data.state, code_verifier: data.code_verifier };
+        if (data.authorize_url) {
+            window.open(data.authorize_url, '_blank');
+        }
+        if (authBtn) {
+            authBtn.disabled = true;
+            authBtn.innerText = '已生成授权页';
+        }
+        setAliyunOAuthStatus('已在新窗口打开官方授权页，请扫码授权后复制授权码并粘贴到下方');
+    } catch (e) {
+        setAliyunOAuthStatus('✗ ' + (e?.message || e), true);
+        if (authBtn) {
+            authBtn.disabled = false;
+            authBtn.innerText = '获取授权码';
+        }
+    }
+}
+
+async function bindAliyunCode() {
+    const codeEl = document.getElementById('aliyun-oauth-code');
+    const code = String(codeEl?.value || '').trim();
+    const btn = document.getElementById('aliyun-oauth-bind-btn');
+    const authBtn = document.getElementById('aliyun-oauth-btn');
+    if (!code || !_aliyunOAuthState || !_aliyunOAuthState.code_verifier) {
+        setAliyunOAuthStatus('请先点击“获取授权码”并粘贴授权码', true);
+        return;
+    }
+    if (btn) {
+        btn.disabled = true;
+        btn.innerText = '绑定中…';
+    }
+    setAliyunOAuthStatus('正在换取访问凭证…');
+    try {
+        const data = await window.MediaHubApi.postJson('/settings/providers/aliyun/oauth/complete', {
+            state: _aliyunOAuthState.state,
+            code,
+            code_verifier: _aliyunOAuthState.code_verifier,
+        });
+        if (data?.ok) {
+            _aliyunOAuthState = null;
+            setAliyunOAuthStatus('✓ ' + (data.message || '授权成功，已保存访问凭证'));
+            if (typeof window.checkCookieHealthProvider === 'function') {
+                window.checkCookieHealthProvider('aliyun');
+            }
+            if (typeof window.renderProviderAuthBlocks === 'function' && typeof window.MediaHubApi === 'object') {
+                window.MediaHubApi.getJson('/get_settings').then((cfg) => {
+                    if (cfg && typeof window.renderProviderAuthBlocks === 'function') {
+                        window.renderProviderAuthBlocks(cfg, cfg.sensitive_configured || {});
+                    }
+                }).catch(() => {});
+            }
+        } else {
+            setAliyunOAuthStatus('✗ ' + (data?.error || '换取失败，请重试'), true);
+        }
+    } catch (e) {
+        setAliyunOAuthStatus('✗ ' + (e?.message || e), true);
+    }
+    if (btn) {
+        btn.disabled = false;
+        btn.innerText = '绑定并保存';
+    }
+    if (authBtn) {
+        authBtn.disabled = false;
+        authBtn.innerText = '获取授权码';
+    }
+}
+
+async function copyProviderCredential(name) {
+    const statusEl = document.getElementById('provider-copy-status-' + name);
+    const setStatus = (text, isError = false) => {
+        if (statusEl) {
+            statusEl.textContent = text;
+            statusEl.className = 'text-xs ' + (isError ? 'text-red-400' : 'text-slate-500');
+        }
+    };
+    setStatus('获取中…');
+    try {
+        const data = await window.MediaHubApi.getJson('/settings/providers/' + encodeURIComponent(name) + '/credential');
+        if (!data?.ok) throw new Error(data?.error || '获取失败');
+        const value = String(data.credential || '').trim();
+        if (!value) {
+            setStatus('未配置凭证');
+            return;
+        }
+        try {
+            if (!navigator.clipboard?.writeText) throw new Error('当前浏览器不支持剪贴板接口');
+            await navigator.clipboard.writeText(value);
+            setStatus('已复制 ✓');
+            if (typeof window.showToast === 'function') {
+                window.showToast('已复制 ' + (data.label || name) + ' 凭证到剪贴板', { tone: 'success', duration: 2200, placement: 'top-center' });
+            }
+        } catch (clipError) {
+            if (typeof window.showAppPrompt === 'function') {
+                window.showAppPrompt('复制失败，请手动复制凭证：', value);
+                setStatus('请手动复制');
+            } else {
+                throw clipError;
+            }
+        }
+    } catch (e) {
+        setStatus('复制失败', true);
+        if (typeof window.showToast === 'function') {
+            window.showToast('复制失败：' + (e?.message || e), { tone: 'error', duration: 3000, placement: 'top-center' });
+        }
+    }
 }
 
 function toggleProviderBlock(name) {
     const body = document.getElementById('provider-block-body-' + name);
-    if (body) body.classList.toggle('hidden');
+    if (!body) return;
+    const wasVisible = !body.classList.contains('hidden');
+    body.classList.toggle('hidden');
+    const block = body.closest?.('.provider-auth-block');
+    const chevron = block?.querySelector('[data-provider-chevron="' + name + '"]');
+    if (chevron) chevron.classList.toggle('is-open', !wasVisible);
+    const header = block?.querySelector('[data-provider-header="' + name + '"]');
+    if (header) header.setAttribute('aria-expanded', String(!wasVisible));
 }
 
 function toggleProviderEnabled(name, checked) {
@@ -797,6 +1610,7 @@ export async function saveSettings({
         }
         if (typeof refreshResourceState === 'function') void refreshResourceState({ allowSearch: false });
         if (typeof refreshSign115Status === 'function') void refreshSign115Status(false);
+        refreshSettingsSectionSummaries();
         return true;
     }
 
@@ -1029,6 +1843,7 @@ export function updateCookieHealthBar(cookieHealthState) {
     if (!dotsContainer) return;
     const state = cookieHealthState && typeof cookieHealthState === 'object' ? cookieHealthState : {};
     latestCookieHealthState = state;
+    refreshSettingsSectionSummaries();
     const meta = window.providerMeta || [];
     let busy = false;
     dotsContainer.innerHTML = meta.map(p => {
@@ -1066,6 +1881,10 @@ if (typeof window !== 'undefined') {
     window.toggleProviderBlock = toggleProviderBlock;
     window.toggleProviderEnabled = toggleProviderEnabled;
     window.testProviderCookie = testProviderCookie;
+    window.start115QrLogin = start115QrLogin;
+    window.startAliyunOAuth = startAliyunOAuth;
+    window.bindAliyunCode = bindAliyunCode;
+    window.copyProviderCredential = copyProviderCredential;
     window.renderCookieHealthBar = renderCookieHealthBar;
     window.updateCookieHealthBar = updateCookieHealthBar;
     window.checkCookieHealthProviders = checkCookieHealthProviders;

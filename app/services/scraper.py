@@ -2,18 +2,22 @@ import os
 import re
 import unicodedata
 import uuid
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core import *  # noqa: F401,F403
 from ..db import db_connection
 from ..providers.pan115 import (
+    _115_RENAME_WAIT_SECONDS,
     invalidate_115_entries_cache,
     list_115_entries_payload,
     rename_115_entries,
     resolve_115_entry_by_name,
     resolve_115_folder_id_by_path,
+    resolve_115_folder_path,
     search_115_entries,
+    wait_115_writes_landed,
 )
 from ..providers.registry import get_or_none as get_provider_or_none, list_enabled as list_enabled_providers
 from ..media_tags import media_tag_labels, parse_media_tags, remove_media_tags
@@ -31,6 +35,7 @@ def _prepare_scraper_monitor_sync(
     *,
     source_action: str,
     dedupe_key: str,
+    monitor_run_id: str = "",
 ) -> Dict[str, Any]:
     """Create a durable monitor event before a 115 mutation.
 
@@ -45,6 +50,7 @@ def _prepare_scraper_monitor_sync(
         entries=entries,
         source_action=source_action,
         dedupe_key=dedupe_key,
+        monitor_run_id=monitor_run_id,
         cfg=get_config(),
     )
 
@@ -607,8 +613,19 @@ def _rename_provider_entry(provider: str, cookie: str, entry_id: str, new_name: 
     return p.rename_entry(cookie, entry_id, new_name, parent_id)
 
 
-def _rename_provider_entries(provider: str, cookie: str, renames: Dict[str, str], parent_id: str = "") -> Dict[str, Any]:
-    """批量重命名（115 官方 batch_rename 一次传多个；其他网盘逐条回退）。"""
+def _rename_provider_entries(
+    provider: str,
+    cookie: str,
+    renames: Dict[str, str],
+    parent_id: str = "",
+    *,
+    verify_landing: bool = True,
+) -> Dict[str, Any]:
+    """批量重命名（115 官方 batch_rename 一次传多个；其他网盘逐条回退）。
+
+    返回里带 ``landing``：115 写操作是排队的，只有回验到新名字 / 新父目录才算真的落地，
+    调用方据此决定要不要把监控同步事件按"成功"收尾。
+    """
     _require_scraper_operation(provider, "rename", "重命名")
     normalized = normalize_scraper_provider(provider)
     normalized_renames: Dict[str, str] = {}
@@ -620,17 +637,62 @@ def _rename_provider_entries(provider: str, cookie: str, renames: Dict[str, str]
     if not normalized_renames:
         raise RuntimeError("重命名条目不能为空")
     if normalized == "115":
-        return rename_115_entries(cookie, normalized_renames, parent_cid=parent_id)
+        result = dict(rename_115_entries(cookie, normalized_renames, parent_cid=parent_id) or {})
+        if verify_landing:
+            result["landing"] = _await_provider_writes_landed(
+                provider,
+                cookie,
+                [
+                    {
+                        "id": entry_id,
+                        "parent_id": str(parent_id or "").strip(),
+                        "name": name,
+                        "source_parent_id": str(parent_id or "").strip(),
+                    }
+                    for entry_id, name in normalized_renames.items()
+                ],
+                kind="rename",
+            )
+        return result
     responses = []
     for entry_id, name in normalized_renames.items():
         responses.append(_rename_provider_entry(provider, cookie, entry_id, name, parent_id))
     return {"renames": normalized_renames, "responses": responses}
 
 
-def _move_provider_entries(provider: str, cookie: str, entry_ids: List[str], target_id: str, source_id: str = "") -> Dict[str, Any]:
+def _move_provider_entries(
+    provider: str,
+    cookie: str,
+    entry_ids: List[str],
+    target_id: str,
+    source_id: str = "",
+    *,
+    verify_landing: bool = True,
+) -> Dict[str, Any]:
+    """移动条目；115 额外等它真正落地（progress + 父目录回验）。
+
+    ``verify_landing=False`` 只给失败恢复 / 回滚这类"尽力而为"的路径用，避免拖慢救援。
+    """
     _require_scraper_operation(provider, "move", "移动")
     p = get_provider_or_none(provider)
-    return p.move_entries(cookie, entry_ids, target_id, source_id)
+    result = dict(p.move_entries(cookie, entry_ids, target_id, source_id) or {})
+    if verify_landing:
+        result["landing"] = _await_provider_writes_landed(
+            provider,
+            cookie,
+            [
+                {
+                    "id": str(entry_id or "").strip(),
+                    "parent_id": str(target_id or "").strip(),
+                    "source_parent_id": str(source_id or "").strip(),
+                }
+                for entry_id in (entry_ids or [])
+                if str(entry_id or "").strip()
+            ],
+            move_proid=str(result.get("move_proid", "") or ""),
+            kind="move",
+        )
+    return result
 
 
 def _copy_provider_entries(provider: str, cookie: str, entry_ids: List[str], target_id: str, source_id: str = "") -> Dict[str, Any]:
@@ -648,6 +710,108 @@ def _delete_provider_entries(provider: str, cookie: str, entry_ids: List[str], p
 def _invalidate_provider_parent(provider: str, parent_id: str = "") -> None:
     if provider == "115":
         invalidate_115_entries_cache(parent_id)
+
+
+_LANDING_LANDED_RESULT: Dict[str, Any] = {
+    "status": "landed",
+    "pending_ids": [],
+    "unknown_ids": [],
+    "progress_status": "skipped",
+    "waited_seconds": 0.0,
+    "attempts": 0,
+}
+
+
+def _await_provider_writes_landed(
+    provider: str,
+    cookie: str,
+    expects: List[Dict[str, Any]],
+    *,
+    move_proid: str = "",
+    kind: str = "move",
+) -> Dict[str, Any]:
+    """等 115 写操作真正落地（先看移动任务进度，再逐条回验父目录 / 名字）。
+
+    只有 115 需要；其他网盘接口是同步的，直接返回"已落地"。
+    确认超时 / 查不出来不是搬运失败——由调用方决定按成功收尾还是走 needs_reconcile 兜底。
+    """
+    normalized = normalize_scraper_provider(provider)
+    checkable = [
+        item
+        for item in (expects or [])
+        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    ]
+    if normalized != "115" or not checkable:
+        return dict(_LANDING_LANDED_RESULT)
+    kind_label = "改名" if kind == "rename" else "移动"
+    try:
+        return wait_115_writes_landed(
+            cookie,
+            checkable,
+            move_proid=str(move_proid or "").strip(),
+            timeout_seconds=_115_RENAME_WAIT_SECONDS if kind == "rename" else None,
+            label=f"115 {kind_label}",
+        )
+    except Exception as exc:
+        logging.info("115 %s 落地确认失败（不影响搬运结果）：%s", kind_label, str(exc)[:120])
+        return {
+            **_LANDING_LANDED_RESULT,
+            "status": "unknown",
+            "unknown_ids": [str(item.get("id", "") or "").strip() for item in checkable],
+            "progress_status": "error",
+        }
+
+
+def _landing_pending_detail(landing: Optional[Dict[str, Any]]) -> str:
+    """未确认落地时的说明文字；返回空串表示可以按成功收尾。"""
+    if not isinstance(landing, dict):
+        return ""
+    pending_ids = [str(value) for value in (landing.get("pending_ids") or []) if str(value or "").strip()]
+    if not pending_ids:
+        return ""
+    waited = int(float(landing.get("waited_seconds", 0) or 0))
+    progress = str(landing.get("progress_status", "") or "")
+    tail = f"，进度={progress}" if progress and progress != "skipped" else ""
+    return f"已提交给 115，但等待 {waited} 秒仍未确认落地（{len(pending_ids)} 项{tail}）"
+
+
+def _merge_scraper_landing_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """把多阶段写操作各自的 landing 合并成一份（批量整理收尾判断用）。"""
+    pending: List[str] = []
+    unknown: List[str] = []
+    waited = 0.0
+    progress_statuses: List[str] = []
+    for result in results or []:
+        landing = result.get("landing") if isinstance(result, dict) else {}
+        if not isinstance(landing, dict) or not landing:
+            continue
+        pending.extend(str(value) for value in (landing.get("pending_ids") or []) if str(value or "").strip())
+        unknown.extend(str(value) for value in (landing.get("unknown_ids") or []) if str(value or "").strip())
+        waited = max(waited, float(landing.get("waited_seconds", 0) or 0))
+        status = str(landing.get("progress_status", "") or "").strip()
+        if status:
+            progress_statuses.append(status)
+    return {
+        "status": "pending" if pending else ("unknown" if unknown else "landed"),
+        "pending_ids": list(dict.fromkeys(pending)),
+        "unknown_ids": list(dict.fromkeys(unknown)),
+        "progress_status": ",".join(dict.fromkeys(progress_statuses)),
+        "waited_seconds": waited,
+        "attempts": len(results or []),
+    }
+
+
+def _finish_scraper_syncs_with_landing(
+    prepared_syncs: List[Dict[str, Any]],
+    landing: Optional[Dict[str, Any]],
+) -> None:
+    """按"是否确认落地"收尾监控同步事件：落地按成功，否则交给 needs_reconcile 兜底。"""
+    detail = _landing_pending_detail(landing)
+    for prepared_sync in prepared_syncs or []:
+        if detail:
+            _finish_scraper_monitor_sync(prepared_sync, succeeded=False, error=detail)
+        else:
+            _finish_scraper_monitor_sync(prepared_sync, succeeded=True)
 
 
 def _compact_scraper_entry(entry: Dict[str, Any], parent_id: str = "", parent_path: str = "") -> Dict[str, Any]:
@@ -788,11 +952,24 @@ def list_scraper_entries(
             offset=max(0, int(offset or 0)),
             limit=max(20, min(int(limit or 300), 1000)),
         )
-    entries = [
-        compact
-        for compact in (_compact_scraper_entry(item, target_id) for item in (payload.get("entries", []) if isinstance(payload, dict) else []))
-        if compact
-    ]
+    raw_entries = payload.get("entries", []) if isinstance(payload, dict) else []
+    entries = []
+    for raw_item in raw_entries:
+        compact = _compact_scraper_entry(raw_item, "" if search_source == "official" else target_id)
+        if compact:
+            entries.append(compact)
+    if search_source == "official":
+        # 官方搜索命中网盘任意位置，不能把结果当成当前目录的子项补全路径。
+        for raw_item, entry in zip(raw_entries, entries):
+            entry["search_result"] = True
+            raw_path = str((raw_item if isinstance(raw_item, dict) else {}).get("path", "") or "").strip()
+            entry["path_unknown"] = not raw_path
+            real_parent = str(entry.get("parent_id", "") or "").strip()
+            if not real_parent or real_parent == "0":
+                entry["parent_id"] = ""
+                entry["parent_path"] = ""
+            if not raw_path:
+                entry["path"] = str(entry.get("name", "") or "")
     if keyword and search_source == "local":
         lower_keyword = keyword.lower()
         entries = [item for item in entries if lower_keyword in str(item.get("name", "")).lower()]
@@ -847,19 +1024,48 @@ def resolve_scraper_path_entry(provider: str, path: str) -> Dict[str, Any]:
     return entry
 
 
-def resolve_scraper_dest_folder_id(provider: str, dest: str) -> str:
-    """解析 move/copy 的目标目录路径为 115 目录 ID（仅支持 115）。"""
+def resolve_scraper_folder_path(provider: str, cid: str) -> Dict[str, Any]:
+    """按目录 id 返回网盘真实相对路径（目前仅 115 提供祖先链查询）。
+
+    用于 115 官方搜索结果命中网盘任意位置时，进入该目录后恢复真实路径栏；
+    其它网盘没有该能力时返回空路径，前端保持“根目录 / 该文件夹”的兜底显示。
+    """
     normalized = normalize_scraper_provider(provider)
+    target_id = str(cid or "0").strip() or "0"
     if normalized != "115":
-        raise RuntimeError(f"目标路径操作当前仅支持 115，{normalized} 请改用 target_cid 参数")
-    cfg = get_config()
-    cookie = str(cfg.get("cookie_115", "") or "").strip()
-    if not cookie:
-        raise RuntimeError("115 Cookie 未配置")
+        return {"ok": True, "provider": normalized, "cid": target_id, "path": "", "ancestors": []}
+    cookie = _require_provider_cookie(normalized)
+    resolved = resolve_115_folder_path(cookie, target_id)
+    return {
+        "ok": True,
+        "provider": normalized,
+        "cid": str(resolved.get("cid", "") or target_id).strip() or target_id,
+        "path": str(resolved.get("path", "") or "").strip(),
+        "ancestors": resolved.get("ancestors") or [],
+    }
+
+
+def resolve_scraper_dest_folder_id(provider: str, dest: str) -> str:
+    """解析 move/copy 的目标目录路径为目标网盘内的目录 ID。
+
+    115 走分页版 ``resolve_115_folder_id_by_path``（大目录不漏匹配）；其他网盘走
+    provider 自己的 ``resolve_folder_id_by_path``，按名字逐层向下找，找不到会抛出
+    带完整路径的错误。接收夹挂在非 115 网盘时，分发目标就是走这条分支。
+    """
+    normalized = normalize_scraper_provider(provider)
     normalized_dest = normalize_relative_path(str(dest or "").strip())
     if not normalized_dest:
         raise RuntimeError("目标路径无效")
-    return resolve_115_folder_id_by_path(cookie, normalized_dest)
+    cookie = _require_provider_cookie(normalized)
+    if normalized == "115":
+        return resolve_115_folder_id_by_path(cookie, normalized_dest)
+    p = get_provider_or_none(normalized)
+    if not p:
+        raise RuntimeError("网盘类型无效")
+    resolved = str(p.resolve_folder_id_by_path(cookie, normalized_dest) or "").strip()
+    if not resolved:
+        raise RuntimeError(f"未找到目标目录：{normalized_dest}")
+    return resolved
 
 
 def _resolve_scraper_selected_paths(
@@ -983,8 +1189,31 @@ def rename_scraper_entry(
         _finish_scraper_monitor_sync(prepared, succeeded=False, error=str(exc))
         raise
     _invalidate_provider_parent(normalized, parent_id)
-    monitor_sync = _finish_scraper_monitor_sync(prepared, succeeded=True)
-    return {"ok": True, "provider": normalized, "entry": result, "monitor_sync": monitor_sync}
+    landing = _await_provider_writes_landed(
+        normalized,
+        cookie,
+        [
+            {
+                "id": str(entry_id or "").strip(),
+                "parent_id": str(parent_id or "").strip(),
+                "name": str(name or "").strip(),
+                "source_parent_id": str(parent_id or "").strip(),
+            }
+        ],
+        kind="rename",
+    )
+    pending_detail = _landing_pending_detail(landing)
+    if pending_detail:
+        monitor_sync = _finish_scraper_monitor_sync(prepared, succeeded=False, error=pending_detail)
+    else:
+        monitor_sync = _finish_scraper_monitor_sync(prepared, succeeded=True)
+    return {
+        "ok": True,
+        "provider": normalized,
+        "entry": result,
+        "monitor_sync": monitor_sync,
+        "landing": landing,
+    }
 
 
 def check_scraper_folder_rename_warning(provider: str, old_path: str, new_path: str) -> Dict[str, Any]:
@@ -1011,6 +1240,8 @@ def move_scraper_entries(
     entries: Optional[List[Dict[str, Any]]] = None,
     target_parent_path: Optional[str] = None,
     request_id: str = "",
+    source_action: str = "",
+    monitor_run_id: str = "",
 ) -> Dict[str, Any]:
     normalized = normalize_scraper_provider(provider)
     cookie = _require_provider_cookie(normalized)
@@ -1026,8 +1257,11 @@ def move_scraper_entries(
         normalized,
         "move",
         snapshots,
-        source_action="scraper:entry:move",
+        # 默认仍是用户直接移动；快捷导入等"系统自己搬的"传入 scraper-job: 前缀，
+        # 复用监控侧既有守卫，避免刚整理完又被目标监控任务二次自动刮削。
+        source_action=str(source_action or "").strip() or "scraper:entry:move",
         dedupe_key=_direct_monitor_change_key("move", request_id),
+        monitor_run_id=str(monitor_run_id or "").strip(),
     )
     try:
         result = _move_provider_entries(normalized, cookie, entry_ids, target_cid, source_cid)
@@ -1036,8 +1270,20 @@ def move_scraper_entries(
         raise
     _invalidate_provider_parent(normalized, source_cid)
     _invalidate_provider_parent(normalized, target_cid)
-    monitor_sync = _finish_scraper_monitor_sync(prepared, succeeded=True)
-    return {"ok": True, "provider": normalized, "result": result, "monitor_sync": monitor_sync}
+    landing = result.get("landing") if isinstance(result, dict) else {}
+    pending_detail = _landing_pending_detail(landing)
+    if pending_detail:
+        # 115 收下了请求但还没落地：事件留给 needs_reconcile 兜底补扫，别当成"搬完了"。
+        monitor_sync = _finish_scraper_monitor_sync(prepared, succeeded=False, error=pending_detail)
+    else:
+        monitor_sync = _finish_scraper_monitor_sync(prepared, succeeded=True)
+    return {
+        "ok": True,
+        "provider": normalized,
+        "result": result,
+        "monitor_sync": monitor_sync,
+        "landing": landing,
+    }
 
 
 def copy_scraper_entries(
@@ -1200,17 +1446,36 @@ _SCRAPER_CN_AD_SITE_ACTION_RE = re.compile(
     rf"\s*(?:发布|首发|分享|出品|压制|制作|整理|更新)"
 )
 
+# 常见“发布页 / 官网 / 推广话术”（不依赖具体网址）：站点广告图几乎都带这些词。
+# 这份词表同时给文件名清理（噪声词）和广告文件识别用，避免两处口径不一致。
+SCRAPER_CN_AD_PROMO_PHRASES = (
+    "全网首发", "独家首发", "地址发布页", "发布地址", "永久地址", "备用地址",
+    "最新地址", "官网地址", "防走丢", "收藏本站", "最新网址", "发布页",
+    # 长词在前，短词在后，避免 “官网” 抢先匹配掉 “官方网站 / 官方网址”。
+    "官方网站", "官方网址", "官网", "请访问", "访问网站", "更多剧集", "更多电影",
+    "更多资源", "更多精彩", "免费下载", "在线观看",
+    # 站点引流整句：真实案例是文件名/文件夹名整段只有这句推广话术，没有任何片名。
+    "更多无水印高品质资源请访问", "无水印高品质资源", "高品质资源",
+    "无水印高清资源", "更多高清资源", "高清资源", "更多无水印",
+    "最新域名", "备用域名", "永久域名", "更换域名", "备用网址", "永久网址",
+    # 社交引流 / 版权声明式水印：词形明确，不会出现在正常片名里。
+    "扫码关注", "关注公众号", "微信公众号", "二维码", "加入群聊",
+    "仅供学习", "仅供交流", "请勿传播", "收集于网络", "资源来源于网络",
+)
+
+_SCRAPER_CN_AD_PROMO_RE = re.compile(
+    "|".join(re.escape(phrase) for phrase in SCRAPER_CN_AD_PROMO_PHRASES)
+)
+
 # 常见附属信息短语（不是片名的一部分）：字幕/水印/版本/音轨/资源渠道等。
 SCRAPER_COMMON_NOISE_PHRASES = (
     "无字片源", "无字幕版", "无字幕", "无水印", "无广告", "无删减", "未删减", "未删节",
     "完整版", "加长版", "剧场版", "导演剪辑版", "重制版", "修复版", "高清修复版", "4k修复版",
-    "国配版", "国语版", "国语配音", "粤语版", "双音轨", "多音轨", "中英双语", "国粤双语",
+    "国配版", "国语版", "国语配音", "国语音轨", "粤语版", "双音轨", "多音轨", "中英双语", "国粤双语",
     "特效中字", "内嵌中字", "外挂字幕", "简体中字", "繁体中字",
     "中文字幕", "中文配音", "中文音轨", "中文版",
     "提取码", "磁力链接", "种子下载", "网盘下载", "百度网盘", "夸克网盘", "阿里云盘", "天翼云盘", "城通网盘",
-    "全网首发", "独家首发", "地址发布页", "发布地址", "永久地址", "备用地址",
-    "最新地址", "官网地址", "防走丢", "收藏本站", "最新网址", "发布页",
-)
+) + SCRAPER_CN_AD_PROMO_PHRASES
 
 _SCRAPER_COMMON_NOISE_RE = re.compile(
     "|".join(re.escape(phrase) for phrase in SCRAPER_COMMON_NOISE_PHRASES),
@@ -1228,6 +1493,53 @@ _SCRAPER_STANDALONE_NOISE_RE = re.compile(
     + "|".join(re.escape(word) for word in SCRAPER_STANDALONE_NOISE_WORDS)
     + ")(?![\u4e00-\u9fff])"
 )
+
+_NOISE_RULES_CACHE: Dict[Tuple[Tuple[str, ...], Tuple[str, ...]], Tuple[re.Pattern, re.Pattern, frozenset]] = {}
+
+
+def _normalize_scraper_noise_items(value: Any) -> Tuple[str, ...]:
+    if isinstance(value, str):
+        raw_items = re.split(r"[\r\n,]+", value)
+    elif isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = []
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for raw in raw_items:
+        item = str(raw or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return tuple(normalized)
+
+
+def _get_scraper_noise_rules() -> Tuple[re.Pattern, re.Pattern, frozenset]:
+    """返回（复合词正则、独立词正则、独立词 key 集合），内置词表 + 设置里的自定义词。"""
+    try:
+        cfg = get_config()
+    except Exception:
+        # 配置存储不可用时（如单测环境、启动早期）回退到内置词表，行为与旧版一致。
+        cfg = {}
+    custom_phrases = _normalize_scraper_noise_items(cfg.get("scraper_noise_phrases") or [])
+    custom_words = _normalize_scraper_noise_items(cfg.get("scraper_standalone_noise_words") or [])
+    cache_key = (custom_phrases, custom_words)
+    cached = _NOISE_RULES_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    phrases = tuple(SCRAPER_COMMON_NOISE_PHRASES) + custom_phrases
+    words = tuple(SCRAPER_STANDALONE_NOISE_WORDS) + custom_words
+    common_re = re.compile("|".join(re.escape(phrase) for phrase in phrases), re.IGNORECASE)
+    standalone_re = re.compile(
+        "(?<![\u4e00-\u9fff])(?:"
+        + "|".join(re.escape(word) for word in words)
+        + ")(?![\u4e00-\u9fff])"
+    )
+    standalone_keys = frozenset(_normalize_scraper_keyword_compact(word) for word in words)
+    rules = (common_re, standalone_re, standalone_keys)
+    _NOISE_RULES_CACHE[cache_key] = rules
+    return rules
 
 
 def _scraper_cn_ad_site_matches(value: str) -> List[str]:
@@ -1257,6 +1569,55 @@ def _strip_scraper_cn_ad_phrases(value: str, *, leading_only: bool = False) -> s
     for fragment in matches:
         text = text.replace(fragment, " ")
     return re.sub(r"\s+", " ", text).strip(" -_.")
+
+
+# 网盘/下载工具给重名文件追加的序号与副本标记：判断“整段都是广告词”时要忽略这些残留。
+_SCRAPER_AD_NAME_RESIDUE_RE = re.compile(
+    r"[\[\(（【]\s*(?:copy|复件|副本|复制|\d{1,3})\s*[\]\)）】]"
+    r"|(?:复件|副本|复制)"
+    r"|(?<![a-z0-9])copy(?![a-z])",
+    re.IGNORECASE,
+)
+
+# 判断“整段都是广告词”时，裸域名同样属于广告残留（真实案例：推广话术里夹 www.Butailing.com）。
+_SCRAPER_AD_NAME_DOMAIN_RE = re.compile(
+    r"(?i)(?:[a-z0-9][a-z0-9-]*\.)+" + SCRAPER_SITE_TLD_PATTERN + r"\b"
+)
+
+
+def _strip_scraper_compound_extensions(value: str) -> str:
+    """剥掉叠在名字后面的已知后缀链（`.mkv` / `.mkv.strm` / `.mp4.DOC`），只剥已知后缀。"""
+    text = str(value or "").strip()
+    while True:
+        stem, ext = os.path.splitext(text)
+        if not stem or ext.lower() not in SCRAPER_STRIPPABLE_EXTENSIONS:
+            return text
+        text = stem
+
+
+def _is_scraper_promotional_only(value: str) -> bool:
+    """名字是否“只由广告推广话术组成”（去掉话术、网址、序号、括号后没有任何片名残留）。
+
+    站点引流会把广告文件伪装成 .mkv/.mp4 并直接用推广整句命名
+    （真实案例：`【更多无水印高品质资源请访问 】【更多无水印高品质资源请访问 】.mkv`，
+    同一份话术还会配 `.mp4` / `.DOC`，本地 STRM 侧则是 `.mkv.strm`）。
+    这类名字没有任何可用来识别影片的信息，只有判成广告，才不会把广告当成正片整理进媒体库。
+    """
+    stem = _strip_scraper_compound_extensions(value)
+    text = unicodedata.normalize("NFKC", stem).strip()
+    if not text:
+        return False
+    # 必须先命中明确的广告/推广词，避免把“只有年份”之类的正常短名误判成广告。
+    if not (_SCRAPER_CN_AD_PROMO_RE.search(text) or _scraper_cn_ad_site_matches(text)):
+        return False
+    common_re, _, _ = _get_scraper_noise_rules()
+    residue = common_re.sub(" ", text)
+    residue = _SCRAPER_EMBEDDED_AD_URL_RE.sub(" ", residue)
+    residue = _SCRAPER_AD_NAME_DOMAIN_RE.sub(" ", residue)
+    residue = _SCRAPER_AD_NAME_RESIDUE_RE.sub(" ", residue)
+    residue = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", " ", residue)
+    # 允许残留一个连接字（如“最新地址请收藏本站”里的“请”），但片名至少要有 2 个字才算正常名字。
+    return len(_normalize_scraper_keyword_compact(residue)) <= 1
 
 
 def _strip_scraper_site_prefix(text: str) -> str:
@@ -1375,7 +1736,7 @@ _SCRAPER_PART_WORDS = {
 }
 
 
-def _split_scraper_mixed_language_title(title: str) -> List[str]:
+def _split_scraper_mixed_language_title(title: str, preserve_colon: bool = False) -> List[str]:
     """把中英混排标题拆成独立候选：中文部分优先，再英文部分。"""
     text = str(title or "").strip()
     if not text:
@@ -1384,8 +1745,12 @@ def _split_scraper_mixed_language_title(title: str) -> List[str]:
     latin = re.sub(r"^[\d\s._-]+", "", latin)
     latin = re.sub(r"^[\s:：,，;；|/\\·•]+|[\s:：,，;；|/\\·•]+$", "", latin)
     latin = re.sub(r"\s+", " ", latin).strip(" -_.")
-    cjk = re.sub(r"[^\u4e00-\u9fff]+", " ", text)
-    cjk = re.sub(r"\s+", " ", cjk).strip(" -_.")
+    if preserve_colon:
+        cjk = re.sub(r"[^\u4e00-\u9fff\uFF1A:]+", " ", text)
+        cjk = re.sub(r"\s+", " ", cjk).strip(" -_.").strip("：: ")
+    else:
+        cjk = re.sub(r"[^\u4e00-\u9fff]+", " ", text)
+        cjk = re.sub(r"\s+", " ", cjk).strip(" -_.")
     parts: List[str] = []
     for part in (cjk, latin):
         key_len = len(_scraper_keyword_key(part))
@@ -1499,23 +1864,90 @@ def _legacy_extract_scraper_title_candidates(raw: str) -> List[str]:
     return candidates
 
 
-def _extract_scraper_title_candidates(raw: str) -> List[str]:
+_SCRAPER_LEADING_BRACKET_RE = re.compile(r"^\s*(?:[\[\(（【][^\]\)）】]{1,80}[\]\)）】]\s*)+")
+_SCRAPER_SUBTITLE_MARKER_RE = re.compile(
+    r"(?:字幕|字幕组|字幕組|简繁|簡繁|简中|簡中|繁中|中英|國英|国英|国粤|國粵|"
+    r"双语|雙語|中字|英字|国语|國語|粤语|粵語|配音|音轨|音軌)"
+)
+# 目录/占位用的结构性中文词，不应被当成片名（如“文件夹A”“新建文件夹”）。
+_SCRAPER_STRUCTURAL_CJK_TITLES = frozenset({
+    "文件夹", "新建文件夹", "未命名", "未命名文件夹", "根目录",
+    "未整理", "待整理", "已整理", "未处理", "待处理", "已处理",
+    "临时", "临时文件", "回收站", "其他", "其它", "杂项",
+})
+
+
+def _extract_scraper_leading_cjk_titles(raw: str) -> List[str]:
+    """提取文件名开头括号里的中文片名候选。
+
+    发布名常把中文片名放在开头方括号里（如 ``[朱弦玉磐2024]``），而通用解析会把这些
+    括号整体当成噪声丢弃，导致中文片名丢失。这里把每个开头括号的内容去掉年份后清洗，
+    只保留仍是中文、且不是字幕/字幕组/版本等噪声的片段，作为高优先级候选。
+    """
+    text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+    match = _SCRAPER_LEADING_BRACKET_RE.match(text)
+    if not match:
+        return []
+    contents = re.findall(r"[\[\(（【]([^\]\)）】]{1,80})[\]\)）】]", match.group(0))
+    titles: List[str] = []
+    for content in contents:
+        stripped = re.sub(r"(?:19|20)\d{2}", " ", content)
+        if _SCRAPER_SUBTITLE_MARKER_RE.search(stripped):
+            continue
+        cleaned = _clean_search_title(stripped)
+        if not cleaned or not _contains_cjk(cleaned):
+            continue
+        if _is_scraper_noise_keyword(cleaned):
+            continue
+        common_re, _, _ = _get_scraper_noise_rules()
+        if not common_re.sub(" ", cleaned).strip():
+            continue
+        titles.append(cleaned)
+    return titles
+
+
+def _extract_scraper_title_candidates(raw: str, preserve_colon: bool = False) -> List[str]:
     """按发布名结构提取候选标题（guessit 主解析 + 手写解析兜底合并）。
 
     guessit 擅长处理站点前缀、父目录路径、季集结构与发布组；手写解析补充多部曲
-    与中英混排等场景。两者按关键字去重合并，保证查询顺序稳定；
+    与中英混排等场景。开头括号里的中文片名也作为高优先级候选，避免被当作噪声丢弃。
+    三者按关键字去重合并，保证查询顺序稳定；
     中英混排候选拆成独立关键词，避免把两个名称合并成一条搜不出结果。
     """
     text = unicodedata.normalize("NFKC", str(raw or "")).strip()
     if not text:
         return []
+    leading_cjk = _extract_scraper_leading_cjk_titles(text)
     candidates = _scraper_guessit_candidates(text)
-    candidates = _merge_scraper_title_candidates(candidates + _legacy_extract_scraper_title_candidates(text))
+    candidates = _merge_scraper_title_candidates(
+        leading_cjk + candidates + _legacy_extract_scraper_title_candidates(text)
+    )
     split_candidates: List[str] = []
     for candidate in candidates:
-        split_candidates.extend(_split_scraper_mixed_language_title(candidate))
+        split_candidates.extend(_split_scraper_mixed_language_title(candidate, preserve_colon=preserve_colon))
     candidates = _merge_scraper_title_candidates(split_candidates + candidates)
     return candidates
+
+
+def _extract_scraper_filename_cjk_title(raw: str) -> str:
+    """从原始文件名里取最可能的中文片名，用于文件夹命名优先（没有则返回空串）。"""
+    text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+    if not text:
+        return ""
+    candidates: List[str] = list(_extract_scraper_leading_cjk_titles(text))
+    head = re.sub(r"^[\s.\-_\[\]【】()（）]+", "", text)
+    matched = re.match(r"([\u4e00-\u9fff][\u4e00-\u9fff0-9·]*)", head)
+    if matched:
+        head_candidate = re.sub(r"(?:19|20)\d{2}$", "", matched.group(1)).strip(" -_·")
+        if head_candidate and _contains_cjk(head_candidate):
+            candidates.append(head_candidate)
+    for candidate in candidates:
+        if candidate in _SCRAPER_STRUCTURAL_CJK_TITLES:
+            continue
+        if _is_scraper_noise_keyword(candidate):
+            continue
+        return candidate
+    return ""
 
 
 def _scraper_query_degradations(query: str) -> List[str]:
@@ -1536,13 +1968,17 @@ def _is_scraper_generic_keyword(value: str) -> bool:
         return True
     if key in SCRAPER_GENERIC_CATEGORY_KEYS:
         return True
-    if not _normalize_scraper_keyword_compact(_SCRAPER_COMMON_NOISE_RE.sub(" ", str(value or ""))):
+    common_re, _, standalone_keys = _get_scraper_noise_rules()
+    if not _normalize_scraper_keyword_compact(common_re.sub(" ", str(value or ""))):
         return True
-    if key in _SCRAPER_STANDALONE_NOISE_KEYS:
+    if key in standalone_keys:
         return True
     for fragment in _scraper_cn_ad_site_matches(value):
         if _normalize_scraper_keyword_compact(fragment) == key:
             return True
+    # 整段只有推广话术的名字（如“更多无水印高品质资源请访问”）不含片名，按通用词处理。
+    if _is_scraper_promotional_only(value):
+        return True
     return bool(
         re.fullmatch(
             r"(?:电影|影片|影视|影視|电视剧|剧集|动漫|动画|動畫|番剧|新番|综艺|纪录片|紀錄片|纪录|紀錄|资源|資源|下载|下載|媒体|视频|高清|蓝光|藍光)"
@@ -1577,8 +2013,9 @@ def _clean_search_title(value: str) -> str:
         text,
     )
     text = re.sub(r"(?:简繁英|简中|繁中|中英|国英|国粤|中法|双语|内嵌|外挂|特效|简繁|繁简)?(?:字幕|双字)(?!组|站|网)", " ", text)
-    text = _SCRAPER_COMMON_NOISE_RE.sub(" ", text)
-    text = _SCRAPER_STANDALONE_NOISE_RE.sub(" ", text)
+    common_re, standalone_re, _ = _get_scraper_noise_rules()
+    text = common_re.sub(" ", text)
+    text = standalone_re.sub(" ", text)
     text = re.sub(r"[\[\(（【][^\]\)）】]{0,90}?(?:第.+?季|s\d{1,2}e\d{1,4})[^\]\)）】]{0,90}?[\]\)）】]", " ", text, flags=re.I)
     text = re.sub(r"^[\[\(（【][A-Za-z0-9][A-Za-z0-9._ +&-]{0,40}[\]\)）】]\s*", " ", text)
     text = re.sub(r"[\[\(（【][A-Za-z0-9][A-Za-z0-9._ +&-]{0,60}[\]\)）】]", " ", text)
@@ -1603,6 +2040,55 @@ def _clean_search_title(value: str) -> str:
     text = _trim_scraper_trailing_noise_tokens(text)
     text = _trim_scraper_trailing_release_group(text)
     return text or _strip_extension(value)
+
+
+_SCRAPER_MEDIA_LABEL_PREFIX_RE = re.compile(
+    r"^(?:[\[【（(]\s*)?(?:剧集|电视剧|电影|影片|影视|动漫|动画|動畫|番剧|综艺|纪录片|紀錄片|纪实|紀實|资源|資源|合集|合輯)"
+    r"(?:[\]】）)]\s*)?(?:\s+|[:：])",
+    re.IGNORECASE,
+)
+
+
+def _strip_scraper_media_label_prefix(value: str) -> str:
+    return _SCRAPER_MEDIA_LABEL_PREFIX_RE.sub("", str(value or "")).strip()
+
+
+def _sanitize_folder_preserving_colon(value: Any, fallback: Any = "") -> str:
+    """目录名安全化时保留标题内的冒号（转全角），去掉孤立首尾冒号/空格。"""
+    text = str(value or "").replace(":", "：").strip()
+    text = re.sub(r"^[：\s]+", "", text)
+    text = re.sub(r"[：\s]+$", "", text)
+    text = re.sub(r"：\s+", "：", text)
+    return sanitize_115_folder_name(text, fallback=fallback).strip()
+
+
+def recommend_media_folder_name(title: str, year: str = "", raw_text: str = "") -> str:
+    """按刮削标题解析规则生成“片名 (年份)”形式的推荐文件夹名。
+
+    magnet / ED2K 等资源名通常是发布名，直接作为文件夹名会保留大量清晰度、
+    编码、站点标识等噪音。这里复用刮削的标题候选抽取与噪声清洗，并做目录名
+    安全化，返回适合“新建文件夹”默认值的名称。
+    """
+    source = str(title or "").strip() or str(raw_text or "").strip()
+    candidate = ""
+    for item in _extract_scraper_title_candidates(source, preserve_colon=True):
+        cleaned = _sanitize_folder_preserving_colon(item, fallback="")
+        if len(_scraper_keyword_key(cleaned)) >= 2 and not _is_scraper_generic_keyword(cleaned):
+            candidate = cleaned
+            break
+    if not candidate:
+        candidate = _sanitize_folder_preserving_colon(_clean_search_title(source), fallback="")
+    candidate = _strip_scraper_media_label_prefix(candidate)
+    candidate = _sanitize_folder_preserving_colon(candidate, fallback="")
+    if not candidate:
+        return "未命名影视"
+    normalized_year = normalize_tmdb_year(year)
+    if normalized_year:
+        candidate = _sanitize_folder_preserving_colon(
+            f"{candidate} ({normalized_year})",
+            fallback=candidate,
+        )
+    return candidate
 
 
 def _scraper_keyword_key(value: str) -> str:
@@ -1862,6 +2348,13 @@ def choose_scraper_title(tmdb: Dict[str, Any], language: str = "zh", fallback: s
     if normalized_language in ("", "auto", "default", "config"):
         cfg_language = str((get_config() or {}).get("tmdb_language", "zh-CN") or "zh-CN").strip().lower()
         normalized_language = "en" if cfg_language.startswith("en") else "zh"
+    # 电影条目名就是片名，文件名里已带中文片名时优先用它（比 TMDB 中文名更贴合发布名）；
+    # 剧集条目的名字多为单集文件名，中文片段容易是占位词，仍以 TMDB 名称为准。
+    media_type = normalize_tmdb_media_type(payload.get("tmdb_media_type") or payload.get("media_type"), "")
+    if normalized_language != "en" and media_type == "movie":
+        filename_cjk = _extract_scraper_filename_cjk_title(fallback)
+        if filename_cjk:
+            return sanitize_scraper_name(filename_cjk)
     localized = str(payload.get("tmdb_localized_title") or payload.get("tmdb_title") or payload.get("title") or "").strip()
     english = str(payload.get("tmdb_english_title") or "").strip()
     original = str(payload.get("tmdb_original_title") or payload.get("original_title") or "").strip()
@@ -2095,6 +2588,9 @@ def _build_scraper_target_path(
     use_season_subfolder = bool(options.get("use_season_subfolder", True))
     preserve_source_parent_path = bool(options.get("preserve_source_parent_path", False))
     organize_inside_source_folder = bool(options.get("organize_inside_source_folder", False))
+    # 强制归档进媒体文件夹（接收夹快捷导入 / 监控根目录散文件用）：
+    # 即使文件命名方式是"保持原名/仅清理"，也要建出「片名 (年份)/」目录，否则散文件进库后播放器认不出来。
+    force_media_folder = bool(options.get("force_media_folder", False))
     source_relative_parent_path = _relative_parent_path_from_base(
         str(entry.get("parent_path", "") or ""),
         str(options.get("base_path", "") or ""),
@@ -2110,7 +2606,25 @@ def _build_scraper_target_path(
     tag_suffix = _build_tag_suffix(tags)
     subtitle_part = f" ({subtitle_index})" if subtitle_index > 1 else ""
     _, file_title, folder_title = _build_scraper_media_titles(tmdb, options, str(entry.get("name", "") or ""))
+    # 文件已经在「同名媒体文件夹」里时（监控自动刮削会把 片名 (年份)/Season 01 这类子目录当条目、
+    # 重复整理同一部片也会这样），就地在那个文件夹里规范化，不能再套一层同名文件夹，
+    # 否则会整理出 片名 (2026) [tmdbid-x]/片名 (2026) [tmdbid-x]/ 这种嵌套。
+    existing_media_root = _scraper_existing_media_folder_root(
+        str(entry.get("path", "") or ""),
+        folder_title,
+        str(options.get("base_path", "") or ""),
+    )
     if media_type == "tv":
+        # 文件已经在「剧目录/Season NN/」里、且剧目录名就是这部剧时，剧目录本身就是媒体文件夹，
+        # 不能在它里面再套一层「片名 (年份)」（订阅按 savepath/Season NN 落盘、用户手动归位都属于
+        # 这种输入；监控自动整理会把季目录当成条目，锚点落在剧目录上）。
+        if existing_media_root is None:
+            existing_media_root = _scraper_season_show_folder_root(
+                str(entry.get("path", "") or ""),
+                folder_title,
+                str(options.get("base_path", "") or ""),
+                folder_parent_path,
+            )
         task = _build_task_from_tmdb(tmdb, options)
         resolved_episode_info = episode_info if isinstance(episode_info, dict) else {}
         episode_issue = ""
@@ -2159,13 +2673,15 @@ def _build_scraper_target_path(
             return normalize_relative_path(join_relative_path(source_relative_parent_path, file_name)), ""
         if not organize_into_media_folder:
             return file_name, ""
-        if keep_original_name and not season_folder_allowed:
+        if keep_original_name and not season_folder_allowed and not force_media_folder:
             # 保持/清理模式下文件不移动：文件夹重命名由文件夹动作覆盖，文件留在原目录。
             organize_root = source_relative_parent_path
+        elif existing_media_root is not None:
+            organize_root = existing_media_root
         else:
             organize_root = (
                 source_relative_parent_path
-                if organize_inside_source_folder
+                if (organize_inside_source_folder and not force_media_folder)
                 else _scraper_folder_organize_root(folder_parent_path, options, folder_title)
             )
         if not season_folder_allowed:
@@ -2173,7 +2689,7 @@ def _build_scraper_target_path(
         source_parent_is_season = bool(source_relative_parent_path) and is_subscription_season_folder_name(
             os.path.basename(source_relative_parent_path.replace("\\", "/"))
         )
-        if organize_inside_source_folder and source_parent_is_season:
+        if organize_inside_source_folder and source_parent_is_season and existing_media_root is None:
             # 文件已在源目录的 Season 子目录内：原地重命名，不再嵌套一层 Season。
             return normalize_relative_path(join_relative_path(organize_root, file_name)), ""
         return normalize_relative_path(join_relative_path(organize_root, f"Season {season_no:02d}", file_name)), ""
@@ -2190,11 +2706,123 @@ def _build_scraper_target_path(
     if not organize_into_media_folder:
         return file_name, ""
     organize_root = (
-        source_relative_parent_path
-        if (keep_original_name or organize_inside_source_folder)
-        else _scraper_folder_organize_root(folder_parent_path, options, folder_title)
+        _scraper_folder_organize_root(folder_parent_path, options, folder_title)
+        if (force_media_folder or not (keep_original_name or organize_inside_source_folder))
+        else source_relative_parent_path
     )
+    if existing_media_root is not None:
+        organize_root = existing_media_root
     return normalize_relative_path(join_relative_path(organize_root, file_name)), ""
+
+
+def _scraper_existing_media_folder_root(
+    entry_path: str,
+    folder_title: str,
+    base_path: str,
+) -> Optional[str]:
+    """文件目录链上已经有同名媒体文件夹时，返回它相对 base_path 的路径。
+
+    - 返回 ``None``：没找到同名媒体文件夹（按老逻辑整理）；
+    - 返回 ``""``：base_path 本身就是这个媒体文件夹（计划路径都是相对 base_path 的，
+      就地整理即可）。
+
+    按完整挂载路径从最外层开始匹配，避免已有的嵌套结构继续加深；也因为走完整路径，
+    即使调用方把 base_path 收缩到了剧集文件夹本身（`build_scraper_rename_plan` 会用
+    选中文件夹的父目录兜底 base_path），也不会漏判。
+    """
+    title_key = scraper_folder_name_key(folder_title)
+    normalized_path = normalize_relative_path(str(entry_path or "").strip())
+    if not title_key or not normalized_path:
+        return None
+    parent_path = normalize_relative_path(os.path.dirname(normalized_path.replace("\\", "/")))
+    normalized_base = normalize_relative_path(str(base_path or "").strip())
+    parts = [part for part in parent_path.split("/") if part]
+    prefix: List[str] = []
+    for part in parts:
+        prefix.append(part)
+        if scraper_folder_name_key(part) == title_key:
+            matched = "/".join(prefix)
+            if normalized_base and (matched == normalized_base or matched.startswith(f"{normalized_base}/")):
+                return matched[len(normalized_base):].lstrip("/")
+            return matched
+    return None
+
+
+# 剧目录名与媒体名的比对键：把「仙逆」「仙逆 (2023)」「仙逆(2023)」「仙逆 (2023) [tmdbid-1]」
+# 都归到同一部剧，避免剧目录已经存在、却因为年份写法或空格差异被判成"另一部"而再套一层。
+_SCRAPER_FOLDER_YEAR_SUFFIX_RE = re.compile(r"\s*[\(（]\s*(?:19|20)\d{2}\s*[\)）]\s*$")
+
+
+def _scraper_folder_compact_key(value: str) -> str:
+    """文件夹名压缩键：去掉 ``[tmdbid-…]`` / 网盘追加的 ``(n)`` 装饰与全部空格后小写比较。"""
+    name = str(value or "").strip()
+    if not name:
+        return ""
+    while True:
+        stripped = _SCRAPER_FOLDER_TMDB_SUFFIX_RE.sub("", name).strip()
+        stripped = _SCRAPER_FOLDER_AUTO_INDEX_RE.sub("", stripped).strip()
+        if stripped == name:
+            break
+        name = stripped
+    return "".join(name.split()).casefold()
+
+
+def _scraper_show_folder_keys(folder_title: str) -> Set[str]:
+    """一部剧可接受的剧目录写法键：带年份、不带年份、带 ``[tmdbid-…]`` 装饰都算同一部。"""
+    keys: Set[str] = set()
+    values = [
+        str(folder_title or "").strip(),
+        _SCRAPER_FOLDER_TMDB_SUFFIX_RE.sub("", str(folder_title or "")).strip(),
+    ]
+    for value in values:
+        if not value:
+            continue
+        for candidate in (value, _SCRAPER_FOLDER_YEAR_SUFFIX_RE.sub("", value).strip()):
+            key = _scraper_folder_compact_key(candidate)
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _scraper_season_show_folder_root(
+    entry_path: str,
+    folder_title: str,
+    base_path: str,
+    folder_parent_path: str = "",
+) -> Optional[str]:
+    """文件已在「剧目录/Season NN/」里、且剧目录名对得上媒体名时，返回剧目录（相对 base_path）。
+
+    监控自动整理与面板整理面对的条目经常是「新集所在的季目录」（订阅按 ``savepath/Season NN``
+    落盘、用户手动把新集归位到季目录也一样）。此时如果仍按「所选文件夹的父目录 + 片名」算目标，
+    就会在剧目录里再套一层同名媒体文件夹（真实案例：``115连载中/仙逆/Season 01/x.mkv``
+    → ``115连载中/仙逆/仙逆 (2023)/x.mkv``，之后每整理一次还会继续加深）。剧目录本身就是这部剧的
+    媒体文件夹，直接复用它，让文件原地留在 ``剧目录/Season NN/`` 里整理。
+
+    只在「选中的正是季目录」（整理锚点 ``folder_parent_path`` 就是剧目录）时成立：如果用户选中的
+    是剧目录本身，「同步重命名文件夹」会把它改成 ``片名 (年份) [tmdbid-…]``，这时文件仍要跟到改名后
+    的目录里，不能复用它。
+    """
+    title_keys = _scraper_show_folder_keys(folder_title)
+    normalized_path = normalize_relative_path(str(entry_path or "").strip())
+    if not title_keys or not normalized_path:
+        return None
+    parent_path = normalize_relative_path(os.path.dirname(normalized_path.replace("\\", "/")))
+    if not parent_path or not is_subscription_season_folder_name(os.path.basename(parent_path)):
+        return None
+    show_path = normalize_relative_path(os.path.dirname(parent_path))
+    if not show_path or not os.path.basename(show_path):
+        return None
+    if _scraper_folder_compact_key(os.path.basename(show_path)) not in title_keys:
+        return None
+    normalized_base = normalize_relative_path(str(base_path or "").strip())
+    show_rel = show_path
+    if normalized_base and (show_path == normalized_base or show_path.startswith(f"{normalized_base}/")):
+        show_rel = show_path[len(normalized_base):].lstrip("/")
+    if normalize_relative_path(
+        _relative_parent_path_from_base(str(folder_parent_path or ""), normalized_base)
+    ) != show_rel:
+        return None
+    return show_rel
 
 
 def _scraper_folder_organize_root(folder_parent_path: str, options: Dict[str, Any], folder_title: str) -> str:
@@ -2229,6 +2857,31 @@ def _scraper_file_folder_anchor(file_entry: Dict[str, Any], folder_anchors: Dict
                 best_len = len(normalized_folder)
                 best_parent = str(parent_path or "")
     return best_parent
+
+
+def _is_scraper_folder_prefix_only_change(
+    old_path: str,
+    new_path: str,
+    folder_rename_paths: List[Tuple[str, str]],
+) -> bool:
+    """文件本身没变化，只是所在文件夹被重命名：新旧路径仅文件夹前缀不同。
+
+    例如 一级/B/新片名 (2024).mkv -> 一级/新片名 (2024)/新片名 (2024).mkv，
+    网盘侧只需一次文件夹改名，文件不应生成独立的移动/改名动作。
+    """
+    normalized_old = normalize_relative_path(str(old_path or ""))
+    normalized_new = normalize_relative_path(str(new_path or ""))
+    if not normalized_old or not normalized_new:
+        return False
+    for raw_old_folder, raw_new_folder in folder_rename_paths:
+        old_prefix = f"{normalize_relative_path(str(raw_old_folder or ''))}/"
+        new_prefix = f"{normalize_relative_path(str(raw_new_folder or ''))}/"
+        if normalized_old.startswith(old_prefix) and normalized_new.startswith(new_prefix):
+            suffix = normalized_old[len(old_prefix):]
+            if suffix and suffix == normalized_new[len(new_prefix):]:
+                return True
+    return False
+
 
 def _get_scraper_entries_page(
     provider: str,
@@ -2270,6 +2923,159 @@ def _scraper_page_has_more(payload: Dict[str, Any], offset: int, page_size: int)
     return bool(entries) and (len(entries) >= page_size or (total and next_offset < total))
 
 
+# 115 建/搬同名文件夹时会自动追加 ``(1)``/``(2)``，旧版本写 TMDB ID 时还会追加 ``[tmdbid-123]``。
+# 这些只是命名装饰，不代表另一个作品；查找现有文件夹时必须忽略，否则同一部片每整理一次
+# 就会再建一个"新"文件夹（实测：一个剧集目录被拆成 片名/片名(1)/片名(2)/片名(3)）。
+_SCRAPER_FOLDER_TMDB_SUFFIX_RE = re.compile(r"\s*\[(?:tmdb|tmdbid)[^\]]*\]\s*$", re.IGNORECASE)
+_SCRAPER_FOLDER_AUTO_INDEX_RE = re.compile(r"\s*\(\d{1,2}\)\s*$")
+# 同一部影视的多个版本（2160p/1080p 等）在标准命名下会算出同一个目标文件名，
+# 这时给后面的文件追加 ``(2)``/``(3)`` 序号让它并存；序号上限只是防御，避免死循环。
+SCRAPER_TARGET_NAME_SUFFIX_LIMIT = 20
+
+
+def _scraper_folder_tmdb_marker(value: str) -> str:
+    """取文件夹名里的 ``[tmdbid-123]`` 标记，用来判断两边是不是同一部影视。"""
+    matched = re.search(r"\[\s*(?:tmdb|tmdbid)\s*-?\s*(\d+)\s*\]", str(value or ""), re.IGNORECASE)
+    return matched.group(1) if matched else ""
+
+
+def _disambiguate_scraper_target_path(target_path: str, taken: Set[str]) -> str:
+    """目标路径已在用且来自别的条目时，给文件名追加 ``(2)``/``(3)`` 序号。
+
+    只改文件名、保留扩展名（``片名 (2026).mkv`` → ``片名 (2026) (2).mkv``），
+    和字幕同名去重用的是同一套写法。
+    """
+    normalized = normalize_relative_path(str(target_path or "").strip())
+    if not normalized:
+        return ""
+    parent, _, name = normalized.rpartition("/")
+    stem, ext = os.path.splitext(name)
+    if not stem:
+        return normalized
+    for index in range(2, SCRAPER_TARGET_NAME_SUFFIX_LIMIT + 1):
+        candidate_name = f"{stem} ({index}){ext}"
+        candidate = normalize_relative_path(f"{parent}/{candidate_name}") if parent else candidate_name
+        if candidate not in taken:
+            return candidate
+    return normalized
+
+
+def _claim_scraper_target_path(
+    target_path: str,
+    entry_id: str,
+    taken: Set[str],
+    owners: Dict[str, str],
+) -> Tuple[str, bool]:
+    """登记并返回可用目标路径。
+
+    - 路径已被**同批次其他条目**占用：自动加序号，让同一部影视的多个版本并存；
+    - 路径被**同一条目**重复占用：返回 ``True``，调用方仍按原来的"目标路径重复"报冲突。
+    """
+    normalized = normalize_relative_path(str(target_path or "").strip())
+    if not normalized:
+        return "", False
+    owner = owners.get(normalized, "")
+    if owner and owner == str(entry_id or ""):
+        return normalized, True
+    if owner:
+        normalized = _disambiguate_scraper_target_path(normalized, taken)
+    taken.add(normalized)
+    owners.setdefault(normalized, str(entry_id or ""))
+    return normalized, False
+
+
+def _reserve_scraper_target_path(target_path: str, entry_id: str, taken: Set[str], owners: Dict[str, str]) -> None:
+    """把"文件已经就位、不会产生动作"的目标路径也登记为占用，避免别的文件再撞上来。"""
+    normalized = normalize_relative_path(str(target_path or "").strip())
+    if not normalized:
+        return
+    taken.add(normalized)
+    owners.setdefault(normalized, str(entry_id or ""))
+
+
+def scraper_folder_name_key(value: str) -> str:
+    """媒体文件夹名归一化键：忽略 ``[tmdbid-xxx]`` 与 115 自动追加的 ``(n)`` 后缀。"""
+    name = str(value or "").strip()
+    if not name:
+        return ""
+    while True:
+        stripped = _SCRAPER_FOLDER_TMDB_SUFFIX_RE.sub("", name).strip()
+        stripped = _SCRAPER_FOLDER_AUTO_INDEX_RE.sub("", stripped).strip()
+        if stripped == name:
+            break
+        name = stripped
+    return " ".join(name.split()).casefold()
+
+
+def _scraper_folder_name_rank(name: str) -> int:
+    """同名候选的装饰数量：0 = 干净名字，越大说明装饰越多（优先复用最干净的那个）。"""
+    text = str(name or "").strip()
+    return int(bool(_SCRAPER_FOLDER_TMDB_SUFFIX_RE.search(text))) + int(
+        bool(_SCRAPER_FOLDER_AUTO_INDEX_RE.search(text))
+    )
+
+
+def _match_scraper_folder_part(entries: List[Dict[str, Any]], part: str) -> Optional[Dict[str, Any]]:
+    """在目录条目里按名字找文件夹：精确同名优先，其次忽略 ``[tmdbid-xxx]``/``(n)`` 装饰。"""
+    target_name = str(part or "").strip()
+    if not target_name:
+        return None
+    target_key = scraper_folder_name_key(target_name)
+    best: Optional[Dict[str, Any]] = None
+    best_rank = 0
+    for item in entries or []:
+        if not isinstance(item, dict) or not item.get("is_dir"):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        if name == target_name:
+            return item
+        if not target_key or scraper_folder_name_key(name) != target_key:
+            continue
+        rank = _scraper_folder_name_rank(name)
+        if best is None or rank < best_rank:
+            best = item
+            best_rank = rank
+    return best
+
+
+def _find_scraper_folder_part(
+    provider: str,
+    cookie: str,
+    parent_id: str,
+    part: str,
+    *,
+    entries_cache: Optional[Dict[Tuple[str, bool], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """在 ``parent_id`` 下翻页查找文件夹条目（精确同名优先，其次忽略命名装饰）。"""
+    target_name = str(part or "").strip()
+    if not target_name:
+        return {}
+    page_offset = 0
+    for _page_index in range(SCRAPER_NAME_LOOKUP_MAX_PAGES):
+        payload = _get_scraper_entries_page(
+            provider,
+            cookie,
+            parent_id,
+            True,
+            page_offset,
+            SCRAPER_NAME_LOOKUP_PAGE_SIZE,
+            entries_cache,
+        )
+        entries = payload.get("entries", []) if isinstance(payload, dict) and isinstance(payload.get("entries"), list) else []
+        matched = _match_scraper_folder_part(entries, target_name)
+        if matched:
+            return matched
+        if not _scraper_page_has_more(payload, page_offset, SCRAPER_NAME_LOOKUP_PAGE_SIZE):
+            break
+        next_offset = max(0, parse_int(payload.get("next_offset"), default=page_offset + len(entries)))
+        if next_offset <= page_offset:
+            break
+        page_offset = next_offset
+    return {}
+
+
 def _walk_existing_folder(
     provider: str,
     cookie: str,
@@ -2286,35 +3092,13 @@ def _walk_existing_folder(
         return path_cache[path_cache_key]
     parts = [part for part in normalize_relative_path(folder_path).split("/") if part]
     for part in parts:
-        matched = None
-        page_offset = 0
-        for _page_index in range(SCRAPER_NAME_LOOKUP_MAX_PAGES):
-            payload = _get_scraper_entries_page(
-                provider,
-                cookie,
-                current,
-                True,
-                page_offset,
-                SCRAPER_NAME_LOOKUP_PAGE_SIZE,
-                entries_cache,
-            )
-            entries = payload.get("entries", []) if isinstance(payload, dict) and isinstance(payload.get("entries"), list) else []
-            matched = next(
-                (
-                    item
-                    for item in entries
-                    if item.get("is_dir") and str(item.get("name", "") or "").strip() == part
-                ),
-                None,
-            )
-            if matched:
-                break
-            if not _scraper_page_has_more(payload, page_offset, SCRAPER_NAME_LOOKUP_PAGE_SIZE):
-                break
-            next_offset = max(0, parse_int(payload.get("next_offset"), default=page_offset + len(entries)))
-            if next_offset <= page_offset:
-                break
-            page_offset = next_offset
+        matched = _find_scraper_folder_part(
+            provider,
+            cookie,
+            current,
+            part,
+            entries_cache=entries_cache,
+        )
         if not matched:
             if path_cache is not None:
                 path_cache[path_cache_key] = ("", False)
@@ -2329,41 +3113,25 @@ def _walk_existing_folder(
 def _ensure_folder_from_base(provider: str, cookie: str, base_cid: str, folder_path: str) -> str:
     current = str(base_cid or "0").strip() or "0"
     for part in [part for part in normalize_relative_path(folder_path).split("/") if part]:
-        matched = None
-        page_offset = 0
-        for _page_index in range(SCRAPER_NAME_LOOKUP_MAX_PAGES):
-            payload = _get_scraper_entries_page(
-                provider,
-                cookie,
-                current,
-                True,
-                page_offset,
-                SCRAPER_NAME_LOOKUP_PAGE_SIZE,
-                None,
-            )
-            entries = payload.get("entries", []) if isinstance(payload, dict) and isinstance(payload.get("entries"), list) else []
-            matched = next(
-                (
-                    item
-                    for item in entries
-                    if item.get("is_dir") and str(item.get("name", "") or "").strip() == part
-                ),
-                None,
-            )
-            if matched:
-                break
-            if not _scraper_page_has_more(payload, page_offset, SCRAPER_NAME_LOOKUP_PAGE_SIZE):
-                break
-            next_offset = max(0, parse_int(payload.get("next_offset"), default=page_offset + len(entries)))
-            if next_offset <= page_offset:
-                break
-            page_offset = next_offset
+        matched = _find_scraper_folder_part(provider, cookie, current, part)
         if matched:
             current = str(matched.get("id") or matched.get("cid") or "").strip() or current
             continue
         created = _create_provider_folder(provider, cookie, current, part)
         current = str(created.get("id", "") or "").strip() or current
     return current
+
+
+def find_scraper_media_folder(provider: str, parent_id: str, name: str) -> Dict[str, Any]:
+    """在指定目录下查找可复用的媒体文件夹（精确同名优先，其次忽略命名装饰）。
+
+    返回命中的目录条目（含 ``id``/``name``），找不到时返回空字典。
+    快捷导入分发前用它判断"目标监控目录里是否已经有这部剧/这部电影的文件夹"。
+    """
+    normalized = normalize_scraper_provider(provider)
+    cookie = _require_provider_cookie(normalized)
+    target_id = str(parent_id or "0").strip() or "0"
+    return _find_scraper_folder_part(normalized, cookie, target_id, name)
 
 
 def _target_name_exists(
@@ -2375,8 +3143,30 @@ def _target_name_exists(
     *,
     entries_cache: Optional[Dict[Tuple[str, bool], Dict[str, Any]]] = None,
 ) -> bool:
+    return bool(
+        _find_scraper_entry_by_name(
+            provider,
+            cookie,
+            parent_id,
+            target_name,
+            same_entry_id=same_entry_id,
+            entries_cache=entries_cache,
+        )
+    )
+
+
+def _find_scraper_entry_by_name(
+    provider: str,
+    cookie: str,
+    parent_id: str,
+    target_name: str,
+    same_entry_id: str = "",
+    *,
+    entries_cache: Optional[Dict[Tuple[str, bool], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """在目录下按精确同名翻页查找条目（返回条目本身，跳过 ``same_entry_id`` 自己）。"""
     if not parent_id:
-        return False
+        return {}
     page_offset = 0
     for _page_index in range(SCRAPER_NAME_LOOKUP_MAX_PAGES):
         payload = _get_scraper_entries_page(
@@ -2394,14 +3184,50 @@ def _target_name_exists(
                 continue
             if same_entry_id and str(item.get("id", "") or "").strip() == same_entry_id:
                 continue
-            return True
+            return item
         if not _scraper_page_has_more(payload, page_offset, SCRAPER_NAME_LOOKUP_PAGE_SIZE):
             break
         next_offset = max(0, parse_int(payload.get("next_offset"), default=page_offset + len(entries)))
         if next_offset <= page_offset:
             break
         page_offset = next_offset
-    return False
+    return {}
+
+
+def _scraper_conflicting_folder_is_same_media(
+    conflicting: Dict[str, Any],
+    old_name: str,
+    new_name: str,
+    *,
+    same_title_entry_ids: Optional[List[Any]] = None,
+) -> bool:
+    """撞名的那个同名文件夹是不是"同一部影视的另一个文件夹"。
+
+    三种证据任意一条成立就算同一部影视，此时不该报"当前目录中已有同名文件夹"：
+
+    1. 它就是本批次里同一部影视的另一个条目（同一个 TMDB 条目）；
+    2. 两侧名字只差命名装饰（``[tmdbid-…]``/``(n)``）；
+    3. 两侧名字带的 ``[tmdbid-…]`` 标记相同（对方是之前整理留下的文件夹）。
+
+    同一部影视改名本来就必然撞车，正确做法是不改名、让文件就地整理进那个现成文件夹，
+    搬运/合并阶段再并成一个。
+    """
+    if not isinstance(conflicting, dict) or not bool(conflicting.get("is_dir")):
+        return False
+    conflicting_id = str(conflicting.get("id", "") or "").strip()
+    sibling_ids = {
+        str(value).strip()
+        for value in (same_title_entry_ids or [])
+        if str(value or "").strip()
+    }
+    if conflicting_id and conflicting_id in sibling_ids:
+        return True
+    if scraper_folder_name_key(old_name) == scraper_folder_name_key(new_name):
+        return True
+    marker = _scraper_folder_tmdb_marker(new_name)
+    if not marker:
+        return False
+    return marker == _scraper_folder_tmdb_marker(str(conflicting.get("name", "") or ""))
 
 
 def _is_scraper_folder_rename_affecting_path(folder_path: str, target_path: str) -> bool:
@@ -2538,10 +3364,14 @@ def build_scraper_rename_plan(
     plan_options["file_name_mode"] = _normalize_scraper_file_name_mode(plan_options.get("file_name_mode"))
     selection_mode = _resolve_scraper_selection_mode(selected, plan_options)
     folder_mode = selection_mode == "folder"
+    # 调用方可以强制"整理进媒体文件夹"：接收夹快捷导入面对的是散文件（选中的是文件而不是目录），
+    # 需要按「片名 (年份)/…」归档，而不是只在原地把文件改个名。
+    force_media_folder = bool(plan_options.get("force_media_folder", False))
+    organize_into_media_folder = folder_mode or force_media_folder
     plan_options["selection_mode"] = selection_mode
     plan_options["base_path"] = base_path
-    plan_options["organize_into_media_folder"] = folder_mode
-    plan_options["preserve_source_parent_path"] = not folder_mode
+    plan_options["organize_into_media_folder"] = organize_into_media_folder
+    plan_options["preserve_source_parent_path"] = not organize_into_media_folder
     # 选中的本身就是 Season 子目录时，不重命名目录（避免把 Season 01 改成片名），文件原地整理。
     selected_folder_names = [
         str(item.get("name", "") or "")
@@ -2569,9 +3399,15 @@ def build_scraper_rename_plan(
             if folder_path:
                 folder_anchors[folder_path] = normalize_relative_path(str(item.get("parent_path", "") or ""))
     if not folder_mode:
-        plan_options["include_tmdb_id"] = False
-        plan_options["use_season_subfolder"] = False
+        # 选中的是散文件（contents 模式）：不重命名外层文件夹。
         plan_options["rename_selected_folders"] = False
+        # 旧行为是"原地改名、不建媒体文件夹"，那种情况下不写 TMDB ID、不加 Season 子目录；
+        # 但被 force_media_folder 强制归档时（接收夹快捷导入、监控根目录散文件），要跟
+        # "选中文件夹"整理保持同一套命名形状，否则同一部剧会一半散在 片名 (年份)/、
+        # 一半在 片名 (年份) [tmdbid-x]/Season 01/，怎么整理都对不上。
+        if not force_media_folder:
+            plan_options["include_tmdb_id"] = False
+            plan_options["use_season_subfolder"] = False
     expanded_files, scan_issues = _expand_selected_scraper_entries(provider, cookie, selected)
     media_type = normalize_tmdb_media_type(tmdb.get("tmdb_media_type") or tmdb.get("media_type"), "movie")
     task = _build_task_from_tmdb(tmdb, plan_options) if media_type == "tv" else {}
@@ -2606,6 +3442,7 @@ def build_scraper_rename_plan(
     issues: List[str] = list(scan_issues)
     warnings: List[str] = []
     target_paths: Set[str] = set()
+    target_path_owners: Dict[str, str] = {}
     target_folder_names: Set[str] = set()
     preview_entries_cache = entries_cache if isinstance(entries_cache, dict) else {}
     preview_folder_path_cache = path_cache if isinstance(path_cache, dict) else {}
@@ -2615,6 +3452,10 @@ def build_scraper_rename_plan(
     unchanged_rows: List[Dict[str, Any]] = []
     delete_actions: List[Dict[str, Any]] = []
     subtitle_seen: Dict[Tuple[str, str], int] = {}
+    # 内容被并进"同一部影视已存在的媒体文件夹"时记录那个文件夹名：
+    # 调用方（接收夹）据此不再单独分发这个条目，只清理留下的空壳目录。
+    merged_into_folder = ""
+    season_pack_mode = bool(plan_options.get("season_pack"))
     if folder_mode and bool(plan_options.get("rename_selected_folders", True)):
         _, _, target_folder_name = _build_scraper_media_titles(tmdb, plan_options, "")
         for raw in selected:
@@ -2648,14 +3489,30 @@ def build_scraper_rename_plan(
             if new_name in target_folder_names:
                 action_issue = "本批次内目标文件夹重复"
             target_folder_names.add(new_name)
-            if _target_name_exists(
-                provider,
-                cookie,
-                old_parent_id,
-                new_name,
-                same_entry_id=str(entry.get("id", "") or ""),
-                entries_cache=preview_entries_cache,
-            ):
+            try:
+                conflicting_folder = _find_scraper_entry_by_name(
+                    provider,
+                    cookie,
+                    old_parent_id,
+                    new_name,
+                    same_entry_id=str(entry.get("id", "") or ""),
+                    entries_cache=preview_entries_cache,
+                )
+            except Exception:
+                # 查不到就退回老行为（照常报冲突），避免静默跳过用户期望的改名。
+                conflicting_folder = {}
+            if conflicting_folder:
+                if _scraper_conflicting_folder_is_same_media(
+                    conflicting_folder,
+                    old_name,
+                    new_name,
+                    same_title_entry_ids=plan_options.get("same_title_entry_ids"),
+                ):
+                    # 同目录里已经有同一部影视的媒体文件夹（本批次另一个条目 / 装饰名差异 /
+                    # 同一个 [tmdbid-…] 标记）：改名必然撞车，但两边本来就是同一部影视——
+                    # 不改名，文件就地整理进那个现成文件夹，等搬运/合并阶段并成一个。
+                    merged_into_folder = str(conflicting_folder.get("name", "") or new_name).strip() or new_name
+                    continue
                 action_issue = "当前目录中已有同名文件夹"
             action = {
                 "action_index": action_index,
@@ -2686,10 +3543,96 @@ def build_scraper_rename_plan(
                 issues.append(f"{old_name or '--'}：{action_issue}")
             actions.append(action)
             action_index += 1
+    folder_rename_paths: List[Tuple[str, str]] = [
+        (
+            normalize_relative_path(str(item.get("old_path", "") or "")),
+            normalize_relative_path(str(item.get("new_path", "") or "")),
+        )
+        for item in actions
+        if bool(item.get("is_dir"))
+        and bool(item.get("ready"))
+        and not item.get("issue")
+    ]
+    folder_rename_paths = [
+        (old_folder, new_folder)
+        for old_folder, new_folder in folder_rename_paths
+        if old_folder and new_folder and old_folder != new_folder
+    ]
     for file_index, entry in enumerate(expanded_files):
         entry_name = str(entry.get("name", "") or "")
         category = _scraper_file_category(entry_name)
         file_size = max(0, parse_int(entry.get("size", 0), 0))
+        if season_pack_mode and (category in ("info", "image", "other") or _is_scraper_ad_file(entry_name, file_size)):
+            # 整季包拆集时，广告 / NFO / 图片 / 说明等非视频文件不能原地留下：它们会让源季包
+            # 目录永远非空，下一轮被反复识别成“整理失败”。默认“保留”就随季搬进
+            # 片名 (年份)/Season NN/（文件名不改）；开启删除广告时仍然只删除广告类文件。
+            if _is_scraper_ad_file(entry_name, file_size) and bool(plan_options.get("delete_ad_files", False)):
+                delete_actions.append(entry)
+                continue
+            _, _, pack_folder_title = _build_scraper_media_titles(tmdb, plan_options, "")
+            pack_target_path = _canonical_scraper_mount_path(
+                normalize_relative_path(
+                    join_relative_path(pack_folder_title, f"Season {max(1, int(default_season or 1)):02d}", entry_name)
+                ),
+                base_path,
+            )
+            old_parent_id = str(entry.get("parent_id", "") or base_cid).strip() or "0"
+            old_path = _canonical_scraper_mount_path(
+                str(entry.get("path", "") or entry.get("name", "")),
+                base_path,
+            )
+            action_issue = ""
+            if pack_target_path and pack_target_path == old_path:
+                unchanged_count += 1
+                unchanged_rows.append(
+                    {
+                        "old_name": entry_name,
+                        "old_path": old_path,
+                        "new_name": entry_name,
+                        "new_path": pack_target_path,
+                        "is_dir": False,
+                    }
+                )
+                continue
+            if pack_target_path:
+                pack_target_path, same_entry_duplicate = _claim_scraper_target_path(
+                    pack_target_path,
+                    str(entry.get("id", "") or ""),
+                    target_paths,
+                    target_path_owners,
+                )
+                if same_entry_duplicate:
+                    action_issue = "本批次内目标路径重复"
+            else:
+                action_issue = "无法生成目标路径"
+            pack_target_name = os.path.basename(pack_target_path) if pack_target_path else entry_name
+            pack_target_parent = (
+                normalize_relative_path(os.path.dirname(pack_target_path).replace("\\", "/"))
+                if pack_target_path
+                else ""
+            )
+            action = {
+                "action_index": action_index,
+                "entry_id": str(entry.get("id", "") or ""),
+                "is_dir": False,
+                "old_parent_id": old_parent_id,
+                "old_name": entry_name,
+                "old_path": old_path,
+                "new_parent_id": "",
+                "new_name": pack_target_name,
+                "new_path": pack_target_path,
+                "target_parent_path": pack_target_parent,
+                "file_size": file_size,
+                "remote_modified": str(entry.get("remote_modified", "") or ""),
+                "issue": action_issue,
+                "warning": "",
+                "ready": bool(pack_target_path and not action_issue),
+            }
+            if action_issue:
+                issues.append(f"{entry_name}：{action_issue}")
+            actions.append(action)
+            action_index += 1
+            continue
         if category == "info":
             # NFO 等媒体信息文件：保留原名、不删除、不参与整理。
             ignored_names.append(entry_name)
@@ -2755,6 +3698,7 @@ def build_scraper_rename_plan(
         )
         action_issue = issue
         if target_path and target_path == old_path:
+            _reserve_scraper_target_path(target_path, str(entry.get("id", "") or ""), target_paths, target_path_owners)
             unchanged_count += 1
             unchanged_rows.append(
                 {
@@ -2763,6 +3707,22 @@ def build_scraper_rename_plan(
                     "new_name": entry_name,
                     "new_path": target_path,
                     "is_dir": False,
+                }
+            )
+            continue
+        if _is_scraper_folder_prefix_only_change(old_path, target_path, folder_rename_paths):
+            # 文件本身没变，只是外层文件夹被重命名（目录 ID 不变）：
+            # 网盘侧只需一次文件夹改名，文件不应作为独立可执行动作。
+            _reserve_scraper_target_path(target_path, str(entry.get("id", "") or ""), target_paths, target_path_owners)
+            unchanged_count += 1
+            unchanged_rows.append(
+                {
+                    "old_name": entry_name,
+                    "old_path": old_path,
+                    "new_name": entry_name,
+                    "new_path": target_path,
+                    "is_dir": False,
+                    "note": "随文件夹重命名，文件未单独移动",
                 }
             )
             continue
@@ -2776,9 +3736,15 @@ def build_scraper_rename_plan(
         new_name = os.path.basename(execution_target_path) if execution_target_path else ""
         existing_parent_id = ""
         if target_path:
-            if target_path in target_paths:
+            target_path, same_entry_duplicate = _claim_scraper_target_path(
+                target_path,
+                str(entry.get("id", "") or ""),
+                target_paths,
+                target_path_owners,
+            )
+            if same_entry_duplicate:
                 action_issue = action_issue or "本批次内目标路径重复"
-            target_paths.add(target_path)
+            new_name = os.path.basename(target_path) or new_name
             existing_parent_id, exists = _walk_existing_folder(
                 provider,
                 cookie,
@@ -2876,6 +3842,7 @@ def build_scraper_rename_plan(
         "unchanged_count": unchanged_count,
         "unchanged_rows": unchanged_rows,
         "ignored_count": len(ignored_names),
+        "merged_into_folder": merged_into_folder,
         "tmdb": tmdb,
         "options": plan_options,
     }
@@ -3483,12 +4450,13 @@ def _restore_scraper_move_rename_actions(
         rename_back.setdefault(old_parent_id, {})[entry_id] = old_name
     for parent_id, ids in move_back.items():
         try:
-            _move_provider_entries(provider, cookie, ids, parent_id)
+            # 恢复路径只管"尽力挪回去"，不等待落地确认（否则救援会被拖慢甚至超时）。
+            _move_provider_entries(provider, cookie, ids, parent_id, verify_landing=False)
         except Exception:
             pass
     for parent_id, renames in rename_back.items():
         try:
-            _rename_provider_entries(provider, cookie, renames, parent_id=parent_id)
+            _rename_provider_entries(provider, cookie, renames, parent_id=parent_id, verify_landing=False)
         except Exception:
             pass
 
@@ -3600,8 +4568,7 @@ def _execute_scraper_job_batch_forward(
                 renames[str(action.get("entry_id", "") or "").strip()] = str(action.get("new_name", "") or "")
             result = _rename_provider_entries(provider, cookie, renames, parent_id=parent_id)
             _invalidate_provider_parent(provider, parent_id)
-            for prepared_sync in prepared_syncs:
-                _finish_scraper_monitor_sync(prepared_sync, succeeded=True)
+            _finish_scraper_syncs_with_landing(prepared_syncs, result.get("landing"))
             for action, event_action in zip(ready, event_actions):
                 if bool(action.get("is_dir")):
                     path_rewrites.append(
@@ -3800,8 +4767,7 @@ def _execute_scraper_job_batch_forward(
                             for action in chunk:
                                 _invalidate_provider_parent(provider, str(action.get("old_parent_id", "") or "").strip())
                             _invalidate_provider_parent(provider, target_parent_id)
-                            for prepared_sync in prepared_syncs:
-                                _finish_scraper_monitor_sync(prepared_sync, succeeded=True)
+                            _finish_scraper_syncs_with_landing(prepared_syncs, result.get("landing"))
                             for action in chunk:
                                 _mark_completed(action, "已移动", {"moved": True, "response": result.get("response", {})})
                         except Exception as exc:
@@ -3823,6 +4789,7 @@ def _execute_scraper_job_batch_forward(
                 prepared_syncs = []
                 event_actions = []
                 temp_by_action: Dict[int, str] = {}
+                final_landings: List[Dict[str, Any]] = []
                 try:
                     for action in move_rename:
                         event_action = _rebase_scraper_job_action_paths(action, path_rewrites)
@@ -3874,11 +4841,20 @@ def _execute_scraper_job_batch_forward(
                             str(action.get("entry_id", "") or "").strip()
                         ] = str(action.get("new_name", "") or "")
                     for target_parent_id, renames_map in final_renames.items():
-                        _rename_provider_entries(provider, cookie, renames_map, parent_id=target_parent_id)
+                        final_result = _rename_provider_entries(
+                            provider,
+                            cookie,
+                            renames_map,
+                            parent_id=target_parent_id,
+                        )
+                        final_landings.append(final_result)
                         _invalidate_provider_parent(provider, target_parent_id)
 
-                    for prepared_sync in prepared_syncs:
-                        _finish_scraper_monitor_sync(prepared_sync, succeeded=True)
+                    # 三步都发完之后才按"最终名字 + 最终目录"的回验结果收尾监控事件。
+                    _finish_scraper_syncs_with_landing(
+                        prepared_syncs,
+                        _merge_scraper_landing_results(final_landings),
+                    )
                     for action in move_rename:
                         _mark_completed(action, "已整理", {"renamed": True, "moved": True})
                 except Exception as exc:
@@ -4161,6 +5137,7 @@ SCRAPER_BATCH_PRESERVE_TAG_KEYS = frozenset(
     {
         "resolution",
         "source",
+        "group",
         "dynamic_range",
         "video",
         "audio",
@@ -4286,13 +5263,23 @@ SCRAPER_BATCH_SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt", ".i
 SCRAPER_BATCH_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 SCRAPER_BATCH_INFO_EXTENSIONS = {".nfo"}
 SCRAPER_BATCH_AD_EXTENSIONS = {".txt", ".url", ".html", ".htm", ".lnk", ".torrent", ".torrent!"}
+# 可以连续剥离的尾部后缀：站点会给同一份推广文件配 .mkv / .mp4 / .DOC，本地 STRM 侧还可能
+# 再叠一层（.mkv.strm）。判断「整段是不是只有推广话术」前先把这些已知后缀剥干净，
+# 否则残留的 “mkv” 会被当成片名，广告文件就漏判了。
+SCRAPER_STRIPPABLE_EXTENSIONS = (
+    SCRAPER_BATCH_MEDIA_EXTENSIONS
+    | SCRAPER_BATCH_SUBTITLE_EXTENSIONS
+    | SCRAPER_BATCH_IMAGE_EXTENSIONS
+    | SCRAPER_BATCH_AD_EXTENSIONS
+    | {".strm", ".doc", ".docx", ".pdf", ".exe", ".tbn", ".xml", ".json"}
+)
 SCRAPER_STANDARD_IMAGE_STEMS = {
     "poster", "folder", "cover", "backdrop", "fanart", "banner", "clearart",
     "logo", "landscape", "thumb",
 }
 SCRAPER_AD_IMAGE_MARKERS = (
     "official site", "visit", "logo", "banner", "广告", "水印", "推广", "推荐",
-    "watch now", "download now",
+    "watch now", "download now", "扫码", "公众号", "二维码", "加群",
 )
 SCRAPER_SUBTITLE_LANGUAGE_MAP = {
     "dan": "dan", "danish": "dan", "da": "dan",
@@ -4333,10 +5320,93 @@ SCRAPER_SUBTITLE_LANGUAGE_MAP = {
     "cat": "cat", "ca": "cat", "加泰罗尼亚语": "cat",
     "epo": "epo", "eo": "epo", "世界语": "epo",
     "lat": "lat", "la": "lat", "拉丁语": "lat",
+    "yue": "yue", "粤语": "yue", "粵語": "yue", "cantonese": "yue",
     "forced": "forced", "sdh": "sdh", "hi": "hi", "cc": "cc", "default": "default",
     "utf8": "utf8", "utf-8": "utf8", "gb": "gb", "gbk": "gbk", "shift-jis": "sjis",
 }
 _SCRAPER_SUBTITLE_MARKER_VALUES = {"forced", "sdh", "hi", "cc", "default", "utf8", "gb", "gbk", "sjis"}
+# 组合写法：一个 token 里同时表达多种语言/字幕形态。值按文件名从左到右的顺序展开，
+# "双语" 无法确定具体是哪两种语言时保留为原词，避免猜错。
+SCRAPER_SUBTITLE_LANGUAGE_COMBOS: Dict[str, List[str]] = {
+    "简繁英": ["zh-Hans", "zh-Hant", "eng"],
+    "繁简英": ["zh-Hans", "zh-Hant", "eng"],
+    "简繁": ["zh-Hans", "zh-Hant"],
+    "繁简": ["zh-Hans", "zh-Hant"],
+    "中英双语": ["zh-Hans", "eng"],
+    "中英": ["zh-Hans", "eng"],
+    "国英双语": ["zh", "eng"],
+    "國英双语": ["zh", "eng"],
+    "国英": ["zh", "eng"],
+    "國英": ["zh", "eng"],
+    "国粤双语": ["zh", "yue"],
+    "國粵双语": ["zh", "yue"],
+    "国粤": ["zh", "yue"],
+    "國粵": ["zh", "yue"],
+    "国语中字": ["zh"],
+    "國語中字": ["zh"],
+    "粤语中字": ["yue"],
+    "粵語中字": ["yue"],
+    "英语中字": ["eng"],
+    "英語中字": ["eng"],
+    "双语": ["双语"],
+    "雙語": ["双语"],
+}
+
+
+def _scraper_subtitle_token_languages(token: str) -> List[str]:
+    """解析单个文件名 token 里的语言/标记，支持组合词与 & - + , / 分隔写法。"""
+    raw = str(token or "").strip()
+    if not raw:
+        return []
+    key = raw.lower()
+    combined = SCRAPER_SUBTITLE_LANGUAGE_COMBOS.get(raw) or SCRAPER_SUBTITLE_LANGUAGE_COMBOS.get(key)
+    if combined:
+        return list(combined)
+    direct = SCRAPER_SUBTITLE_LANGUAGE_MAP.get(key)
+    if direct:
+        return [direct]
+    # 组合写法：chs&eng / zh-Hans-zh-Hant / chs-eng 等。
+    for separator in (r"[&+,/／|]+", r"[-]+"):
+        parts = [part for part in re.split(separator, raw) if part]
+        if len(parts) <= 1:
+            continue
+        resolved: List[str] = []
+        for part in parts:
+            part_key = part.lower()
+            value = (
+                SCRAPER_SUBTITLE_LANGUAGE_COMBOS.get(part)
+                or SCRAPER_SUBTITLE_LANGUAGE_COMBOS.get(part_key)
+                or SCRAPER_SUBTITLE_LANGUAGE_MAP.get(part_key)
+            )
+            if not value:
+                resolved = []
+                break
+            resolved.extend(value if isinstance(value, list) else [value])
+        if resolved:
+            return resolved
+    # 兜底：整个 token 由已知词 + 分隔符组成时按最长匹配切分。
+    known = sorted(
+        set(SCRAPER_SUBTITLE_LANGUAGE_COMBOS) | set(SCRAPER_SUBTITLE_LANGUAGE_MAP),
+        key=len,
+        reverse=True,
+    )
+    pattern = re.compile("(" + "|".join(re.escape(item) for item in known) + ")", re.IGNORECASE)
+    resolved = []
+    for index, part in enumerate(pattern.split(raw)):
+        if index % 2 == 0:
+            if part.strip(" ._-&+,/／|"):
+                return []
+            continue
+        part_key = part.lower()
+        value = (
+            SCRAPER_SUBTITLE_LANGUAGE_COMBOS.get(part)
+            or SCRAPER_SUBTITLE_LANGUAGE_COMBOS.get(part_key)
+            or SCRAPER_SUBTITLE_LANGUAGE_MAP.get(part_key)
+        )
+        if not value:
+            return []
+        resolved.extend(value if isinstance(value, list) else [value])
+    return resolved
 
 
 def _scraper_file_category(name: str) -> str:
@@ -4358,30 +5428,99 @@ def _scraper_file_category(name: str) -> str:
 
 
 def _scraper_subtitle_suffix(name: str) -> str:
-    """从字幕文件名尾部提取语言/编码/特殊标记，如 Denmark.dan.srt → '.dan'。"""
+    """从字幕文件名尾部提取语言/编码/特殊标记，多语言全部保留。
+
+    例：Denmark.dan.srt → '.dan'；Movie.chs.eng.srt → '.zh-Hans.eng'；
+    Movie.中英.srt → '.zh-Hans.eng'。以前只取最后一个语言 token，多语言字幕会
+    丢失前面的语言，这里改为从尾部连续收集，直到遇到片名等非语言 token。
+    """
     stem = os.path.splitext(str(name or "").strip())[0]
     tokens = [token for token in re.split(r"[._\s]+", stem) if token]
     suffix_parts: List[str] = []
-    language_taken = False
     for token in reversed(tokens):
-        canonical = SCRAPER_SUBTITLE_LANGUAGE_MAP.get(token.lower())
-        if canonical is None:
+        resolved = _scraper_subtitle_token_languages(token)
+        if not resolved:
             break
-        if canonical not in _SCRAPER_SUBTITLE_MARKER_VALUES:
-            if language_taken:
-                break
-            language_taken = True
-        suffix_parts.append(canonical)
-        if len(suffix_parts) >= 3:
+        for part in reversed(resolved):
+            if part not in suffix_parts:
+                suffix_parts.append(part)
+        if len(suffix_parts) >= 4:
             break
     suffix_parts.reverse()
     return f".{'.'.join(suffix_parts)}" if suffix_parts else ""
 
 
+_SCRAPER_CN_DIGITS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "兩": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+
+
+def _scraper_cn_number(value: Any) -> int:
+    """把 1-99 的中文数字转成整数（用于“第N季”）。"""
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = _SCRAPER_CN_DIGITS.get(left, 1) if left else 1
+        ones = _SCRAPER_CN_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return _SCRAPER_CN_DIGITS.get(text, 0)
+
+
+def _scraper_season_pack_seasons(name: str) -> List[int]:
+    """提取“发布式整季文件夹名”里的季号列表。
+
+    只认明确的 S09 / Season 09 / 第9季 写法；裸的 ``Season 09`` 交给现有“就地整理”
+    逻辑处理；带集数标记（S09E01 / EP01）的文件夹是单集或全集范围，不算单季包。
+    返回去重后的季号列表，空列表表示不是整季包。
+    """
+    text = unicodedata.normalize("NFKC", str(name or "")).strip()
+    if not text or is_subscription_season_folder_name(text):
+        return []
+    if re.search(r"(?i)(?<![A-Za-z])(?:e|ep)[\s._-]*\d{1,4}(?![0-9])", text):
+        return []
+    seasons: List[int] = []
+
+    def add(value: Any) -> None:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = 0
+        if 1 <= number <= 99 and number not in seasons:
+            seasons.append(number)
+
+    for match in re.finditer(r"(?<![A-Za-z0-9])S(\d{1,2})(?![0-9])", text):
+        add(match.group(1))
+    for match in re.finditer(r"(?i)(?<![A-Za-z0-9])season[\s._-]*(\d{1,2})(?![0-9])", text):
+        add(match.group(1))
+    for match in re.finditer(r"第\s*([0-9零〇一二三四五六七八九十两兩]{1,4})\s*季", text):
+        add(_scraper_cn_number(match.group(1)))
+    return sorted(seasons)
+
+
+def _scraper_season_pack_number(name: str) -> Optional[int]:
+    """单季包返回季号；多季合集/识别不了返回 None。"""
+    seasons = _scraper_season_pack_seasons(name)
+    return seasons[0] if len(seasons) == 1 else None
+
+
 def _is_scraper_ad_image(name: str, size: int = 0) -> bool:
-    """判断图片是否像站点广告图（Official site / logo / 网站域名水印等）。"""
-    text = str(name or "").lower()
+    """判断图片是否像站点广告图（站名 / 官网 / 发布页 / 网址水印等）。
+
+    与文件名清理共用同一份站点词表：能在文件名里被当成站点广告清理掉的图，
+    这里也要判成广告图，否则会出现“改名会清理、整理不删除”的口径不一致。
+    名称先做 NFKC 归一，全角的 ｗｗｗ／．／（） 也能命中。
+    """
+    text = unicodedata.normalize("NFKC", str(name or "")).lower()
     if any(marker in text for marker in SCRAPER_AD_IMAGE_MARKERS):
+        return True
+    if _SCRAPER_CN_AD_PHRASE_RE.search(text) or _SCRAPER_CN_AD_PROMO_RE.search(text):
+        return True
+    if _SCRAPER_CN_AD_SITE_ACTION_RE.search(text):
         return True
     if re.search(r"www\s*[.\s]", text):
         return True
@@ -4394,12 +5533,23 @@ def _is_scraper_ad_image(name: str, size: int = 0) -> bool:
 
 
 def _is_scraper_ad_file(name: str, size: int = 0) -> bool:
-    """判断是否广告类文件：广告扩展名（txt/url/html 等）或广告图片。NFO 是媒体信息，不算广告。"""
+    """判断是否广告类文件：广告扩展名（txt/url/html 等）、广告图片、“片名全是推广话术”的伪装视频，
+    以及其他扩展名（.doc / .strm 等）里整段只有推广话术的名字。
+
+    NFO 是媒体信息，不算广告。
+    """
     category = _scraper_file_category(name)
     if category == "ad":
         return True
     if category == "image":
         return _is_scraper_ad_image(name, size)
+    if category == "video":
+        # 站点会把广告片伪装成 .mkv/.mp4；文件名去掉推广话术后没有片名残留时按广告处理。
+        return _is_scraper_promotional_only(name)
+    if category == "other":
+        # 非视频扩展名同样会被拿来塞广告：同一份推广话术会配 .mkv / .mp4 / .DOC，
+        # 115 源站上还可能躺着 .strm。整段只有推广话术时按广告处理，否则不动。
+        return _is_scraper_promotional_only(name)
     return False
 
 
@@ -5000,6 +6150,257 @@ def _identify_scraper_batch_item(
     }
 
 
+def _scraper_ai_match_requested(payload: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    """请求体 use_ai 优先；缺省时跟随配置开关。"""
+    raw = payload.get("use_ai") if isinstance(payload, dict) else None
+    if isinstance(raw, bool):
+        return raw
+    return bool(cfg.get("ai_match_enabled", False))
+
+
+def _merge_scraper_ai_candidates(limit: int = 5, *groups: Any) -> List[Dict[str, Any]]:
+    """按 (media_type, tmdb_id) 去重合并候选，靠前的分组优先保留。"""
+    merged: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for candidate in group:
+            if not isinstance(candidate, dict):
+                continue
+            tmdb_id = max(0, parse_int(candidate.get("id", 0), 0))
+            media_type = normalize_tmdb_media_type(candidate.get("media_type"), "")
+            if tmdb_id <= 0:
+                continue
+            key = f"{media_type}:{tmdb_id}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+# 关键词搜索已直接命中高分且明显领先时，跳过第二次 AI 选择调用（省一半调用）。
+AI_MATCH_SKIP_SELECT_SCORE = 80
+AI_MATCH_SKIP_SELECT_GAP = 12
+
+
+def _should_skip_ai_select(candidates: List[Dict[str, Any]]) -> bool:
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    if len(candidates) == 1:
+        return True
+    top = max(0, int(candidates[0].get("score", 0) or 0))
+    second = max(0, int(candidates[1].get("score", 0) or 0))
+    return top >= AI_MATCH_SKIP_SELECT_SCORE and (top - second) >= AI_MATCH_SKIP_SELECT_GAP
+
+
+def _ai_match_one_item(
+    raw_item: Dict[str, Any],
+    result: Dict[str, Any],
+    cfg: Dict[str, Any],
+    runtime: Dict[str, Any],
+) -> None:
+    """对单个未自动匹配条目执行「AI 关键词 → TMDB 搜索 → AI 二次选择」。
+
+    所有异常都在这里吞掉并写进 result["ai_error"]，绝不打断整批识别。
+    """
+    from .ai_match import (
+        ai_match_generate_query,
+        ai_match_select_candidate,
+        empty_ai_usage,
+        merge_ai_usage,
+    )
+
+    usage = empty_ai_usage()
+
+    try:
+        generated = ai_match_generate_query(raw_item, runtime=runtime)
+    except Exception as exc:  # noqa: BLE001 - 单条失败不影响整批
+        result["ai_error"] = f"AI 关键词生成失败：{exc}"
+        result["ai_usage"] = usage
+        return
+    merge_ai_usage(usage, generated.get("usage"))
+    if not generated.get("ok"):
+        result["ai_error"] = str(generated.get("error") or "AI 关键词生成失败")
+        result["ai_usage"] = usage
+        return
+    keyword = str(generated.get("keyword") or "").strip()
+    ai_year = str(generated.get("year") or "").strip()
+    ai_media_type = str(generated.get("media_type") or "").strip()
+    result["ai_keyword"] = keyword
+    result["ai_year"] = ai_year
+    result["ai_media_type"] = ai_media_type
+    if not keyword:
+        result["ai_error"] = "AI 未给出有效关键词"
+        result["ai_usage"] = usage
+        return
+
+    media_type = ai_media_type or str(result.get("media_type") or "").strip()
+    # 文件名里确定性提取的年份比 AI 给出的年份更可靠：优先用它，防止 AI 把 2024 误判成 2023。
+    year = str(result.get("year") or "").strip() or ai_year
+    try:
+        found = _search_batch_tmdb_candidates(keyword, media_type, year, cfg)
+    except Exception as exc:  # noqa: BLE001
+        result["ai_error"] = f"AI 关键词搜索 TMDB 失败：{exc}"
+        result["ai_usage"] = usage
+        return
+    existing_candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+    if not found:
+        result["ai_error"] = "AI 关键词未搜到 TMDB 结果"
+        result["ai_usage"] = usage
+        return
+
+    scored: List[Dict[str, Any]] = []
+    for candidate in found:
+        candidate_score = _score_batch_tmdb_candidate(keyword, year, media_type, candidate)
+        scored.append({**candidate, "score": candidate_score})
+    scored.sort(
+        key=lambda payload: (
+            max(0, int(payload.get("score", 0) or 0)),
+            float(payload.get("popularity", 0) or 0),
+        ),
+        reverse=True,
+    )
+    max_candidates = max(1, int(runtime.get("max_candidates", 5) or 5))
+    top_candidates = scored[:max_candidates]
+
+    if _should_skip_ai_select(top_candidates):
+        # 关键词已直接命中一个明显更优的候选，不必再多花一次 AI 调用。
+        result["ai_skipped_select"] = True
+        selection = {
+            "ok": True,
+            "candidate": top_candidates[0],
+            "confidence": max(0, min(100, int(top_candidates[0].get("score", 0) or 0))),
+            "reason": "关键词直接命中高分候选，已跳过二次选择",
+        }
+    else:
+        try:
+            selection = ai_match_select_candidate(raw_item, top_candidates, runtime=runtime)
+        except Exception as exc:  # noqa: BLE001
+            selection = {"ok": False, "candidate": {}, "confidence": 0, "reason": "", "error": f"AI 候选选择失败：{exc}"}
+        merge_ai_usage(usage, selection.get("usage"))
+
+    min_confidence = max(0, min(100, int(runtime.get("min_confidence", 0) or 0)))
+
+    if selection.get("ok"):
+        chosen = selection.get("candidate") if isinstance(selection.get("candidate"), dict) else {}
+        confidence = max(0, min(100, int(selection.get("confidence", 0) or 0)))
+        reason = str(selection.get("reason") or "").strip()
+        chosen_year = str(chosen.get("year") or "").strip()
+        if year and chosen_year and chosen_year != year:
+            # 已知条目年份时，AI 选中年份不一致直接不采纳，避免同名异年错配。
+            result["ai_year_conflict"] = True
+            result["ai_confidence"] = confidence
+            result["ai_reason"] = f"AI 选中年份 {chosen_year} 与条目年份 {year} 不一致"
+            result["ai_usage"] = usage
+            return
+        if min_confidence > 0 and confidence < min_confidence:
+            # 模型自己都没把握，不当作建议，避免干扰人工判断。
+            result["ai_low_confidence"] = confidence
+            result["ai_reason"] = reason
+            result["ai_usage"] = usage
+            return
+        marked = {
+            **chosen,
+            "source": "ai",
+            "ai_confidence": confidence,
+            "ai_reason": reason,
+        }
+        result["ai_selected"] = marked
+        result["ai_confidence"] = confidence
+        result["ai_reason"] = reason
+        result["candidates"] = _merge_scraper_ai_candidates(5, [marked], top_candidates, existing_candidates)
+        if str(result.get("status") or "") == "manual":
+            result["status"] = "suggest"
+        result["ai_usage"] = usage
+        return
+
+    result["ai_error"] = str(selection.get("error") or "AI 候选选择失败")
+    # 二次选择失败时仍保留关键词命中的候选作为建议，同时保留原确定性候选。
+    merged = _merge_scraper_ai_candidates(5, top_candidates, existing_candidates)
+    if merged:
+        result["candidates"] = merged
+        if str(result.get("status") or "") == "manual":
+            result["status"] = "suggest"
+    result["ai_usage"] = usage
+
+
+def _apply_ai_match_fallback(
+    results: List[Dict[str, Any]],
+    raw_items: List[Dict[str, Any]],
+    payload: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """对确定性识别未自动匹配（status != auto）的条目补充 AI 候选。
+
+    返回本次 AI 运行状态：{"requested": 是否启用, "config_error": 配置错误, "usage": 用量汇总}。
+    """
+    if not _scraper_ai_match_requested(payload, cfg):
+        return {"requested": False, "config_error": "", "usage": {}}
+
+    from .ai_match import (
+        build_ai_match_runtime_config,
+        validate_ai_match_runtime_config,
+        empty_ai_usage,
+        merge_ai_usage,
+    )
+
+    runtime = build_ai_match_runtime_config(cfg)
+    config_error = validate_ai_match_runtime_config(cfg)
+
+    raw_by_index: Dict[int, Dict[str, Any]] = {}
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        index = max(0, parse_int(raw.get("item_index", 0), 0))
+        if index > 0 and index not in raw_by_index:
+            raw_by_index[index] = raw
+
+    targets: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for result in results:
+        if not isinstance(result, dict) or not result.get("ok"):
+            continue
+        if str(result.get("status") or "") == "auto":
+            continue
+        index = max(0, parse_int(result.get("item_index", 0), 0))
+        raw_item = raw_by_index.get(index)
+        if raw_item is None:
+            continue
+        targets.append((raw_item, result))
+
+    if not targets:
+        return {"requested": True, "config_error": "", "usage": {}}
+    if config_error:
+        for _raw_item, result in targets:
+            result["ai_error"] = config_error
+        return {"requested": True, "config_error": config_error, "usage": {}}
+
+    max_workers = max(1, int(runtime.get("max_concurrency", 1) or 1))
+    if max_workers <= 1 or len(targets) == 1:
+        for raw_item, result in targets:
+            _ai_match_one_item(raw_item, result, cfg, runtime)
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(targets))) as executor:
+            futures = [
+                executor.submit(_ai_match_one_item, raw_item, result, cfg, runtime)
+                for raw_item, result in targets
+            ]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:  # noqa: BLE001 - 防御性兜底，单条异常不影响整批
+                    continue
+
+    totals = empty_ai_usage()
+    for _raw_item, result in targets:
+        merge_ai_usage(totals, result.get("ai_usage"))
+    usage = totals if (totals["calls"] or totals["cache_hits"]) else {}
+    return {"requested": True, "config_error": "", "usage": usage}
+
+
 def identify_scraper_batch_items(payload: Dict[str, Any]) -> Dict[str, Any]:
     provider = normalize_scraper_provider(payload.get("provider", "115")) or "115"
     raw_items = payload.get("items", []) if isinstance(payload.get("items"), list) else []
@@ -5010,7 +6411,159 @@ def identify_scraper_batch_items(payload: Dict[str, Any]) -> Dict[str, Any]:
     if config_error:
         raise RuntimeError(config_error)
     results = [_identify_scraper_batch_item(item, cfg) for item in raw_items]
-    return {"ok": True, "provider": provider, "results": results}
+    ai_state = _apply_ai_match_fallback(results, raw_items, payload, cfg)
+    response: Dict[str, Any] = {"ok": True, "provider": provider, "results": results}
+    if ai_state.get("requested"):
+        response["ai_enabled"] = True
+        config_error = str(ai_state.get("config_error") or "").strip()
+        if config_error:
+            response["ai_config_error"] = config_error
+        usage = ai_state.get("usage") if isinstance(ai_state.get("usage"), dict) else {}
+        if usage.get("calls") or usage.get("cache_hits"):
+            response["ai_usage"] = usage
+    return response
+
+
+def identify_scraper_batch_entries(
+    provider: str,
+    entries: Optional[List[Dict[str, Any]]] = None,
+    *,
+    base_cid: str = "0",
+    base_path: str = "",
+    use_ai: bool = True,
+) -> Dict[str, Any]:
+    """共享整理流程第一步：扫描条目 → 识别（TMDB + AI 兜底）→ 挑出可自动处理的候选。
+
+    监控目录的自动刮削与接收夹快捷导入都走这里，保证两边"什么算高置信度""用哪套命名选项"完全一致。
+    可自动处理的条目：TMDB 自动匹配（status == auto）或 AI 已采纳（受 ai_match_min_confidence 约束）。
+    """
+    normalized_provider = normalize_scraper_provider(provider) or "115"
+    normalized_base_cid = str(base_cid or "0").strip() or "0"
+    normalized_base_path = normalize_relative_path(str(base_path or "").strip())
+    scan = scan_scraper_batch_items(
+        normalized_provider,
+        normalized_base_cid,
+        normalized_base_path,
+        entries,
+    )
+    scan_items = scan.get("items", []) if isinstance(scan, dict) else []
+    if not scan_items:
+        return {
+            "ok": True,
+            "provider": normalized_provider,
+            "items": [],
+            "results": [],
+            "picked": {},
+            "plan": {},
+        }
+    identify_payload = {
+        "provider": normalized_provider,
+        "items": [
+            {
+                "item_index": max(0, parse_int(item.get("item_index", 0), 0)),
+                "name": item.get("name", ""),
+                "entry": item.get("entry", {}),
+                "files": (item.get("files") or [])[:40],
+            }
+            for item in scan_items
+        ],
+    }
+    identify = identify_scraper_batch_items(identify_payload)
+    results = identify.get("results", []) if isinstance(identify, dict) else []
+    picked: Dict[int, Dict[str, Any]] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        index = max(0, parse_int(result.get("item_index", 0), 0))
+        auto_pick = result.get("auto_pick")
+        if result.get("status") == "auto" and isinstance(auto_pick, dict) and auto_pick:
+            picked[index] = auto_pick
+            continue
+        ai_selected = result.get("ai_selected") if use_ai else None
+        if isinstance(ai_selected, dict) and ai_selected:
+            picked[index] = ai_selected
+    return {
+        "ok": True,
+        "provider": normalized_provider,
+        "items": scan_items,
+        "results": results,
+        "picked": picked,
+    }
+
+
+def build_scraper_plan_for_batch(
+    provider: str,
+    items: List[Dict[str, Any]],
+    picked: Dict[int, Dict[str, Any]],
+    options: Dict[str, Any],
+    *,
+    base_cid: str = "0",
+    base_path: str = "",
+    item_indexes: Optional[Set[int]] = None,
+) -> Dict[str, Any]:
+    """共享整理流程第二步：用识别结果生成批量计划（可选只取指定条目，便于按类型分组）。"""
+    normalized_provider = normalize_scraper_provider(provider) or "115"
+    allowed = set(item_indexes) if item_indexes else None
+    candidates = picked if isinstance(picked, dict) else {}
+    plan_items = []
+    for item in items or []:
+        index = max(0, parse_int(item.get("item_index", 0), 0))
+        if allowed is not None and index not in allowed:
+            continue
+        binding = candidates.get(index)
+        if not isinstance(binding, dict) or not binding:
+            continue
+        plan_item = {
+            "item_index": index,
+            "name": item.get("name", ""),
+            "entry": item.get("entry", {}),
+            "tmdb": binding,
+        }
+        # 同剧集散文件会被扫描合并成一个条目，这里要把整组文件透传下去，
+        # 否则只有第一个文件会被整理。
+        group_entries = item.get("entries")
+        if isinstance(group_entries, list) and group_entries:
+            plan_item["entries"] = group_entries
+        plan_items.append(plan_item)
+    if not plan_items:
+        return {}
+    return build_scraper_batch_plan(
+        {
+            "provider": normalized_provider,
+            "base_cid": str(base_cid or "0").strip() or "0",
+            "base_path": normalize_relative_path(str(base_path or "").strip()),
+            "options": options if isinstance(options, dict) else {},
+            "items": plan_items,
+        }
+    )
+
+
+def build_scraper_organize_plan(
+    provider: str,
+    entries: Optional[List[Dict[str, Any]]],
+    options: Dict[str, Any],
+    *,
+    base_cid: str = "0",
+    base_path: str = "",
+    use_ai: bool = True,
+) -> Dict[str, Any]:
+    """监控自动刮削用的便捷封装：识别 + 生成计划一次完成。"""
+    identified = identify_scraper_batch_entries(
+        provider,
+        entries,
+        base_cid=base_cid,
+        base_path=base_path,
+        use_ai=use_ai,
+    )
+    plan = build_scraper_plan_for_batch(
+        provider,
+        identified.get("items") or [],
+        identified.get("picked") or {},
+        options,
+        base_cid=base_cid,
+        base_path=base_path,
+    )
+    return {**identified, "plan": plan}
 
 
 def _resolve_batch_tmdb_binding(tmdb: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -5028,6 +6581,16 @@ def _resolve_batch_tmdb_binding(tmdb: Dict[str, Any], cfg: Dict[str, Any]) -> Di
     if not isinstance(detail, dict) or not detail:
         return {}
     return build_tmdb_task_binding(detail, media_type=media_type)
+
+
+def _scraper_batch_title_key(binding: Dict[str, Any]) -> Tuple[str, int]:
+    """批量计划里判断"同一部影视"的键：媒体类型 + TMDB ID。"""
+    data = binding if isinstance(binding, dict) else {}
+    tmdb_id = max(0, parse_int(data.get("tmdb_id") or data.get("id") or 0, 0))
+    media_type = normalize_tmdb_media_type(data.get("tmdb_media_type") or data.get("media_type"), "")
+    if tmdb_id <= 0 or media_type not in ("movie", "tv"):
+        return "", 0
+    return media_type, tmdb_id
 
 
 def build_scraper_batch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -5048,6 +6611,32 @@ def build_scraper_batch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
     issues: List[str] = []
     warnings: List[str] = []
     item_summaries: List[Dict[str, Any]] = []
+    item_issue_messages: Dict[int, List[str]] = {}
+    item_title_keys: Dict[int, Tuple[str, int]] = {}
+
+    def record_item_issue(index: int, name: str, text: str) -> None:
+        normalized_index = max(0, parse_int(index, 0))
+        item_issue_messages.setdefault(normalized_index, []).append(str(text))
+        issues.append(f"条目 #{normalized_index} {name or '--'}：{text}")
+
+    # 先解决 TMDB 绑定，并按"同一部影视"把条目归组：同一组条目（电影的多版本、同一剧集的多季包）
+    # 整理时会落到同一个媒体文件夹，必须让每个条目的计划都知道同组还有谁，才能合并而不是互相报冲突。
+    item_bindings: Dict[int, Dict[str, Any]] = {}
+    title_entry_ids: Dict[Tuple[str, int], Set[str]] = {}
+    for raw_item in raw_items:
+        item = raw_item if isinstance(raw_item, dict) else {}
+        entry = item.get("entry") if isinstance(item.get("entry"), dict) else {}
+        tmdb = item.get("tmdb") if isinstance(item.get("tmdb"), dict) else {}
+        if not entry.get("id"):
+            continue
+        item_index = max(0, parse_int(item.get("item_index", 0), 0))
+        binding = _resolve_batch_tmdb_binding(tmdb, cfg)
+        item_bindings[item_index] = binding
+        title_key = _scraper_batch_title_key(binding)
+        entry_id = str(entry.get("id", "") or "").strip()
+        if title_key and entry_id:
+            title_entry_ids.setdefault(title_key, set()).add(entry_id)
+
     # 批量条目共享目录/路径缓存：同一父目录（尤其大目录）只扫一次，避免每个条目重复扫描。
     shared_entries_cache: Dict[Tuple[str, bool, int, int], Dict[str, Any]] = {}
     shared_path_cache: Dict[Tuple[str, str], Tuple[str, bool]] = {}
@@ -5062,17 +6651,44 @@ def build_scraper_batch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         tmdb = item.get("tmdb") if isinstance(item.get("tmdb"), dict) else {}
         item_name = str(item.get("name") or entry.get("name") or "")
         if not entry.get("id"):
-            issues.append(f"条目 #{item_index} {item_name or '--'}：缺少网盘条目信息")
+            record_item_issue(item_index, item_name, "缺少网盘条目信息")
             continue
-        binding = _resolve_batch_tmdb_binding(tmdb, cfg)
+        binding = item_bindings.get(item_index) or {}
         if not binding:
-            issues.append(f"条目 #{item_index} {item_name or '--'}：未绑定 TMDB 或详情获取失败")
+            record_item_issue(item_index, item_name, "未绑定 TMDB 或详情获取失败")
             continue
+        title_key = _scraper_batch_title_key(binding)
+        item_title_keys[item_index] = title_key
         item_options = dict(options)
         item_overrides = item.get("options") if isinstance(item.get("options"), dict) else {}
         item_options.update(item_overrides)
+        same_title_ids = sorted(
+            title_entry_ids.get(title_key) or set()
+        ) if title_key else []
+        own_entry_id = str(entry.get("id", "") or "").strip()
+        if len(same_title_ids) > 1 and own_entry_id:
+            item_options["same_title_entry_ids"] = [
+                value for value in same_title_ids if value != own_entry_id
+            ]
         if bool(entry.get("is_dir")):
             item_options["selection_mode"] = "folder"
+            # 发布式整季文件夹（Show.S09.1080p…）不能当成“一个作品文件夹”整体改名，
+            # 否则同一部剧的多季会都撞到同一个 片名 (年份) 目录。这里改成展开目录内容，
+            # 按集落到 片名 (年份)/Season NN/，与散文件/单集整理保持同一套目标形状。
+            binding_media_type = normalize_tmdb_media_type(
+                binding.get("tmdb_media_type") or binding.get("media_type"),
+                "",
+            )
+            season_pack = (
+                _scraper_season_pack_number(str(entry.get("name", "") or item_name))
+                if binding_media_type == "tv"
+                else None
+            )
+            if season_pack:
+                item_options["selection_mode"] = "contents"
+                item_options["season"] = season_pack
+                item_options["force_media_folder"] = True
+                item_options["season_pack"] = True
         else:
             item_options["selection_mode"] = "contents"
         item_options["base_path"] = base_path
@@ -5095,13 +6711,14 @@ def build_scraper_batch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
                 path_cache=shared_path_cache,
             )
         except Exception as exc:
-            issues.append(f"条目 #{item_index} {item_name or '--'}：{exc}")
+            record_item_issue(item_index, item_name, str(exc))
             continue
         plan_actions = [action for action in plan.get("actions", []) if isinstance(action, dict)]
         item_issues = [str(value) for value in plan.get("issues", []) if str(value or "").strip()]
         item_warnings = [str(value) for value in plan.get("warnings", []) if str(value or "").strip()]
         item_ignored = max(0, int(plan.get("ignored_count", 0) or 0))
-        issues.extend(f"条目 #{item_index} {item_name or '--'}：{text}" for text in item_issues)
+        for text in item_issues:
+            record_item_issue(item_index, item_name, text)
         warnings.extend(f"条目 #{item_index} {item_name or '--'}：{text}" for text in item_warnings)
         unchanged_count += max(0, int(plan.get("unchanged_count", 0) or 0))
         ignored_count += item_ignored
@@ -5137,11 +6754,36 @@ def build_scraper_batch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "issue_count": len(item_issues),
                 "unchanged": max(0, int(plan.get("unchanged_count", 0) or 0)),
                 "ignored": item_ignored,
+                "merged_into_folder": str(plan.get("merged_into_folder", "") or "").strip(),
             }
         )
 
     # 跨条目目标冲突检测：同一批内不同条目不能落到同一个目标路径。
-    seen_targets: Dict[str, str] = {}
+    # 例外是"同一部影视的多个版本"（接收夹实测：同一部片的高码版 + 普通版）：
+    #   - 文件夹撞名：后来的那个不再单独改名，内容并进先出现的那个媒体文件夹；
+    #   - 文件撞名：给后来的文件加 (2) 序号让两个版本并存，而不是把整批留在接收夹。
+    items_with_file_actions = {
+        max(0, parse_int(action.get("item_index", 0), 0))
+        for action in actions
+        if not action.get("is_dir")
+    }
+    seen_targets: Dict[str, Dict[str, Any]] = {}
+    # 已经就位（不改名）的文件同样占着目标路径：同一部影视的另一个版本不能再撞上它。
+    for row in unchanged_rows:
+        target = normalize_relative_path(str(row.get("new_path", "") or ""))
+        if not target:
+            continue
+        row_index = max(0, parse_int(row.get("item_index", 0), 0))
+        seen_targets.setdefault(
+            target,
+            {
+                "entry_id": "",
+                "item_index": row_index,
+                "item_name": str(row.get("item_name", "") or ""),
+                "title_key": item_title_keys.get(row_index) or ("", 0),
+            },
+        )
+    dropped_action_indexes: Set[int] = set()
     for action in actions:
         if action.get("issue"):
             continue
@@ -5149,25 +6791,70 @@ def build_scraper_batch_plan(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not target:
             continue
         entry_id = str(action.get("entry_id", "") or "")
-        previous_entry = seen_targets.get(target, "")
-        if previous_entry and previous_entry != entry_id:
-            action["issue"] = "目标路径与本批次其他条目重复"
-            action["ready"] = False
-            issues.append(
-                f"条目 #{action.get('item_index', 0)} {action.get('item_name') or '--'}："
-                f"目标路径 {target} 与本批次其他条目重复"
-            )
-        elif not previous_entry:
-            seen_targets[target] = entry_id
+        item_index = max(0, parse_int(action.get("item_index", 0), 0))
+        current = {
+            "entry_id": entry_id,
+            "item_index": item_index,
+            "item_name": str(action.get("item_name", "") or ""),
+            "title_key": item_title_keys.get(item_index) or ("", 0),
+        }
+        previous = seen_targets.get(target)
+        if not previous:
+            seen_targets[target] = current
+            continue
+        previous_entry = str(previous.get("entry_id", "") or "")
+        if previous_entry and previous_entry == entry_id:
+            continue
+        same_title = bool(current["title_key"][1]) and current["title_key"] == previous.get("title_key")
+        if same_title and bool(action.get("is_dir")):
+            if item_index in items_with_file_actions:
+                dropped_action_indexes.add(max(0, parse_int(action.get("action_index", 0), 0)))
+                merged_name = os.path.basename(target)
+                for summary in item_summaries:
+                    if max(0, parse_int(summary.get("item_index", 0), 0)) == item_index:
+                        summary["merged_into_folder"] = merged_name
+                warnings.append(
+                    f"条目 #{item_index} {current['item_name'] or '--'}：与同一部影视的另一个条目合并，"
+                    f"内容并入「{merged_name}」"
+                )
+                continue
+            # 没有可并入的文件动作（空文件夹 / 只有非影视文件）：保持原来的冲突提示。
+        elif same_title:
+            new_target = _disambiguate_scraper_target_path(target, set(seen_targets.keys()))
+            if new_target and new_target != target:
+                action["new_path"] = new_target
+                action["new_name"] = os.path.basename(new_target)
+                seen_targets[new_target] = current
+                warnings.append(
+                    f"条目 #{item_index} {current['item_name'] or '--'}：与同一部影视的其他版本同名，"
+                    f"目标文件名改为「{os.path.basename(new_target)}」"
+                )
+                continue
+        action["issue"] = "目标路径与本批次其他条目重复"
+        action["ready"] = False
+        record_item_issue(
+            item_index,
+            current["item_name"],
+            f"目标路径 {target} 与本批次其他条目重复",
+        )
+    if dropped_action_indexes:
+        actions = [
+            action
+            for action in actions
+            if max(0, parse_int(action.get("action_index", 0), 0)) not in dropped_action_indexes
+        ]
 
-    # 冲突标记后重算每个条目的可执行数，避免汇总与最终 ready_count 不一致。
-    item_ready_counts: Dict[int, int] = {}
-    for action in actions:
-        if action.get("ready") and not action.get("issue"):
-            item_index = max(0, int(action.get("item_index", 0) or 0))
-            item_ready_counts[item_index] = item_ready_counts.get(item_index, 0) + 1
+    # 冲突/合并处理完再重算每个条目的可执行数与问题数，避免汇总和最终 ready_count 不一致。
     for summary in item_summaries:
-        summary["ready"] = item_ready_counts.get(max(0, int(summary.get("item_index", 0) or 0)), 0)
+        index = max(0, parse_int(summary.get("item_index", 0), 0))
+        related = [
+            action
+            for action in actions
+            if max(0, parse_int(action.get("item_index", 0), 0)) == index
+        ]
+        summary["total"] = len(related)
+        summary["ready"] = sum(1 for action in related if action.get("ready") and not action.get("issue"))
+        summary["issue_count"] = len(item_issue_messages.get(index, []))
 
     ready_count = sum(1 for action in actions if action.get("ready") and not action.get("issue"))
     return {

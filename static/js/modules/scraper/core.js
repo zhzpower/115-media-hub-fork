@@ -62,6 +62,9 @@ const state = {
     batchBusy: false,
     batchScan: null,
     batchIdentify: null,
+    batchAiUsage: null,
+    batchAiEnabled: false,
+    batchAiConfigError: '',
     batchBindings: {},
     batchIncluded: new Set(),
     batchSearchState: {},
@@ -222,7 +225,9 @@ function syncScraperLocationHash() {
         params.set('tab', 'scraper');
         params.set('provider', String(state.provider || '115'));
         const path = currentParentPath();
-        if (path) params.set('path', path);
+        const hasSearchJump = state.trail.some(item => item.searchJump);
+        if (hasSearchJump) params.delete('path');
+        else if (path) params.set('path', path);
         else params.delete('path');
         const url = `${window.location.pathname}${window.location.search}#${params.toString()}`;
         history.replaceState(null, '', url);
@@ -339,16 +344,20 @@ function enrichEntry(entry) {
     const item = entry && typeof entry === 'object' ? entry : {};
     const id = String(item.id || item.cid || item.fid || '').trim();
     const name = String(item.name || '').trim();
-    const parentPath = currentParentPath();
+    const isSearchResult = !!item.search_result;
+    const parentPath = isSearchResult ? '' : currentParentPath();
     const itemPath = normalizePath(item.path || '');
     const combinedPath = normalizePath(joinPath(parentPath, name));
-    const path = itemPath && (itemPath.includes('/') || !parentPath) ? itemPath : combinedPath;
+    const path = isSearchResult
+        ? (itemPath || name)
+        : (itemPath && (itemPath.includes('/') || !parentPath) ? itemPath : combinedPath);
+    const rawParentId = String(item.parent_id || '').trim();
     return {
         ...item,
         id,
         name,
-        parent_id: normalizeCid(item.parent_id || state.cid),
-        parent_path: parentPath,
+        parent_id: isSearchResult ? rawParentId : normalizeCid(rawParentId || state.cid),
+        parent_path: isSearchResult ? normalizePath(item.parent_path || '') : parentPath,
         path,
         is_dir: !!item.is_dir,
         size: Number(item.size || 0) || 0,
@@ -368,7 +377,18 @@ function getSelectionPath(entry = {}) {
 
 function getSelectionParentPath(entry = {}) {
     const item = entry && typeof entry === 'object' ? entry : {};
-    return normalizePath(item.parent_path || currentParentPath());
+    const parentPath = normalizePath(item.parent_path || '');
+    if (item.search_result && !parentPath) return '';
+    return normalizePath(parentPath || currentParentPath());
+}
+
+function getUnknownSearchResultEntries(entries = []) {
+    return (Array.isArray(entries) ? entries : [])
+        .filter(item => item && item.search_result && item.path_unknown !== false);
+}
+
+function hasUnknownSearchResultEntries(entries = []) {
+    return getUnknownSearchResultEntries(entries).length > 0;
 }
 
 function buildMonitorScanScopes(entries) {
@@ -651,8 +671,14 @@ async function promptText({ title = '输入名称', message = '', defaultValue =
             if (event.key === 'Escape') cleanup(null);
             if (event.key === 'Enter' && !event.isComposing) cleanup(String(input.value || '').trim());
         };
+        // 遮罩关闭只认 pointerdown（按下时就在遮罩上）：文本选择从输入框拖出、
+        // 在遮罩上松开时点击事件的公共祖先仍是遮罩，若用 click 判断会误关重命名框。
+        modal.addEventListener('pointerdown', (event) => {
+            if (event.target === modal) cleanup(null);
+        });
         modal.addEventListener('click', (event) => {
-            if (event.target === modal || event.target.closest('[data-prompt-cancel]')) cleanup(null);
+            if (!modal.isConnected) return;
+            if (event.target.closest('[data-prompt-cancel]')) cleanup(null);
             if (event.target.closest('[data-prompt-confirm]')) cleanup(String(input.value || '').trim());
         });
         document.addEventListener('keydown', onKeydown);
@@ -841,7 +867,7 @@ function renderSelection() {
         monitorScanButton.disabled = state.loading || !canMonitorScan;
         monitorScanButton.classList.toggle('btn-disabled', state.loading || !canMonitorScan);
         monitorScanButton.title = canMonitorScan
-            ? '对勾选的文件夹（或文件所在目录）执行监控扫描并刷新 STRM'
+            ? '对勾选的文件夹（或文件所在目录）执行监控扫描并刷新 STRM（只同步 STRM，不整理文件）'
             : (hasPlan ? '退出预览后再扫描监控' : '请先勾选要扫描的文件夹或文件');
     }
     const batchButton = document.querySelector('[data-scraper-action="open-batch"]');
@@ -1012,16 +1038,20 @@ function renderEntries() {
         const unchangedRows = Array.isArray(state.plan?.unchanged_rows) ? state.plan.unchanged_rows : [];
         const unchangedHtml = unchangedRows.map((row) => {
             const title = row.item_name ? `${row.item_name} / ${row.old_name || '--'}` : (row.old_name || '--');
+            const followsFolderRename = !!row.note;
+            const rowTitle = followsFolderRename
+                ? (row.new_path || row.old_path || row.old_name || '--')
+                : (row.old_path || row.old_name || '--');
             return `
                 <div class="scraper-preview-row is-unchanged">
                     <div class="scraper-preview-original">
                         <span class="scraper-plan-badge">${row.is_dir ? '文件夹' : '文件'}</span>
-                        <strong title="${escapeHtml(row.old_path || row.old_name || '--')}">${escapeHtml(title)}</strong>
+                        <strong title="${escapeHtml(rowTitle)}">${escapeHtml(title)}</strong>
                     </div>
                     <div class="scraper-preview-target">
                         <div class="scraper-preview-target-head">
-                            <span class="scraper-preview-status is-muted">无变化</span>
-                            <strong>保持原名，已跳过</strong>
+                            <span class="scraper-preview-status is-muted">${followsFolderRename ? '随文件夹重命名' : '无变化'}</span>
+                            <strong>${followsFolderRename ? '文件未单独移动，保持原名' : '保持原名，已跳过'}</strong>
                         </div>
                     </div>
                     <label class="scraper-preview-check">
@@ -1859,7 +1889,16 @@ async function enterFolder(entryId) {
     state.navigationBusy = true;
     try {
         state.cid = nextCid;
-        state.trail = state.trail.concat([{ id: state.cid, name: entry.name }]);
+        if (entry.search_result) {
+            // 搜索结果来自网盘任意位置：先向服务端补查真实祖先链，恢复完整路径栏；
+            // 查询失败时退回“根目录 / 该文件夹”，避免把结果误挂到当前目录下。
+            const resolved = await resolveSearchFolderPath(entry, nextCid);
+            state.trail = resolved.resolved
+                ? [{ id: '0', name: '根目录' }, ...resolved.ancestors]
+                : [{ id: '0', name: '根目录' }, { id: state.cid, name: entry.name, searchJump: true }];
+        } else {
+            state.trail = state.trail.concat([{ id: state.cid, name: entry.name }]);
+        }
         state.search = '';
         $('scraper-search-input').value = '';
         clearPlan();
@@ -1871,6 +1910,34 @@ async function enterFolder(entryId) {
         renderEntries();
     }
     syncScraperLocationHash();
+}
+
+async function resolveSearchFolderPath(entry, cid) {
+    try {
+        const data = await window.MediaHubApi.getJson(
+            `/scraper/${encodeURIComponent(state.provider)}/folder-path?cid=${encodeURIComponent(cid)}`
+        );
+        const ancestors = (Array.isArray(data.ancestors) ? data.ancestors : [])
+            .map(item => item && typeof item === 'object' ? {
+                id: String(item.id || item.cid || '').trim(),
+                name: String(item.name || '').trim(),
+            } : null)
+            .filter(item => item && item.id && item.name && item.id !== '0');
+        const normalizedCid = String(cid || '').trim();
+        const lastAncestor = ancestors[ancestors.length - 1] || null;
+        if (lastAncestor && lastAncestor.id === normalizedCid) {
+            return { ancestors, resolved: true };
+        }
+        // 接口偶尔只返回上级链时，把当前目录补在末尾，保证路径栏完整可点击。
+        const folderName = String(entry?.name || '').trim();
+        if (!folderName) return { ancestors: [], resolved: false };
+        return {
+            ancestors: ancestors.concat([{ id: normalizedCid, name: folderName }]),
+            resolved: true,
+        };
+    } catch (error) {
+        return { ancestors: [], resolved: false };
+    }
 }
 
 async function goTrail(index) {
@@ -1922,6 +1989,10 @@ async function renameSelected() {
     const selected = getEffectiveSelectedEntries();
     if (selected.length !== 1) {
         showToast('请选择一个文件或文件夹进行重命名', { tone: 'warn', duration: 2400, placement: 'top-center' });
+        return;
+    }
+    if (hasUnknownSearchResultEntries(selected)) {
+        showToast('搜索结果真实路径未知，请先进入该文件夹后再重命名', { tone: 'warn', duration: 3000, placement: 'top-center' });
         return;
     }
     const target = selected[0];
@@ -1976,6 +2047,10 @@ function prepareMove() {
         showToast('请先选择要移动的条目', { tone: 'warn', duration: 2200, placement: 'top-center' });
         return;
     }
+    if (hasUnknownSearchResultEntries(selected)) {
+        showToast('搜索结果真实路径未知，请先进入该文件夹后再移动', { tone: 'warn', duration: 3000, placement: 'top-center' });
+        return;
+    }
     state.copyBuffer = null;
     state.moveBuffer = {
         provider: state.provider,
@@ -1992,6 +2067,10 @@ function prepareCopy() {
     const selected = getEffectiveSelectedEntries();
     if (!selected.length) {
         showToast('请先选择要复制的条目', { tone: 'warn', duration: 2200, placement: 'top-center' });
+        return;
+    }
+    if (hasUnknownSearchResultEntries(selected)) {
+        showToast('搜索结果真实路径未知，请先进入该文件夹后再复制', { tone: 'warn', duration: 3000, placement: 'top-center' });
         return;
     }
     state.moveBuffer = null;
@@ -2076,6 +2155,10 @@ async function deleteSelected() {
     const selected = getEffectiveSelectedEntries();
     if (!selected.length) {
         showToast('请先选择要删除的条目', { tone: 'warn', duration: 2200, placement: 'top-center' });
+        return;
+    }
+    if (hasUnknownSearchResultEntries(selected)) {
+        showToast('搜索结果真实路径未知，请先进入该文件夹后再删除', { tone: 'warn', duration: 3000, placement: 'top-center' });
         return;
     }
     const ok = await showConfirm(`确定删除 ${selected.length} 个条目吗？删除不纳入刮削任务回退。`, {
@@ -2315,6 +2398,9 @@ function resetBatchContext() {
     state.batchBusy = false;
     state.batchScan = null;
     state.batchIdentify = null;
+    state.batchAiUsage = null;
+    state.batchAiEnabled = false;
+    state.batchAiConfigError = '';
     state.batchBindings = {};
     state.batchIncluded = new Set();
     state.batchSearchState = {};
@@ -2436,6 +2522,9 @@ async function scanBatch(entries) {
         });
         state.batchScan = data || {};
         state.batchIdentify = null;
+        state.batchAiUsage = null;
+        state.batchAiEnabled = false;
+        state.batchAiConfigError = '';
         state.batchBindings = {};
         state.batchIncluded = new Set();
         state.batchSearchState = {};
@@ -2466,6 +2555,9 @@ async function identifyBatch() {
             })),
         });
         state.batchIdentify = Array.isArray(data.results) ? data.results : [];
+        state.batchAiUsage = data && typeof data.ai_usage === 'object' && data.ai_usage ? data.ai_usage : null;
+        state.batchAiEnabled = !!(data && data.ai_enabled);
+        state.batchAiConfigError = String(data?.ai_config_error || '').trim();
         for (const result of state.batchIdentify) {
             if (result?.ok && result.auto_pick) {
                 const index = Number(result.item_index || 0);
@@ -2598,11 +2690,21 @@ function renderBatchItem(item) {
         actionsHtml = `<button type="button" class="scraper-compact-btn" data-batch-search="${escapeHtml(String(index))}">改绑</button>`;
     } else if (identify?.status === 'suggest' && Array.isArray(identify.candidates) && identify.candidates.length) {
         const candidate = identify.candidates[0];
+        const isAi = candidate?.source === 'ai' || !!identify.ai_selected;
+        const aiConfidence = Number((identify.ai_confidence ?? candidate?.ai_confidence) || 0);
+        const aiReason = String(identify.ai_reason || candidate?.ai_reason || '').trim();
+        const aiError = String(identify?.ai_error || '').trim();
+        const aiLowConfidence = Number(identify?.ai_low_confidence || 0);
+        const aiNote = isAi
+            ? [aiConfidence > 0 ? `置信度 ${aiConfidence}` : '', aiReason].filter(Boolean).join(' · ')
+            : (aiError || (aiLowConfidence > 0 ? `置信度 ${aiLowConfidence}，低于门槛未采纳` : ''));
+        const aiNoteText = isAi ? aiNote : (aiNote ? `AI：${aiNote}` : '');
         matchHtml = `
             <div class="scraper-batch-match">
-                <span class="scraper-batch-badge is-suggest">建议</span>
+                <span class="scraper-batch-badge ${isAi ? 'is-ai' : 'is-suggest'}">${isAi ? 'AI 建议' : '建议'}</span>
                 <strong title="${escapeHtml(getBatchCandidateTitle(candidate))}">${escapeHtml(getBatchCandidateTitle(candidate))}</strong>
                 <span class="scraper-batch-type">${typeLabel}</span>
+                ${aiNoteText ? `<span class="scraper-batch-ai-note" title="${escapeHtml(aiNoteText)}">${escapeHtml(aiNoteText)}</span>` : ''}
                 <button type="button" class="scraper-compact-btn scraper-primary-soft" data-batch-accept="${escapeHtml(String(index))}">接受</button>
             </div>
         `;
@@ -2616,10 +2718,14 @@ function renderBatchItem(item) {
         `;
     } else {
         const queryText = identify?.query || item.name || '';
+        const aiError = String(identify?.ai_error || '').trim();
+        const aiLowConfidence = Number(identify?.ai_low_confidence || 0);
+        const aiNote = aiError || (aiLowConfidence > 0 ? `置信度 ${aiLowConfidence}，低于门槛未采纳` : '');
         matchHtml = `
             <div class="scraper-batch-match">
                 <span class="scraper-batch-badge is-manual">未匹配</span>
                 <span class="scraper-batch-status-text">${identify ? `未找到可信条目（关键词：${escapeHtml(queryText)}）` : '等待识别'}</span>
+                ${aiNote ? `<span class="scraper-batch-ai-note" title="${escapeHtml(aiNote)}">AI：${escapeHtml(aiNote)}</span>` : ''}
             </div>
         `;
         actionsHtml = `<button type="button" class="scraper-compact-btn" data-batch-search="${escapeHtml(String(index))}">搜索绑定</button>`;
@@ -2633,22 +2739,38 @@ function renderBatchItem(item) {
             </div>
         `
         : '';
+    const rebindHtml = actionsHtml || searchHtml
+        ? `
+            <section class="scraper-batch-rebind">
+                <div class="scraper-batch-section-label">改绑</div>
+                <div class="scraper-batch-actions">${actionsHtml}</div>
+                ${searchHtml}
+            </section>
+        `
+        : '';
     return `
         <div class="scraper-batch-row ${included ? 'is-included' : ''}">
             <label class="scraper-batch-check">
                 <input type="checkbox" class="ui-checkbox ui-checkbox-sm" data-batch-toggle="${escapeHtml(String(index))}" ${included ? 'checked' : ''}>
             </label>
             <div class="scraper-batch-main">
-                <div class="scraper-batch-head">
-                    <span class="scraper-plan-badge">${dirBadge}</span>
-                    <strong title="${escapeHtml(item.name || '')}">${escapeHtml(item.name || '--')}</strong>
-                    <span class="scraper-batch-count">${fileCount} 个媒体文件</span>
-                </div>
-                ${matchHtml}
-                <div class="scraper-batch-actions">${actionsHtml}</div>
-                ${searchHtml}
+                <section class="scraper-batch-source">
+                    <div class="scraper-batch-section-label">原始文件夹</div>
+                    <div class="scraper-batch-head">
+                        <span class="scraper-plan-badge">${dirBadge}</span>
+                        <strong title="${escapeHtml(item.name || '')}">${escapeHtml(item.name || '--')}</strong>
+                        <span class="scraper-batch-count">${fileCount} 个媒体文件</span>
+                    </div>
+                </section>
+                <section class="scraper-batch-recognition">
+                    <div class="scraper-batch-section-label">当前影视信息</div>
+                    <div class="scraper-batch-recognition-content">
+                        ${matchHtml}
+                        ${posterHtml}
+                    </div>
+                </section>
+                ${rebindHtml}
             </div>
-            ${posterHtml}
         </div>
     `;
 }
@@ -2687,6 +2809,22 @@ function renderBatch() {
         const index = Number(item.item_index || 0);
         return state.batchIncluded.has(index) && !!getBatchBinding(index);
     });
+    const aiUsage = state.batchAiUsage && typeof state.batchAiUsage === 'object' ? state.batchAiUsage : null;
+    const aiCalls = Number(aiUsage?.calls || 0);
+    const aiCacheHits = Number(aiUsage?.cache_hits || 0);
+    const aiTokens = Number(aiUsage?.total_tokens || 0);
+    const aiConfigError = String(state.batchAiConfigError || '').trim();
+    let aiUsageText = '';
+    let aiUsageTone = '';
+    if (aiCalls || aiCacheHits) {
+        aiUsageText = `AI 调用 ${aiCalls} 次${aiCacheHits ? `（缓存命中 ${aiCacheHits}）` : ''}${aiTokens ? ` · ${aiTokens} tokens` : ''}`;
+    } else if (aiConfigError) {
+        aiUsageText = `AI 未运行：${aiConfigError}`;
+        aiUsageTone = ' is-warn';
+    } else if (state.batchAiEnabled) {
+        aiUsageText = 'AI 已启用，本次没有可处理的未匹配条目';
+        aiUsageTone = ' is-muted';
+    }
     if (state.batchBusy) {
         summary.innerHTML = '<span class="scraper-busy-spinner inline" aria-hidden="true"></span>正在扫描并匹配 TMDB 条目，请稍候...';
     } else {
@@ -2695,6 +2833,7 @@ function renderBatch() {
             <span> / 自动匹配 ${escapeHtml(String(autoCount))}，建议 ${escapeHtml(String(suggestCount))}，待确认 ${escapeHtml(String(manualCount))}</span>
             <span> / 已勾选 ${escapeHtml(String(includedCount))}（已绑定 ${escapeHtml(String(boundCount))}）</span>
             ${issues.length ? `<em class="scraper-plan-warning">${escapeHtml(String(issues.length))} 个扫描提醒</em>` : ''}
+            ${aiUsageText ? `<span class="scraper-ai-usage${aiUsageTone}">${escapeHtml(aiUsageText)}</span>` : ''}
         `;
     }
     list.innerHTML = items.map(item => renderBatchItem(item)).join('');
@@ -2920,6 +3059,7 @@ async function buildBatchPlan() {
             item_index: Number(item.item_index || 0),
             name: item.name,
             entry: item.entry,
+            entries: Array.isArray(item.entries) && item.entries.length ? item.entries : undefined,
             tmdb: getBatchBinding(Number(item.item_index || 0)),
         })),
     };
@@ -2947,6 +3087,9 @@ async function buildBatchPlan() {
 function buildPlanRequestPayload() {
     const entries = getEffectiveSelectedEntries();
     if (!entries.length) throw new Error('请先选择要刮削的文件或文件夹');
+    if (hasUnknownSearchResultEntries(entries)) {
+        throw new Error('搜索结果来自网盘其他位置，真实路径未知，请先进入该文件夹后再批量整理');
+    }
     if (!state.tmdb || Number(state.tmdb.tmdb_id || state.tmdb.id || 0) <= 0) {
         throw new Error('请先绑定 TMDB 条目');
     }
@@ -3071,6 +3214,7 @@ async function updateManualEpisode(actionIndex, { clear = false } = {}) {
     const entryId = String(action?.entry_id || '').trim();
     if (!action || !entryId) return;
     const previousOverrides = { ...state.planEpisodeOverrides };
+    const previousContext = state.batchPlanContext;
     if (clear) {
         delete state.planEpisodeOverrides[entryId];
     } else {
@@ -3105,9 +3249,12 @@ async function updateManualEpisode(actionIndex, { clear = false } = {}) {
         try {
             const data = await window.MediaHubApi.postJson('/scraper/batch/plan', state.batchPlanContext);
             applyPlanResponse(data);
+            renderPlan();
+            renderEntries();
             showToast(clear ? '已恢复自动识别' : '已应用手动集数', { tone: 'success', duration: 2200, placement: 'top-center' });
         } catch (error) {
             state.planEpisodeOverrides = previousOverrides;
+            state.batchPlanContext = previousContext;
             showToast(`更新预览失败：${error.message || '未知错误'}`, { tone: 'error', duration: 3600, placement: 'top-center' });
         }
         return;
@@ -3237,7 +3384,7 @@ async function scanMonitorDir() {
         ? scopes.join(' / ')
         : `${scopes.slice(0, 3).join(' / ')} 等 ${scopes.length} 个目录`;
     const confirmed = await showConfirm(
-        `将对以下目录执行监控扫描并刷新 STRM：\n${preview}\n\n继续？`,
+        `将对以下目录执行监控扫描并刷新 STRM（只同步 STRM，不整理文件）：\n${preview}\n\n继续？`,
         { title: '扫描监控', confirmText: '开始扫描' },
     );
     if (!confirmed) return;

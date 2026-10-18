@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         115-media-hub助手
 // @namespace    http://tampermonkey.net/
-// @version      2.5.0
-// @description  检测网页 magnet / torrent / 115 / 夸克分享链接并生成快捷按钮
+// @version      2.7.2
+// @description  检测网页 magnet / torrent / 115 / 夸克分享链接并生成快捷按钮（点 115 后的弹窗内可一键复制磁力）
 // @author       仙儿
 // @license      MIT
 // @match        *://*/*
@@ -22,6 +22,7 @@
     const DETECTABLE_LINK_REGEX = /(magnet:\?xt=urn:btih:[A-Za-z0-9]{32,40}[^\s<>'"]*|https?:\/\/[^\s<>'"]+?\.torrent(?:\?[^\s<>'"]*)?|https?:\/\/(?:115cdn|115|anxia)\.com\/s\/[A-Za-z0-9]+[^\s<>'"]*|https?:\/\/(?:pan|www)\.quark\.cn\/s\/[A-Za-z0-9]+[^\s<>'"]*)/gi;
     const STORE_TASKS_KEY = 'magnet_push_tasks_v2';
     const STORE_SECRET_KEY = 'magnet_push_secret_v2';
+    const STORE_EXCLUDE_HOSTS_KEY = 'magnet_push_exclude_hosts_v1';
 
     const BTN_CLASS = 'mh-push-btn';
     const COPY_BTN_CLASS = 'mh-copy-btn';
@@ -59,6 +60,7 @@
 
     let tasks = [];
     let secret = '';
+    let excludeHosts = [];
     let toastTimer = null;
     let managerEditorState = { mode: 'none', taskId: '' };
 
@@ -122,12 +124,14 @@
     }
 
     async function loadPersistedState() {
-        const [storedTasks, storedSecret] = await Promise.all([
+        const [storedTasks, storedSecret, storedExcludeHosts] = await Promise.all([
             readStore(STORE_TASKS_KEY, []),
-            readStore(STORE_SECRET_KEY, '')
+            readStore(STORE_SECRET_KEY, ''),
+            readStore(STORE_EXCLUDE_HOSTS_KEY, [])
         ]);
         tasks = normalizeTaskList(storedTasks);
         secret = String(storedSecret || '').trim();
+        excludeHosts = normalizeExcludeHostList(storedExcludeHosts);
     }
 
     function normalizeSavePath(path) {
@@ -380,6 +384,60 @@
         writeStore(STORE_SECRET_KEY, secret);
     }
 
+    // 排除域名：用户在“任务管理器”里维护，匹配到的域名下脚本不注入任何按钮。
+    // 支持裸域名 / IP，以及带协议、端口、路径、通配符前缀的写法，统一归一化成 hostname。
+    function normalizeExcludeHost(entry) {
+        let text = String(entry || '').trim().toLowerCase();
+        if (!text) return '';
+        text = text.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+        text = text.split(/[/?#]/, 1)[0];
+        text = text.replace(/:\d+$/, '');
+        text = text.replace(/^\*\./, '').replace(/^\./, '').trim();
+        return text;
+    }
+
+    function normalizeExcludeHostList(list) {
+        const lines = Array.isArray(list)
+            ? list
+            : String(list || '').split(/\r?\n/);
+        const seen = new Set();
+        const out = [];
+        lines.forEach((line) => String(line || '').split(/\r?\n/).forEach((token) => {
+            const normalized = normalizeExcludeHost(token);
+            if (!normalized || seen.has(normalized)) return;
+            seen.add(normalized);
+            out.push(normalized);
+        }));
+        return out;
+    }
+
+    // 裸域名同时匹配其子域名（example.com 会匹配 a.example.com）；带 http/https 或通配符也能识别。
+    function isHostExcluded(hostname, entries) {
+        const host = String(hostname || '').trim().toLowerCase();
+        if (!host) return false;
+        return normalizeExcludeHostList(entries).some((entry) => {
+            if (!entry) return false;
+            return host === entry || host.endsWith('.' + entry);
+        });
+    }
+
+    function currentHostname() {
+        try {
+            return (window.location && window.location.hostname) || '';
+        } catch (err) {
+            return '';
+        }
+    }
+
+    function getExcludeHosts() {
+        return excludeHosts.slice();
+    }
+
+    function saveExcludeHosts(next) {
+        excludeHosts = normalizeExcludeHostList(next);
+        writeStore(STORE_EXCLUDE_HOSTS_KEY, excludeHosts);
+    }
+
     function showToast(message, tone = 'success') {
         const id = 'mh-core-toast';
         let el = document.getElementById(id);
@@ -402,7 +460,9 @@
         }
         const colors = tone === 'error'
             ? { bg: 'rgba(153,27,27,.96)', border: 'rgba(254,202,202,.3)', fg: '#fee2e2' }
-            : { bg: 'rgba(6,95,70,.96)', border: 'rgba(167,243,208,.3)', fg: '#ecfdf5' };
+            : (tone === 'warn'
+                ? { bg: 'rgba(120,53,15,.96)', border: 'rgba(253,230,138,.3)', fg: '#fef3c7' }
+                : { bg: 'rgba(6,95,70,.96)', border: 'rgba(167,243,208,.3)', fg: '#ecfdf5' });
         el.style.background = colors.bg;
         el.style.border = `1px solid ${colors.border}`;
         el.style.color = colors.fg;
@@ -959,16 +1019,26 @@
         }
     }
 
-    async function postJson(url, headers, bodyText) {
+    /**
+     * headers 既可以是固定对象，也可以是「每次尝试都重新生成请求头」的异步函数。
+     * 带签名的请求必须用函数形式：GM 通道失败后走 fetch 兜底时不能复用同一份 (ts, nonce)，
+     * 否则服务端防重放会判「签名已被使用」（而第一份签名其实已经被受理）。
+     */
+    async function resolveRequestHeaders(headersOrFactory) {
+        if (typeof headersOrFactory !== 'function') return headersOrFactory;
+        return await headersOrFactory();
+    }
+
+    async function postJson(url, headersOrFactory, bodyText) {
         const requestUrl = encodeUrlForRequest(url);
         let gmResult;
         try {
-            gmResult = await postJsonByGM(requestUrl, headers, bodyText);
+            gmResult = await postJsonByGM(requestUrl, await resolveRequestHeaders(headersOrFactory), bodyText);
         } catch (err) {
             gmResult = { ok: false, status: 0, body: `GM 请求异常: ${err && err.message ? err.message : '未知错误'}` };
         }
         if (gmResult.ok || gmResult.status > 0) return gmResult;
-        const fetchResult = await postJsonByFetch(requestUrl, headers, bodyText);
+        const fetchResult = await postJsonByFetch(requestUrl, await resolveRequestHeaders(headersOrFactory), bodyText);
         if (fetchResult.ok || fetchResult.status > 0) return fetchResult;
         return {
             ok: false,
@@ -1001,6 +1071,10 @@
 
             const overlay = document.createElement('div');
             overlay.id = 'mh-task-picker-overlay';
+            const canCopySource = !!source;
+            const copyHint = torrentHint
+                ? 'torrent 链接会先自动转成磁力，再复制到剪贴板'
+                : '把这条磁力链接复制到剪贴板，不推送任务';
             overlay.style.cssText = [
                 'position:fixed',
                 'inset:0',
@@ -1033,6 +1107,15 @@
                                 <div style="margin-top:2px;font-size:11px;color:#94a3b8;">${escapeHtml(task.webhookUrl)}</div>
                             </button>
                         `).join('')}
+                        ${canCopySource ? `
+                            <button type="button" data-mh-picker-action="copy-magnet" style="text-align:left;padding:10px 12px;border-radius:10px;border:1px solid #7c3aed;background:#1e1b4b;color:#e2e8f0;cursor:pointer;transition:all .16s ease;">
+                                <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;">
+                                    <div style="font-size:13px;font-weight:700;color:#ddd6fe;">复制磁力链接</div>
+                                    <div style="font-size:11px;color:#a5b4fc;">不推送</div>
+                                </div>
+                                <div style="margin-top:4px;font-size:12px;color:#cbd5e1;">${escapeHtml(copyHint)}</div>
+                            </button>
+                        ` : ''}
                     </div>
                     <div style="margin-top:12px;padding-top:12px;border-top:1px solid #334155;display:flex;justify-content:flex-end;">
                         <button type="button" data-mh-picker-action="manage" style="padding:7px 12px;border-radius:9px;border:1px solid #334155;background:#1e293b;color:#93c5fd;cursor:pointer;">任务管理</button>
@@ -1053,7 +1136,7 @@
             };
 
             document.addEventListener('keydown', onKeydown, true);
-            overlay.addEventListener('click', (event) => {
+            overlay.addEventListener('click', async (event) => {
                 if (event.target === overlay) {
                     done(null);
                     return;
@@ -1068,6 +1151,30 @@
                 if (action === 'manage') {
                     done(null);
                     openTaskManager();
+                    return;
+                }
+                if (action === 'copy-magnet') {
+                    if (btn.disabled) return;
+                    btn.disabled = true;
+                    const originalHtml = btn.innerHTML;
+                    btn.textContent = '正在复制...';
+                    try {
+                        await copyMagnetFromSource(source);
+                        btn.textContent = '已复制磁力链接';
+                        showToast('磁力链接已复制');
+                        window.setTimeout(() => {
+                            btn.innerHTML = originalHtml;
+                            btn.disabled = false;
+                        }, 900);
+                    } catch (err) {
+                        const message = err && err.message ? err.message : '未知错误';
+                        btn.textContent = `复制失败：${message}`;
+                        showToast(`复制失败: ${message}`, 'error');
+                        window.setTimeout(() => {
+                            btn.innerHTML = originalHtml;
+                            btn.disabled = false;
+                        }, 1400);
+                    }
                     return;
                 }
                 if (action === 'pick') {
@@ -1117,14 +1224,25 @@
             const magnet = await resolveMagnetFromSource(source);
             const payload = buildPayload(task, magnet);
             const bodyText = JSON.stringify(payload);
-            const signHeaders = await buildSignedHeaders(secret, bodyText);
-            const result = await postJson(task.webhookUrl, {
+            // 每次尝试（GM / fetch 兜底）都重新签名，避免重发同一份签名被服务端防重放挡下。
+            const result = await postJson(task.webhookUrl, async () => ({
                 'Content-Type': 'application/json',
                 'Accept': 'application/json, text/plain, */*',
-                ...signHeaders
-            }, bodyText);
+                ...(await buildSignedHeaders(secret, bodyText))
+            }), bodyText);
             if (!result.ok) {
                 const tail = result.body ? `\n${String(result.body).slice(0, 200)}` : '';
+                if (result.status === 409) {
+                    // 同一条磁力 + 同一个保存路径会命中去重：多半是刚才那次点击其实已经提交成功。
+                    showToast(`已提交过：这条磁力正在后台处理（上一次点击可能已经成功），请到任务中心确认${tail}`, 'warn');
+                    setButtonState(button, 'idle');
+                    return;
+                }
+                if (result.status === 401 && /签名已被使用/.test(String(result.body || ''))) {
+                    showToast(`推送被拒绝：这份签名已经用过（多为重复点击或客户端重试）\n请到任务中心确认是否已经提交，确认没有收到再重推${tail}`, 'warn');
+                    setButtonState(button, 'idle');
+                    return;
+                }
                 showToast(`推送失败: ${result.status || '网络错误'}${tail}`, 'error');
                 setButtonState(button, 'error');
                 return;
@@ -1225,6 +1343,15 @@
         return button;
     }
 
+    async function copyMagnetFromSource(sourceLink) {
+        const source = normalizeSourceLink(sourceLink);
+        if (!source) throw new Error('链接为空');
+        // torrent 链接没有现成磁力，复用推送时的同一套解析逻辑。
+        const magnet = await resolveMagnetFromSource(source);
+        await copyTextToClipboard(magnet);
+        return magnet;
+    }
+
     function shouldSkipTextNode(node) {
         const parent = node.parentElement;
         if (!parent) return true;
@@ -1318,6 +1445,8 @@
             addTaskBtn: document.getElementById('mh-manager-task-add'),
             summary: document.getElementById('mh-manager-summary'),
             list: document.getElementById('mh-manager-list'),
+            excludeInput: document.getElementById('mh-manager-exclude'),
+            excludeSaveBtn: document.getElementById('mh-manager-exclude-save'),
             closeBtn: document.getElementById('mh-manager-close')
         };
     }
@@ -1325,7 +1454,8 @@
     function validateManagerTask(task) {
         if (!task.name) return '任务名称不能为空';
         if (!task.webhookUrl || !isHttpUrl(task.webhookUrl)) return '请求地址必须是 http:// 或 https://';
-        if (!task.savepath) return '保存路径 savepath 不能为空';
+        // 保存路径允许留空：绑定接收夹任务时后台会默认落到接收夹（接收夹就是分类前的中转目录，
+        // 不需要用户每次想路径）；绑定普通监控任务时后台会返回明确的 400，要求填任务目录内的路径。
         return '';
     }
 
@@ -1358,7 +1488,7 @@
                 <div style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:8px;">
                     <input data-editor-field="name" type="text" placeholder="名称：只在脚本内显示，例如：自存电影" value="${escapeHtml(task.name || '')}" style="padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#020617;color:#f8fafc;outline:none;">
                     <input data-editor-field="webhookUrl" type="text" placeholder="完整请求地址，如 http://192.168.1.100:18080/webhook/任务名" value="${escapeHtml(task.webhookUrl || '')}" style="padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#020617;color:#f8fafc;outline:none;">
-                    <input data-editor-field="savepath" type="text" placeholder="保存路径：115 目标目录，需在监控扫描路径内" value="${escapeHtml(task.savepath || '')}" style="padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#020617;color:#f8fafc;outline:none;">
+                    <input data-editor-field="savepath" type="text" placeholder="保存路径：监控任务填其扫描路径内；接收夹任务填接收夹或子目录（可留空）" value="${escapeHtml(task.savepath || '')}" style="padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#020617;color:#f8fafc;outline:none;">
                     <input data-editor-field="delaySeconds" type="number" min="0" step="1" title="延迟：导入成功后等待几秒再刷新；0 使用监控任务默认延迟" value="${Number(task.delaySeconds || 0)}" style="padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#020617;color:#f8fafc;outline:none;">
                 </div>
                 <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -1472,14 +1602,25 @@
                     <button id="mh-manager-close" type="button" style="padding:6px 11px;border-radius:9px;border:1px solid #475569;background:#1e293b;color:#e2e8f0;cursor:pointer;">关闭</button>
                 </div>
                 <div style="margin-top:10px;padding:10px;border-radius:10px;background:rgba(30,41,59,.55);border:1px solid rgba(71,85,105,.5);color:#cbd5e1;">
-                    用途：把网页里的 magnet / torrent 推送到 115-media-hub。必须填写“请求地址”和“保存路径”；“延迟”可选，“名称”只用于脚本内识别。签名密钥需与后台的 Webhook 签名密钥一致。
-                    <br>关系：请求地址里的 /webhook/任务名 决定绑定哪个文件夹监控任务；保存路径是磁力离线到 115 的目标目录，也要落在该任务的扫描路径内，导入完成后才会自动刷新并生成 strm。
+                    用途：把网页里的 magnet / torrent 推送到 115-media-hub。“请求地址”必填，“保存路径”看任务类型（普通监控任务填其扫描路径内的目录，接收夹任务可留空）；“延迟”可选，“名称”只用于脚本内识别。签名密钥只有一个：填后台「参数配置 → 后台安全管理」里的 Webhook 签名密钥，全部任务共用同一把。
+                    <br>关系：请求地址里的 /webhook/任务名 决定绑定哪条任务。绑定普通监控任务时，保存路径是磁力离线到 115 的目标目录，要落在该任务的扫描路径内，导入完成后才会自动刷新并生成 strm。
+                    <br>绑定接收夹任务时，保存路径填接收夹本身或它的子目录（留空即接收夹）。接收夹是分类前的中转文件夹，也是新增的可选便捷入口：先统一落这里，下载完成后自动识别是电影还是电视剧，再按接收夹自己的整理选项重命名并搬到同一个网盘的目标文件夹，所以不用每次保存前先挑分类目录；不用它也能照旧绑定分类监控任务、把保存路径填到那个任务的目录。
                 </div>
 
                 <div style="margin-top:12px;padding:12px;border-radius:10px;border:1px solid #334155;background:#0b1220;">
                     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                         <input id="mh-manager-secret" type="text" placeholder="签名密钥（留空可清空）" style="flex:1;min-width:220px;padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#020617;color:#f8fafc;outline:none;">
                         <button id="mh-manager-secret-save" type="button" style="padding:8px 12px;border-radius:8px;border:1px solid #334155;background:#2563eb;color:#fff;cursor:pointer;">保存密钥</button>
+                    </div>
+                </div>
+
+                <div style="margin-top:12px;padding:12px;border-radius:10px;border:1px solid #334155;background:#0b1220;">
+                    <div style="font-size:13px;font-weight:700;color:#f8fafc;">不生效的网页（排除域名）</div>
+                    <div style="margin-top:4px;font-size:12px;line-height:1.6;color:#94a3b8;">在这些域名下脚本将停止识别链接、不生成任何按钮。每行一个域名；支持带协议、端口、路径或通配符（如 example.com 同时排除它的子域名）。留空表示所有网页都生效。</div>
+                    <textarea id="mh-manager-exclude" rows="3" placeholder="例如：hub.example.com&#10;127.0.0.1:18080&#10;*.nas.local" style="margin-top:8px;width:100%;box-sizing:border-box;resize:vertical;padding:8px 10px;border:1px solid #475569;border-radius:8px;background:#020617;color:#f8fafc;outline:none;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;"></textarea>
+                    <div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                        <button id="mh-manager-exclude-save" type="button" style="padding:8px 12px;border-radius:8px;border:1px solid #334155;background:#2563eb;color:#fff;cursor:pointer;">保存排除域名</button>
+                        <span style="font-size:12px;color:#94a3b8;">当前页面：<span id="mh-manager-exclude-current">${escapeHtml(currentHostname())}</span></span>
                     </div>
                 </div>
 
@@ -1513,6 +1654,15 @@
                 const next = String(els.secretInput.value || '').trim();
                 setSecret(next);
                 showToast(next ? '签名密钥已保存' : '签名密钥已清空');
+            });
+        }
+        if (els.excludeSaveBtn && els.excludeInput) {
+            els.excludeSaveBtn.addEventListener('click', () => {
+                const lines = String(els.excludeInput.value || '').trim();
+                saveExcludeHosts(normalizeExcludeHostList(lines));
+                els.excludeInput.value = excludeHosts.join('\n');
+                const count = excludeHosts.length;
+                showToast(count ? `已保存 ${count} 个排除域名` : '已清空排除域名，所有网页将生效');
             });
         }
         if (els.addTaskBtn) {
@@ -1613,6 +1763,7 @@
         if (!els.overlay || !els.secretInput) return;
         els.overlay.style.display = 'block';
         els.secretInput.value = getSecret();
+        if (els.excludeInput) els.excludeInput.value = excludeHosts.join('\n');
         resetManagerEditorState();
         renderManagerTaskList();
     }
@@ -1631,6 +1782,13 @@
     async function init() {
         await loadPersistedState();
         registerMenus();
+
+        // 匹配到“排除域名”时，不在该网页注入任何按钮；仍保留油猴菜单/任务管理器以便用户修改排除名单。
+        const excluded = isHostExcluded(currentHostname(), excludeHosts);
+        if (excluded) {
+            console.info(`[${APP_NAME}] 当前域名已在排除名单中，跳过：${currentHostname()}`);
+            return;
+        }
 
         if (!getSecret() || !activeTasks().length) {
             showToast('尚未配置签名密钥和任务，点击任意“115”按钮或油猴菜单即可配置', 'error');
@@ -1656,6 +1814,12 @@
                 getSecret,
                 setSecret,
                 saveTasks,
+                getExcludeHosts,
+                saveExcludeHosts,
+                normalizeExcludeHost,
+                normalizeExcludeHostList,
+                isHostExcluded,
+                currentHostname,
                 getTasks: () => tasks,
                 normalizeTaskList,
                 validateManagerTask,
@@ -1668,8 +1832,10 @@
                 jsHmacSha256Hex,
                 jsSha256Hex: (bytes) => arrayBufferToHex(jsSha256Bytes(bytes).buffer),
                 buildSignedHeaders,
+                pushMagnet,
                 registerMenus,
                 createPushButton,
+                copyMagnetFromSource,
                 chooseTask
             }
         };

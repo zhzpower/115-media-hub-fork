@@ -1,5 +1,5 @@
         let isRunning = false;
-        let monitorState = { running: false, current_task: '', tasks: [], logs: [], log_segments: [], log_segment_total: 0, log_segment_has_more: false, summary: { step: '空闲', detail: '等待监控任务' }, queued: [], next_runs: {}, change_counts: {} };
+        let monitorState = { running: false, current_task: '', tasks: [], logs: [], log_segments: [], log_segment_total: 0, log_segment_has_more: false, runs: [], run_page: 1, run_has_more: false, run_next_cursor: '', run_retention: { mode: 'longterm', days: 30 }, summary: { step: '空闲', detail: '等待监控任务' }, queued: [], next_runs: {}, change_counts: {} };
         let subscriptionState = { running: false, current_task: '', tasks: [], logs: [], summary: { step: '空闲', detail: '等待订阅任务' }, queued: [], next_runs: {} };
         let sign115State = {
             enabled: false,
@@ -22,6 +22,8 @@
         let cookieHealthCheckBusy = false;
         let resourceState = { sources: [], quick_links: [], favorite_dirs: { '115': [], quark: [] }, items: [], jobs: [], active_jobs: [], job_counts: {}, job_pagination: {}, channel_sections: [], channel_profiles: {}, subscription_channel_support: {}, search_sections: [], last_syncs: {}, channel_sync: {}, monitor_tasks: [], stats: { source_count: 0, item_count: 0, filtered_item_count: 0, completed_job_count: 0 }, cookie_configured: false, quark_cookie_configured: false, cookie_health: null, setup_status: null, search: '', search_source: 'tg', provider_filter: 'all', default_magnet_provider: '115', search_meta: {} };
         let editingMonitorName = null;
+        // 任务类型不再由弹窗里的下拉决定：从「接收夹整理」列表进来就是 inbox，从「文件夹监控」列表进来就是 scan。
+        let monitorFormType = 'scan';
         let editingSubscriptionName = null;
         let editingResourceSourceIndex = null;
         let selectedResourceId = null;
@@ -79,6 +81,10 @@
         let resourceTargetPreviewLoading = false;
         let resourceTargetPreviewError = '';
         let monitorFolderTrail = [{ id: '0', name: '根目录' }];
+        // 文件夹选择弹窗当前要写回哪个输入框（监控扫描路径 / 快捷导入接收夹）。
+        let monitorFolderPickerTargetId = 'monitor_scan_path';
+        // 文件夹选择弹窗当前浏览的网盘（扫描任务固定 115，接收夹跟随所选 provider）。
+        let monitorFolderProvider = '115';
         let monitorFolderEntries = [];
         let monitorFolderSummary = { folder_count: 0, file_count: 0 };
         let monitorFolderLoading = false;
@@ -86,6 +92,7 @@
         let monitorFolderNextOffset = 0;
         let monitorFolderHasMore = false;
         let monitorFolderLoadingMore = false;
+        let monitorFolderCreateBusy = false;
         let resourceModalLinkType = '';
         let resourceShareEntriesByParent = { '0': [] };
         let resourceShareEntryIndex = {};
@@ -199,6 +206,7 @@
         let appMountPoints = [];
         let tgProxyTestState = { loading: false, ok: null, message: '', latency_ms: 0, mode: '', proxy_url: '', target_url: '' };
         let pansouTestState = { loading: false, ok: null, message: '', latency_ms: 0, auth_enabled: false, auth_configured: false, auth_logged_in: false, plugin_count: 0, channels_count: 0 };
+        let aiMatchTestState = { loading: false, ok: null, message: '', latency_ms: 0, base_url: '', model: '', keyword: '', year: '', media_type: '', thinking_disabled: false, usage: null };
         let notifyTestState = { loading: false, ok: null, message: '', channel: '', target_desc: '', webhook_host: '', sent_at: '' };
         let resourceBoardHintText = '';
         let resourceActiveSearchRuntime = null;
@@ -207,8 +215,21 @@
         let lastLogSignature = '';
         let lastMonitorLogSignature = '';
         let monitorLogLoadBusy = false;
+        let monitorRunLoadBusy = false;
+        let monitorRunActionBusy = false;
+        let monitorRunPage = 1;
+        let monitorRunPageCursors = [''];
+        let monitorRunPageHasMore = false;
+        let activeMonitorRunId = '';
+        let activeMonitorRunCategory = '';
+        let monitorRunRequestRevision = 0;
+        let monitorRunDetailRevision = 0;
+        let monitorRunDetailData = null;
+        let monitorRunDetailTimer = null;
+        let monitorRunReturnFocus = null;
         let lastSubscriptionLogSignature = '';
         let lastMonitorRenderKey = '';
+        let lastMonitorRunRenderKey = '';
         let lastSubscriptionRenderKey = '';
         let monitorTaskIntroExpanded = {};
         let subscriptionTaskIntroExpanded = {};
@@ -294,7 +315,9 @@
                 'notify_wecom_webhook',
                 'notify_wecom_app_secret',
                 'tmdb_api_key',
+                'ai_match_api_key',
                 'pansou_password',
+                'webhook_secret',
             ];
             const meta = window.providerMeta || [];
             meta.forEach(p => {
@@ -384,7 +407,6 @@
             window.requestAnimationFrame(() => {
                 restoreWindowScrollTop(Math.max(0, Number(moduleScrollTopState[tab] || 0)));
                 syncResourceBackTopButton();
-                syncSettingsSaveDock();
                 window.syncScraperBackTopButton?.();
             });
         }
@@ -507,6 +529,8 @@
                 document.body.style.top = `-${modalScrollLockY}px`;
             }
             modalScrollLockCount += 1;
+            // 滚动锁状态变了要重算可视视口平移量（--app-vv-offset-top 只在锁住时生效）。
+            requestViewportMetricsSync();
             syncResourceBackTopButton();
             window.syncScraperBackTopButton?.();
         }
@@ -521,6 +545,7 @@
             document.body.classList.remove('body-scroll-lock');
             document.body.style.top = '';
             window.scrollTo(0, restoreY);
+            requestViewportMetricsSync();
             syncResourceBackTopButton();
             window.syncScraperBackTopButton?.();
         }
@@ -540,44 +565,41 @@
             btn.classList.toggle('hidden', !shouldShow);
         }
 
-        function syncSettingsSaveDock() {
-            const dock = document.getElementById('settings-save-dock');
-            const settingsPage = document.getElementById('page-settings');
-            if (!dock || !settingsPage) return;
-
-            const isSettingsVisible = !settingsPage.classList.contains('hidden');
-            if (!isSettingsVisible) {
-                dock.classList.remove('is-inline');
-                settingsPage.classList.remove('has-inline-save-dock');
-                return;
-            }
-
-            const viewportHeight = Math.max(0, window.innerHeight || document.documentElement.clientHeight || 0);
-            const scrollTop = getWindowScrollTop();
-            const docHeight = Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0);
-            const footer = document.querySelector('footer.footer-text');
-            const nearDocumentEnd = scrollTop + viewportHeight >= docHeight - 4;
-            let shouldInline = false;
-
-            if (footer) {
-                const footerRect = footer.getBoundingClientRect();
-                const footerVisible = footerRect.top < viewportHeight && footerRect.bottom > 0;
-                shouldInline = footerVisible || nearDocumentEnd;
-            } else {
-                shouldInline = nearDocumentEnd;
-            }
-
-            dock.classList.toggle('is-inline', shouldInline);
-            settingsPage.classList.toggle('has-inline-save-dock', shouldInline);
-        }
-
         function syncViewportMetrics() {
+            const viewport = window.visualViewport;
+            const layoutHeight = Math.max(0, window.innerHeight || 0, document.documentElement.clientHeight || 0);
             const viewportHeight = Math.max(
                 0,
-                window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 0,
+                viewport?.height || window.innerHeight || document.documentElement.clientHeight || 0,
             );
             if (!viewportHeight) return;
             document.documentElement.style.setProperty('--app-vh', `${viewportHeight}px`);
+            // 手机软键盘弹出时可视视口会矮掉接近一个键盘的高度；此时浏览器会为露出输入框
+            // 平移可视视口，固定定位的弹窗会被顶出屏幕，这里记下状态并用 offsetTop 抵消平移。
+            const active = document.activeElement;
+            const editing = !!active && (
+                active.tagName === 'INPUT'
+                || active.tagName === 'TEXTAREA'
+                || active.tagName === 'SELECT'
+                || active.isContentEditable
+            );
+            const keyboardOpen = editing && (layoutHeight - viewportHeight) > 120;
+            document.documentElement.classList.toggle('keyboard-open', keyboardOpen);
+            // 只有整页滚动被锁住（弹窗打开）时才用 offsetTop 抵消平移：页面正常滚动时
+            // iOS 的 offsetTop 含页面滚动量，直接套上去反而会把弹窗推下去。
+            const locked = document.body.classList.contains('body-scroll-lock');
+            const viewportOffsetTop = (keyboardOpen && locked)
+                ? Math.max(0, Math.round(viewport?.offsetTop || 0))
+                : 0;
+            document.documentElement.style.setProperty('--app-vv-offset-top', `${viewportOffsetTop}px`);
+            // 设置页顶部吸顶分区条需要避开 shell 工具栏，工具栏高度随断点变化，这里统一量一次。
+            const toolbar = document.querySelector('.shell-toolbar');
+            if (toolbar) {
+                const toolbarHeight = Math.round(toolbar.getBoundingClientRect().height);
+                if (toolbarHeight > 0) {
+                    document.documentElement.style.setProperty('--shell-toolbar-h', `${toolbarHeight}px`);
+                }
+            }
         }
 
         function requestViewportMetricsSync() {
@@ -670,12 +692,46 @@
             focusMainTab('resource', 'auto');
         }
 
+        // 弹窗层级：模板里的 z-[N] 只当基线用，真正生效的层级在每次打开时按「当前可见弹窗的基线 + 1」
+        // 重新算。历史上各处 z 值是手写的，二级弹窗（「选择文件夹」这类）只要被 z 值更高的父弹窗打开
+        // 就会被盖住——统一在这里抬升，避免每个调用点各自记层级。
+        const MODAL_LAYER_FLOOR = 40;
+        const MODAL_LAYER_CEILING = 94; // 95 是盖住所有弹窗的应用对话框（showAppDialog）
+
+        function readModalLayerBase(modal) {
+            const cached = Number.parseInt(modal?.dataset?.modalLayer || '', 10);
+            if (Number.isFinite(cached) && cached > 0) return cached;
+            const computed = Number.parseInt(window.getComputedStyle(modal).zIndex || '', 10);
+            return Number.isFinite(computed) && computed > 0 ? computed : MODAL_LAYER_FLOOR;
+        }
+
+        function isModalOpen(modal) {
+            if (!modal || modal.classList.contains('hidden')) return false;
+            const style = window.getComputedStyle(modal);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+        }
+
+        function stackModalLayer(modal) {
+            if (!modal) return;
+            const base = readModalLayerBase(modal);
+            // 登记基线：只有经过这里的弹窗才参与层序，其他直接改 class 的浮层（如帮助弹窗）维持原样。
+            modal.dataset.modalLayer = String(base);
+            let topBase = 0;
+            document.querySelectorAll('div[id$="-modal"]').forEach((candidate) => {
+                if (candidate === modal || !candidate.dataset.modalLayer || !isModalOpen(candidate)) return;
+                topBase = Math.max(topBase, readModalLayerBase(candidate));
+            });
+            const layer = Math.min(Math.max(base, topBase + 1, MODAL_LAYER_FLOOR), MODAL_LAYER_CEILING);
+            modal.style.zIndex = String(layer);
+        }
+
         function showLockedModal(modalId) {
             const modal = document.getElementById(modalId);
             if (!modal) return;
             const isHidden = modal.classList.contains('hidden');
             modal.classList.remove('hidden');
             if (isHidden) lockPageScroll();
+            stackModalLayer(modal);
         }
 
         function hideLockedModal(modalId) {
@@ -787,6 +843,28 @@
             }
             void loadSettingsTabModule().then((mod) => {
                 mod?.generateWebhookSecret?.({ showToast });
+            });
+        }
+
+        function expandAllSettingsSections() {
+            const settingsModule = tabRuntimeState.tabModuleCache.settings;
+            if (settingsModule?.expandAllSettingsSections) {
+                settingsModule.expandAllSettingsSections();
+                return;
+            }
+            void loadSettingsTabModule().then((mod) => {
+                mod?.expandAllSettingsSections?.();
+            });
+        }
+
+        function collapseAllSettingsSections() {
+            const settingsModule = tabRuntimeState.tabModuleCache.settings;
+            if (settingsModule?.collapseAllSettingsSections) {
+                settingsModule.collapseAllSettingsSections();
+                return;
+            }
+            void loadSettingsTabModule().then((mod) => {
+                mod?.collapseAllSettingsSections?.();
             });
         }
 
@@ -1378,6 +1456,29 @@
             });
         }
 
+        // 运行记录列表在每次状态推送时都会重绘，重绘会打断键盘焦点和悬停；
+        // 这里只比较真正影响列表的字段，内容没变就跳过整块 innerHTML 重建。
+        function buildMonitorRunRenderKey(state) {
+            return JSON.stringify({
+                runs: (Array.isArray(state?.runs) ? state.runs : []).map(run => [
+                    run?.id || '', run?.status || '', run?.summary || '', run?.subject || '',
+                    run?.updated_at || run?.finished_at || '', Number(run?.child_count || 0),
+                    Number(run?.children_done || 0),
+                    // 合并行会把上游变更同步的结论显示在副行，它变了也要重绘。
+                    [run?.upstream_change?.id || '', run?.upstream_change?.status || '',
+                     run?.upstream_change?.summary || ''],
+                    (Array.isArray(run?.children) ? run.children : [])
+                        .map(item => [item?.id || '', item?.status || '', item?.subject || '']),
+                ]),
+                page: Number(state?.run_page || 1),
+                has_more: !!state?.run_has_more,
+                filtered: !!state?.run_filtered,
+                loading: !!state?.run_loading,
+                tasks: (Array.isArray(state?.tasks) ? state.tasks : [])
+                    .map(task => [task?.name || '', task?.task_type || 'scan']),
+            });
+        }
+
         function pruneTaskIntroExpanded(expandedMap, tasks) {
             const validNames = new Set(
                 (Array.isArray(tasks) ? tasks : [])
@@ -1615,6 +1716,14 @@
         }
 
         function applyMonitorState(data, { forceRender = false } = {}) {
+            if (data && (monitorState.run_filtered || monitorState.run_loading || monitorState.run_page > 1)) {
+                data = {
+                    ...data,
+                    runs: monitorState.runs,
+                    run_has_more: monitorState.run_has_more,
+                    run_next_cursor: monitorState.run_next_cursor,
+                };
+            }
             const monitorModule = tabRuntimeState.tabModuleCache.monitor;
             if (monitorModule?.applyMonitorState) {
                 monitorModule.applyMonitorState(data, {
@@ -1633,11 +1742,17 @@
                     setLastMonitorRenderKey: (nextValue) => {
                         lastMonitorRenderKey = String(nextValue || '');
                     },
+                    buildMonitorRunRenderKey,
+                    getLastMonitorRunRenderKey: () => lastMonitorRunRenderKey,
+                    setLastMonitorRunRenderKey: (nextValue) => {
+                        lastMonitorRunRenderKey = String(nextValue || '');
+                    },
                     renderMonitorTasks,
                     renderMonitorLogs,
                     afterApply: (nextState) => {
                         resourceState.monitor_tasks = nextState.tasks || resourceState.monitor_tasks || [];
                         syncResourceMonitorTaskOptions(document.getElementById('resource_job_savepath')?.value || '');
+                        maybeRefreshInboxTaskStatus();
                     },
                 });
                 return;
@@ -1668,6 +1783,10 @@
                 log_segments: logSegments,
                 log_segment_total: Number(data.log_segment_total || monitorState.log_segment_total || logSegments.length) || logSegments.length,
                 log_segment_has_more: logSegments.length < (Number(data.log_segment_total || monitorState.log_segment_total || logSegments.length) || logSegments.length),
+                runs: monitorState.run_page > 1 ? (monitorState.runs || []) : (Array.isArray(data.runs) ? data.runs : (monitorState.runs || [])),
+                run_has_more: data.run_has_more !== undefined ? !!data.run_has_more : !!monitorState.run_has_more,
+                run_next_cursor: data.run_next_cursor ?? monitorState.run_next_cursor ?? '',
+                run_retention: data.run_retention || monitorState.run_retention || { mode: 'longterm', days: 30 },
                 queued: Array.isArray(data.queued) ? data.queued : (monitorState.queued || []),
                 next_runs: data.next_runs || monitorState.next_runs || {},
                 summary: data.summary || monitorState.summary || { step: '空闲', detail: '等待监控任务' }
@@ -1681,9 +1800,11 @@
                 renderMonitorTasks();
                 lastMonitorRenderKey = renderKey;
             }
-            renderMonitorLogs();
+            const runRenderKey = buildMonitorRunRenderKey(monitorState);
+            if (forceRender || runRenderKey !== lastMonitorRunRenderKey) renderMonitorLogs();
             resourceState.monitor_tasks = monitorState.tasks || resourceState.monitor_tasks || [];
             syncResourceMonitorTaskOptions(document.getElementById('resource_job_savepath')?.value || '');
+            maybeRefreshInboxTaskStatus();
         }
 
         function startStatusFallbackPolling() {
@@ -2145,13 +2266,190 @@
 
         function showHelp(text) {
             const normalized = String(text || '').replace(/\\n/g, '\n');
-            document.getElementById('help-modal-body').textContent = normalized;
+            const titleEl = document.getElementById('help-modal-title');
+            if (titleEl) titleEl.textContent = '参数说明';
+            const body = document.getElementById('help-modal-body');
+            if (body) {
+                body.classList.remove('help-rich');
+                body.classList.add('help-text');
+                body.textContent = normalized;
+            }
             document.getElementById('help-modal').classList.remove('hidden');
+        }
+
+        // 富文本版说明：内容较长、需要分节和示例时用（如设置页的批量整理过滤词）。
+        function showHelpHtml(title, html) {
+            const titleEl = document.getElementById('help-modal-title');
+            if (titleEl) titleEl.textContent = String(title || '参数说明');
+            const body = document.getElementById('help-modal-body');
+            if (body) {
+                body.classList.remove('help-text');
+                body.classList.add('help-rich');
+                body.innerHTML = String(html || '');
+            }
+            document.getElementById('help-modal').classList.remove('hidden');
+        }
+
+        // 内容为固定文案（无用户输入），因此这里用 innerHTML 渲染分节结构。
+        const SCRAPER_FILTER_HELP_HTML = `
+            <div class="help-rich-section">
+                <div class="help-rich-title">用在哪里</div>
+                <div class="help-rich-text">批量整理（刮削页）、接收夹分发整理、订阅入库后的整理，都会先从文件名里提取片名，再拿片名去搜 TMDB；提取这一步用的就是这份词表。</div>
+                <div class="help-rich-text">提取结果还会用于：TMDB 搜索关键词、识别不到时按清理后的名字兜底命名、刮削页的关键词建议，以及「这个候选词算不算通用词」的判断（整个文件夹名就叫「国语音轨」时不会被当成片名）。</div>
+                <div class="help-rich-text">它只影响识别与命名判断，不会改动网盘里的源文件；删除广告文件是整理选项里的另一个开关。</div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">两类词的区别</div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">复合过滤词</span>
+                    <span class="help-rich-text">在文件名里任意位置出现就删掉。适合「国语音轨」「无水印」「夸克网盘」这类整块信息。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">独立过滤词</span>
+                    <span class="help-rich-text">只有它是独立一段时才删（前后是分隔符或中英文边界）。适合「国语」「中文」这类短词，不会误伤「我的中文老师」。</span>
+                </div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">怎么配置</div>
+                <div class="help-rich-text">1）每行一个词，行内不要写逗号、引号，也不用一次写多个。</div>
+                <div class="help-rich-text">2）内置词表始终生效，这里只做追加；常见站点名、发布页、网盘、字幕 / 音轨等信息已经内置，不用重复填。</div>
+                <div class="help-rich-text">3）改完点设置页顶部悬浮条里的「保存全部配置」，保存后立即生效；回到刮削页「重新扫描 / 生成预览」就能看到效果。</div>
+                <div class="help-rich-text">4）单个词 50 字以内，每个输入框最多 200 条，重复的会自动去重。</div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">案例（按上面的规则提取到的片名）</div>
+                <div class="help-rich-example">
+                    <div>监狱星级餐厅.国语音轨.2024.1080p.mkv<b> → 片名：监狱星级餐厅</b></div>
+                    <div>我的中文老师.2024.1080p.mkv<b> → 片名：我的中文老师</b>（短词只在词边界删，不误伤）</div>
+                    <div>自定义复合词「测试广告词」：片名.测试广告词.2024.1080p.mkv<b> → 片名：片名</b></div>
+                    <div>自定义独立词「测试」：测试尾缀.2024.mkv<b> → 片名：测试尾缀</b></div>
+                    <div>自定义独立词「测试」：测试.2024.mkv<b> → 整条就是过滤词，不产生片名</b></div>
+                </div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">什么时候需要加</div>
+                <div class="help-rich-text">识别不准、片名里混进音轨 / 字幕 / 网盘 / 站点词时，就把那个词加进来。只影响个别名字时优先加「复合过滤词」；1~2 个字的词一定加「独立过滤词」。</div>
+                <div class="help-rich-text">注意别加得太宽（例如把「电影」加进去），会把真实片名里的字一起删掉；加完建议先「重新扫描」看预览，再执行整理。</div>
+            </div>
+        `;
+
+        function showScraperFilterHelp() {
+            showHelpHtml('批量整理过滤词说明', SCRAPER_FILTER_HELP_HTML);
+        }
+
+        // 监控页头部说明：内容为固定文案（无用户输入），改用信息按钮 + 弹窗，正文只留标题。
+        const MONITOR_HELP_HTML = `
+            <div class="help-rich-section">
+                <div class="help-rich-title">这块在做什么</div>
+                <div class="help-rich-text">只扫描 115 网盘目录、生成 / 刷新本地 <code>/strm</code> 播放文件，<b>不整理、不搬运</b>网盘里的文件。</div>
+                <div class="help-rich-text">媒体服务器（Emby / Jellyfin / Infuse 等）读本地 strm，播放时再由服务端解析 115 链接回源。</div>
+                <div class="help-rich-text">资源导入 / Webhook 命中 savepath 时会优先局部刷新——只处理这次变动涉及的目录，不必等下一次全量扫描。</div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">什么时候会跑</div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">定时</span>
+                    <span class="help-rich-text">任务自己的「定时执行」（按分钟，0 为关闭）。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">手动</span>
+                    <span class="help-rich-text">任务卡片上的「立即扫描」，改完配置后马上生效。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">自动</span>
+                    <span class="help-rich-text">Webhook / 资源导入命中 savepath、订阅导入完成、接收夹分发后的目录同步、网盘变更同步，都会自动排队刷新。</span>
+                </div>
+                <div class="help-rich-text">任务停用后，定时和所有自动触发都会停，只保留手动运行（用于排查或临时冻结）。</div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">路径怎么匹配（最容易踩坑）</div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">扫描路径</span>
+                    <span class="help-rich-text">115 网盘里要监控的源目录，手动运行会从这里递归扫描。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">保存路径</span>
+                    <span class="help-rich-text">资源导入 / 磁力离线下载落到 115 的目标目录，填 115 根目录下的相对路径（例如 <code>电影/新片</code>）。</span>
+                </div>
+                <div class="help-rich-text">savepath 必须落在某条任务的扫描路径内（会先映射到 115 挂载前缀再比较），导入成功后才会自动刷新并生成 strm；不在任何扫描路径内就不会自动生成。</div>
+                <div class="help-rich-text">最终路径是 <code>/strm/目标路径/扫描路径末级/...</code>，扫描路径和保存路径末级重名时会自动去重，不会出现 <code>/自存影视/自存影视</code>。</div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">什么时候不会生成</div>
+                <div class="help-rich-text">后缀名不在「参数配置 → 115 STRM 播放基础配置」的「扫描后缀名」列表内，或文件小于任务里的「文件大小过滤 (MB)」，会被跳过并计入运行记录的跳过数。</div>
+                <div class="help-rich-text">没有纳入任何监控任务、任务被停用、网盘目录读取失败时也不会生成；跳过与失败原因都会写进运行记录和 Web 日志。</div>
+            </div>
+        `;
+
+        // 接收夹整理是另一套链路（识别 → 整理 → 分发），和文件夹监控（纯扫描生成 STRM）不是一回事，
+        // 两个「i」各自弹自己的说明，不要共用同一份文案。
+        const INBOX_HELP_HTML = `
+            <div class="help-rich-section">
+                <div class="help-rich-title">这块在做什么</div>
+                <div class="help-rich-text">接收夹是<b>分类前的中转文件夹</b>：磁力 / 分享先统一落进来，系统识别类型后按本任务的整理选项重命名，再搬进同盘的电影 / 电视剧文件夹。</div>
+                <div class="help-rich-text">它只是可选入口，不是强制流程：照旧把保存路径填到分类监控任务的目录也完全有效。</div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">什么时候会跑</div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">手动</span>
+                    <span class="help-rich-text">任务里的「立即整理并分发」，不受整理节流的等待时间限制。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">定时</span>
+                    <span class="help-rich-text">任务自己的「定时执行」（按分钟，0 为关闭）。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">推送</span>
+                    <span class="help-rich-text">115 接收夹的 Webhook（油猴脚本上报保存路径后整理一次）；其他网盘的接收夹不能开 webhook，只能用上面的手动 / 定时。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">自动</span>
+                    <span class="help-rich-text">115 离线下载完成后的回调。</span>
+                </div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">整理与分发规则</div>
+                <div class="help-rich-text">每个网盘只能有一个接收夹；电影 / 电视剧的分发目标必须和接收夹在<b>同一个网盘</b>，v1 不做跨盘分发。</div>
+                <div class="help-rich-text">同一部影视的多个条目 / 多个版本会合并进同一个媒体文件夹：文件夹撞名只保留一次改名，文件同名给后面的加 <code>(2)</code>；某个条目自己的冲突不会连累同批其他条目。</div>
+                <div class="help-rich-text">只有 115 上、且目标落在某条目录同步任务扫描范围内的条目才会刷新 STRM；其他网盘只搬运文件，不生成 STRM。</div>
+                <div class="help-rich-text">识别不准、重名冲突、搬运失败会留在接收夹并写明原因，不会被强行塞进库里。</div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">整理节流</div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">无新文件等待</span>
+                    <span class="help-rich-text">有新保存就重新计时，连续这段时间没有新文件才统一整理，避免边下边搬。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">单批条目数</span>
+                    <span class="help-rich-text">只控制同一轮内的执行批次，不会重新扫描接收夹。</span>
+                </div>
+                <div class="help-rich-row">
+                    <span class="help-rich-key">轮间暂停</span>
+                    <span class="help-rich-text">批次之间的额外缓冲，降低网盘风控概率。</span>
+                </div>
+            </div>
+            <div class="help-rich-section">
+                <div class="help-rich-title">不做什么</div>
+                <div class="help-rich-text">不下载、不转存（磁力 / 分享的落盘还是走原有的导入链路）；自己不是扫描目录，也不会顺手扫描别的目录；文件夹监控是纯扫描，不会替你整理文件——自动整理只有接收夹（分类归档）和订阅（电视剧新集原地改名）两个入口。</div>
+            </div>
+        `;
+
+        function showMonitorHelp(kind = 'scan') {
+            if (String(kind || '').trim() === 'inbox') {
+                showHelpHtml('接收夹整理说明', INBOX_HELP_HTML);
+                return;
+            }
+            showHelpHtml('文件夹监控说明', MONITOR_HELP_HTML);
         }
 
         function closeHelpModal() {
             document.getElementById('help-modal').classList.add('hidden');
         }
+
+        window.showScraperFilterHelp = showScraperFilterHelp;
+        window.showMonitorHelp = showMonitorHelp;
 
         function normalizeMountProviderInput(value) {
             const raw = String(value || '').trim().toLowerCase();
@@ -2205,8 +2503,35 @@
             return matched ? normalizeRemotePathInput(matched.prefix || '') : '';
         }
 
+        function getProviderLabel(provider) {
+            const providerKey = normalizeMountProviderInput(provider) || '115';
+            const matched = (window.providerMeta || []).find(item => String(item?.name || '') === providerKey);
+            return String(matched?.label || providerKey).trim() || providerKey;
+        }
+
+        function isProviderAuthConfigured(provider) {
+            // 与 applyConfig 里计算 cookie_configured_<provider> 的口径保持一致。
+            const providerKey = normalizeMountProviderInput(provider) || '115';
+            const matched = (window.providerMeta || []).find(item => String(item?.name || '') === providerKey);
+            const configKeys = Array.isArray(matched?.config_keys) && matched.config_keys.length
+                ? matched.config_keys
+                : ['cookie_' + providerKey];
+            const authType = String(matched?.auth_type || '').trim();
+            if (authType === 'password') {
+                return configKeys.every((key) => !!sensitiveConfigMeta[key]);
+            }
+            if (authType === 'password_cookie') {
+                const cookieKey = configKeys[0] || '';
+                const usernameKey = configKeys[1] || '';
+                const passwordKey = configKeys[2] || '';
+                return !!sensitiveConfigMeta[cookieKey]
+                    || (!!sensitiveConfigMeta[usernameKey] && !!sensitiveConfigMeta[passwordKey]);
+            }
+            return !!sensitiveConfigMeta[configKeys[0] || ('cookie_' + providerKey)];
+        }
+
         async function resetExtensions() {
-            if (await showAppConfirm("确定要恢复默认扫描后缀名吗？\n(恢复后请手动点击下方的保存全部配置)")) {
+            if (await showAppConfirm("确定要恢复默认扫描后缀名吗？\n(恢复后请手动点击设置页顶部悬浮条里的保存全部配置)")) {
                 document.getElementById('extensions').value = DEFAULT_EXTENSIONS;
             }
         }
@@ -3256,6 +3581,322 @@
             }
         }
 
+        function getCurrentAiMatchConfig() {
+            const num = (id, fallback) => {
+                const raw = parseFloat(document.getElementById(id)?.value || '');
+                return Number.isFinite(raw) ? raw : fallback;
+            };
+            return {
+                ai_match_enabled: !!document.getElementById('ai_match_enabled')?.checked,
+                ai_match_base_url: String(document.getElementById('ai_match_base_url')?.value || '').trim(),
+                ai_match_api_key: String(document.getElementById('ai_match_api_key')?.value || ''),
+                ai_match_model: String(document.getElementById('ai_match_model')?.value || '').trim(),
+                ai_match_timeout_seconds: num('ai_match_timeout_seconds', 20),
+                ai_match_temperature: num('ai_match_temperature', 0),
+                ai_match_max_concurrency: num('ai_match_max_concurrency', 3),
+                ai_match_thinking_mode: String(document.getElementById('ai_match_thinking_mode')?.value || 'auto'),
+                ai_match_min_confidence: num('ai_match_min_confidence', 60),
+                ai_match_cache_ttl_hours: num('ai_match_cache_ttl_hours', 24),
+            };
+        }
+
+        function renderAiMatchTestStatus() {
+            const settingsModule = tabRuntimeState.tabModuleCache.settings;
+            if (settingsModule?.renderAiMatchTestStatus) {
+                settingsModule.renderAiMatchTestStatus({ aiMatchTestState });
+                return;
+            }
+            void loadSettingsTabModule().then((mod) => {
+                mod?.renderAiMatchTestStatus?.({ aiMatchTestState });
+            });
+        }
+
+        async function testAiMatchConnection() {
+            const settingsModule = await loadSettingsTabModule();
+            if (settingsModule?.testAiMatchConnection) {
+                await settingsModule.testAiMatchConnection({
+                    getCurrentAiMatchConfig,
+                    getAiMatchTestState: () => aiMatchTestState,
+                    setAiMatchTestState: (nextValue) => {
+                        aiMatchTestState = { ...nextValue };
+                    },
+                    renderAiMatchTestStatus,
+                });
+                return;
+            }
+            showToast('AI 测试模块加载失败，请刷新页面后重试', { tone: 'error', duration: 3200, placement: 'top-center' });
+        }
+
+        async function loadAiMatchUsage() {
+            const settingsModule = await loadSettingsTabModule();
+            if (settingsModule?.loadAiMatchUsage) {
+                await settingsModule.loadAiMatchUsage();
+                return;
+            }
+            showToast('用量模块加载失败，请刷新页面后重试', { tone: 'error', duration: 3200, placement: 'top-center' });
+        }
+
+        async function resetAiMatchUsage() {
+            const settingsModule = await loadSettingsTabModule();
+            if (settingsModule?.resetAiMatchUsage) {
+                await settingsModule.resetAiMatchUsage({ showToast });
+                return;
+            }
+            showToast('用量模块加载失败，请刷新页面后重试', { tone: 'error', duration: 3200, placement: 'top-center' });
+        }
+
+        // 接收夹任务的状态缓存：任务卡片和编辑弹窗共用一份最近动态。
+        let inboxTaskStatusCache = {};
+        let inboxStatusFetchedAt = 0;
+        const INBOX_STATUS_REFRESH_INTERVAL_MS = 30000;
+        const INBOX_STATUS_RUNNING_REFRESH_INTERVAL_MS = 5000;
+
+        function monitorTaskWebhookUrl(taskName = '') {
+            const origin = String(window.location?.origin || '').replace(/\/+$/, '');
+            return `${origin}/webhook/${String(taskName || '').trim()}`;
+        }
+
+        function currentMonitorFormTaskName() {
+            return String(document.getElementById('monitor_name')?.value || '').trim();
+        }
+
+        function renderMonitorWebhookUrl() {
+            const input = document.getElementById('monitor_inbox_webhook_url');
+            if (!input) return;
+            const name = currentMonitorFormTaskName();
+            input.value = name ? monitorTaskWebhookUrl(name) : '填写任务名后生成';
+        }
+
+        async function copyMonitorWebhookUrl() {
+            const name = currentMonitorFormTaskName();
+            if (!name) {
+                showToast('请先填写任务名', { tone: 'warn', duration: 2600, placement: 'top-center' });
+                return;
+            }
+            const url = monitorTaskWebhookUrl(name);
+            try {
+                if (!navigator.clipboard?.writeText) throw new Error('当前浏览器不支持剪贴板接口');
+                await navigator.clipboard.writeText(url);
+                showToast('已复制 webhook 地址，粘贴到油猴脚本的“请求地址”即可', {
+                    tone: 'success',
+                    duration: 2600,
+                    placement: 'top-center',
+                });
+            } catch (e) {
+                if (typeof showAppPrompt === 'function') {
+                    showAppPrompt('复制失败，请手动复制 webhook 地址：', url);
+                    return;
+                }
+                showToast(`复制失败：${(e && e.message) || e}`, { tone: 'error', duration: 3200, placement: 'top-center' });
+            }
+        }
+
+        function formatInboxJobStatus(status = '') {
+            const key = String(status || '').trim().toLowerCase();
+            if (key === 'completed') return { icon: '✓', label: '已完成' };
+            if (key === 'failed') return { icon: '✗', label: '失败' };
+            if (key === 'pending' || key === 'running' || key === 'submitted') return { icon: '⏳', label: '下载中' };
+            return { icon: '•', label: key || '未知' };
+        }
+
+        function renderInboxTaskStatus(status = {}) {
+            const statusEl = document.getElementById('inbox-task-status');
+            if (!statusEl) return;
+            const data = status && typeof status === 'object' ? status : {};
+            const runBtn = document.getElementById('inbox-task-run-btn');
+            const applyRunButton = (busy = false, cancelling = false) => {
+                if (!runBtn) return;
+                runBtn.textContent = busy ? (cancelling ? '正在中断…' : '中断整理') : '立即整理并分发';
+                runBtn.disabled = cancelling;
+                runBtn.classList.toggle('btn-disabled', cancelling);
+                runBtn.classList.toggle('bg-amber-500', busy);
+                runBtn.classList.toggle('hover:bg-amber-400', busy);
+                runBtn.classList.toggle('bg-emerald-600', !busy);
+                runBtn.classList.toggle('hover:bg-emerald-500', !busy);
+            };
+            const showStatus = (modifier, html) => {
+                statusEl.className = modifier
+                    ? `tg-proxy-status quick-import-result ${modifier}`
+                    : 'tg-proxy-status quick-import-result';
+                statusEl.innerHTML = html;
+                statusEl.classList.remove('quick-import-result--enter');
+                void statusEl.offsetWidth;
+                statusEl.classList.add('quick-import-result--enter');
+            };
+            if (!String(data.task_name || '').trim()) {
+                // 新建接收夹还没有任务名：这里不能显示任何已有接收夹的运行状态，只给占位说明。
+                applyRunButton(false, false);
+                showStatus(
+                    '',
+                    '<div class="tg-proxy-status-title">最近动态</div>'
+                    + '<div class="tg-proxy-status-meta">保存任务后，这里会显示这个接收夹最近的接收与整理记录。</div>',
+                );
+                return;
+            }
+            applyRunButton(!!data.running, !!data.cancelling);
+            if (data.running) {
+                showStatus(
+                    'tg-proxy-status--loading',
+                    '<div class="tg-proxy-status-title">正在整理接收夹</div>'
+                    + '<div class="tg-proxy-status-meta">正在识别、重命名并按类型分发，请稍候...</div>',
+                );
+                return;
+            }
+
+            const recentJobs = Array.isArray(data.recent_jobs) ? data.recent_jobs : [];
+            const count24h = Math.max(0, Number(data.recent_job_count_24h || 0) || 0);
+            const recentHtml = recentJobs.length
+                ? recentJobs.slice(0, 3).map((job) => {
+                    const info = formatInboxJobStatus(job?.status);
+                    const title = String(job?.title || job?.savepath || '--').trim();
+                    const when = String(job?.updated_at || job?.created_at || '').trim();
+                    return `<div class="tg-proxy-status-note">${escapeHtml(info.icon)} ${escapeHtml(title)}`
+                        + ` · ${escapeHtml(info.label)}${when ? ` · ${escapeHtml(when)}` : ''}</div>`;
+                }).join('')
+                : '<div class="tg-proxy-status-note">最近 24 小时没有新的接收记录。</div>';
+
+            const latest = data.latest && typeof data.latest === 'object' ? data.latest : {};
+            const detail = data.latest_detail && typeof data.latest_detail === 'object' ? data.latest_detail : {};
+            const moved = Array.isArray(detail.moved) ? detail.moved : [];
+            const left = Array.isArray(detail.left) ? detail.left : [];
+            const movedHtml = moved.length
+                ? moved.slice(0, 8).map((item) => `<li>${escapeHtml(item.name || '--')} → ${escapeHtml(item.target || '--')}</li>`).join('')
+                : '<li>无</li>';
+            const leftHtml = left.length
+                ? left.slice(0, 8).map((item) => `<li>${escapeHtml(item.name || '--')}：${escapeHtml(item.reason || '')}</li>`).join('')
+                : '<li>无</li>';
+            const triggerLabel = String(latest.trigger || '').trim() === 'manual'
+                ? '手动'
+                : (String(latest.trigger || '').trim() || '--');
+            const latestHtml = latest.id
+                ? `<div class="tg-proxy-status-title">最近整理：${escapeHtml(String(latest.summary || '--'))}</div>`
+                    + `<div class="tg-proxy-status-meta">${escapeHtml(String(latest.finished_at || latest.started_at || ''))} · 触发：${escapeHtml(triggerLabel)}</div>`
+                    + `<div class="tg-proxy-status-note">已分发：<ul class="list-disc ml-5">${movedHtml}</ul></div>`
+                    + `<div class="tg-proxy-status-note">留在接收夹：<ul class="list-disc ml-5">${leftHtml}</ul></div>`
+                : '<div class="tg-proxy-status-title">还没有整理记录</div>'
+                    + '<div class="tg-proxy-status-meta">点「立即整理并分发」跑一次，或把磁力推到上面的地址。</div>';
+            const configError = String(data.config_error || '').trim();
+            showStatus(
+                configError ? 'tg-proxy-status--error' : '',
+                `<div class="tg-proxy-status-title">最近接收：24 小时 ${count24h} 个</div>`
+                + recentHtml
+                + latestHtml
+                + (configError ? `<div class="tg-proxy-status-meta">配置未就绪：${escapeHtml(configError)}</div>` : ''),
+            );
+        }
+
+        async function refreshInboxTaskStatus() {
+            inboxStatusFetchedAt = Date.now();
+            try {
+                inboxTaskStatusCache = (await window.MediaHubApi.getJson('/scraper/quick-import/status')) || {};
+            } catch (e) {
+                inboxTaskStatusCache = inboxTaskStatusCache || {};
+            }
+            // 弹窗里只显示当前正在编辑的那条接收夹；没有编辑对象（新建）时渲染占位说明。
+            renderInboxTaskStatus(editingMonitorName ? inboxStatusForTask(editingMonitorName) : {});
+            renderMonitorTasks();
+        }
+
+        function maybeRefreshInboxTaskStatus() {
+            // 跟着页面既有的状态轮询（约 15s 一次）刷新卡片上的最近接收 / 最近整理；
+            // 整理进行中时缩短到 5s，好让卡片及时出现「中断」按钮。
+            const now = Date.now();
+            const editingName = String(editingMonitorName || '').trim();
+            const anyRunning = editingName
+                ? !!inboxStatusForTask(editingName).running
+                : !!inboxTaskStatusCache?.running;
+            const interval = anyRunning
+                ? INBOX_STATUS_RUNNING_REFRESH_INTERVAL_MS
+                : INBOX_STATUS_REFRESH_INTERVAL_MS;
+            if (inboxStatusFetchedAt && now - inboxStatusFetchedAt < interval) return;
+            void refreshInboxTaskStatus();
+        }
+
+        function inboxStatusForTask(taskName = '') {
+            // 每个网盘一个接收夹：卡片按名字取自己那份；取不到就给一份空快照，
+            // 绝不把全局的最近运行 / 最近接收透传给这张卡片（否则所有卡片显示同一条）。
+            const cache = inboxTaskStatusCache && typeof inboxTaskStatusCache === 'object' ? inboxTaskStatusCache : {};
+            const name = String(taskName || '').trim();
+            const list = Array.isArray(cache.inboxes) ? cache.inboxes : [];
+            const match = name ? list.find((item) => String(item?.task_name || '').trim() === name) : null;
+            if (match) return { ...cache, ...match };
+            return {
+                latest: {},
+                latest_detail: {},
+                recent_jobs: [],
+                recent_job_count_24h: 0,
+                running: false,
+                cancelling: false,
+                pending_rerun: false,
+                active_run: {},
+            };
+        }
+
+        function buildInboxActivityHtml(taskName = '') {
+            // 接收夹任务卡片上常驻一行：最近有没有收到文件、最近一次整理结果。
+            const status = inboxStatusForTask(taskName);
+            const latest = status.latest && typeof status.latest === 'object' ? status.latest : {};
+            const count = Math.max(0, Number(status.recent_job_count_24h || 0) || 0);
+            const configError = String(status.config_error || '').trim();
+            if (!latest.id && !count && !configError) {
+                return '<div class="mt-1 text-xs text-slate-500">最近 24 小时没有接收记录，也还没有整理记录</div>';
+            }
+            const latestText = latest.id ? String(latest.summary || '--') : '还没有整理记录';
+            const when = latest.id ? String(latest.finished_at || latest.started_at || '').trim() : '';
+            const failed = String(latest.status || '') === 'failed';
+            const tone = failed ? 'text-red-400' : (configError ? 'text-amber-300' : 'text-slate-400');
+            const errorText = configError ? ` · 配置未就绪：${escapeHtml(configError)}` : '';
+            const pendingText = status.pending_rerun ? ' · 已安排再跑一轮' : '';
+            const activeRun = status.active_run && typeof status.active_run === 'object' ? status.active_run : {};
+            const childTotal = Math.max(0, Number(activeRun.child_total || 0) || 0);
+            const childDone = Math.max(0, Number(activeRun.child_done || 0) || 0);
+            const activeText = String(activeRun.status || '') === 'waiting' && childTotal
+                ? ` · 整理中：等待子任务 ${childDone}/${childTotal}`
+                : (String(activeRun.status || '') === 'running' ? ' · 整理中' : '');
+            return `<div class="mt-1 text-xs ${tone}">最近接收 24 小时 ${count} 个 · 最近整理：${escapeHtml(latestText)}`
+                + `${when ? `（${escapeHtml(when)}）` : ''}${activeText}${pendingText}${errorText}</div>`;
+        }
+
+        async function runInboxTaskNow() {
+            const name = currentMonitorFormTaskName();
+            if (!name || name !== String(editingMonitorName || '').trim()) {
+                showToast('请先保存接收夹任务，再点「立即整理并分发」', { tone: 'warn', duration: 2800, placement: 'top-center' });
+                return;
+            }
+            renderInboxTaskStatus({ ...inboxStatusForTask(name), running: true });
+            try {
+                const data = await window.MediaHubApi.postJson('/monitor/start', { name });
+                showToast(String((data && (data.result?.summary || data.status)) || '接收夹整理完成'), {
+                    tone: 'success',
+                    duration: 3200,
+                    placement: 'top-center',
+                });
+            } catch (e) {
+                showToast(`整理失败：${(e && e.message) || e}`, { tone: 'error', duration: 3600, placement: 'top-center' });
+            } finally {
+                await refreshInboxTaskStatus();
+                await refreshMonitorState();
+            }
+        }
+
+        async function toggleInboxTaskRun() {
+            // 弹窗里的按钮是同一个开关：空闲时开始整理，整理中变成中断。
+            const name = currentMonitorFormTaskName();
+            const running = !!inboxStatusForTask(name).running;
+            if (!running) {
+                await runInboxTaskNow();
+                return;
+            }
+            if (!name) return;
+            renderInboxTaskStatus({ ...inboxStatusForTask(name), running: true, cancelling: true });
+            await stopMonitorTask(name);
+        }
+
+        window.refreshInboxTaskStatus = refreshInboxTaskStatus;
+        window.copyMonitorWebhookUrl = copyMonitorWebhookUrl;
+        window.runInboxTaskNow = runInboxTaskNow;
+        window.toggleInboxTaskRun = toggleInboxTaskRun;
+
         function setResourceTgHealthState(nextState = {}) {
             resourceTgHealthState = {
                 ...resourceTgHealthState,
@@ -3586,51 +4227,48 @@
                 });
                 return;
             }
-            try {
-                await window.MediaHubApi.postJson('/monitor/logs/clear');
-                lastMonitorLogSignature = '';
-                await refreshMonitorState();
-            } catch (e) {}
+            // 清空失败必须让调用方知道，否则界面会停留在一个看起来“已清空”的假象里。
+            await window.MediaHubApi.postJson('/monitor/logs/clear');
+            lastMonitorLogSignature = '';
+            await refreshMonitorState();
         }
 
-        function syncMonitorAutoScrapeOptions() {
-            const enabled = !!document.getElementById('monitor_auto_scrape_on_new')?.checked;
-            const optionsEl = document.getElementById('monitor-auto-scrape-options');
-            if (optionsEl) optionsEl.classList.toggle('hidden', !enabled);
-            const standard = String(document.getElementById('monitor_asc_file_name_mode')?.value || 'standard') === 'standard';
-            const standardWrap = document.getElementById('monitor-asc-standard-wrap');
+        function syncMonitorInboxOrganizeUI() {
+            // 接收夹整理选项只在文件命名方式为「标准重命名」时才需要标题语言 / 季集识别。
+            const standard = String(document.getElementById('monitor_inbox_asc_file_name_mode')?.value || 'standard') === 'standard';
+            const standardWrap = document.getElementById('monitor-inbox-asc-standard-wrap');
             if (standardWrap) {
                 standardWrap.classList.toggle('hidden', !standard);
                 standardWrap.querySelectorAll('input, select').forEach((control) => {
                     control.disabled = !standard;
                 });
             }
-            const preserve = !!document.getElementById('monitor_asc_preserve_file_info')?.checked;
-            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
-                input.disabled = !preserve;
+            const preserve = !!document.getElementById('monitor_inbox_asc_preserve_file_info')?.checked;
+            document.querySelectorAll('[data-monitor-inbox-asc-tag]').forEach((input) => {
+                input.disabled = !standard || !preserve;
             });
         }
 
-        function collectMonitorAutoScrapeOptions() {
+        function collectMonitorInboxOrganizeOptions() {
             const preserveTags = {};
-            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
-                preserveTags[String(input.dataset.monitorAscTag || '').trim()] = !!input.checked;
+            document.querySelectorAll('[data-monitor-inbox-asc-tag]').forEach((input) => {
+                preserveTags[String(input.dataset.monitorInboxAscTag || '').trim()] = !!input.checked;
             });
             return {
-                file_name_mode: String(document.getElementById('monitor_asc_file_name_mode')?.value || 'standard'),
-                title_language: String(document.getElementById('monitor_asc_title_language')?.value || 'auto'),
-                season: Math.max(1, Number(document.getElementById('monitor_asc_season')?.value || 1) || 1),
-                episode_mode: String(document.getElementById('monitor_asc_episode_mode')?.value || 'auto'),
-                include_tmdb_id: !!document.getElementById('monitor_asc_include_tmdb_id')?.checked,
-                use_season_subfolder: document.getElementById('monitor_asc_season_subfolder')?.checked !== false,
-                rename_selected_folders: document.getElementById('monitor_asc_rename_folders')?.checked !== false,
-                delete_ad_files: !!document.getElementById('monitor_asc_delete_ad_files')?.checked,
-                preserve_file_info: !!document.getElementById('monitor_asc_preserve_file_info')?.checked,
+                file_name_mode: String(document.getElementById('monitor_inbox_asc_file_name_mode')?.value || 'standard'),
+                title_language: String(document.getElementById('monitor_inbox_asc_title_language')?.value || 'zh'),
+                season: Math.max(1, Number(document.getElementById('monitor_inbox_asc_season')?.value || 1) || 1),
+                episode_mode: String(document.getElementById('monitor_inbox_asc_episode_mode')?.value || 'auto'),
+                include_tmdb_id: !!document.getElementById('monitor_inbox_asc_include_tmdb_id')?.checked,
+                use_season_subfolder: document.getElementById('monitor_inbox_asc_season_subfolder')?.checked !== false,
+                rename_selected_folders: document.getElementById('monitor_inbox_asc_rename_folders')?.checked !== false,
+                delete_ad_files: !!document.getElementById('monitor_inbox_asc_delete_ad_files')?.checked,
+                preserve_file_info: !!document.getElementById('monitor_inbox_asc_preserve_file_info')?.checked,
                 preserve_tags: preserveTags,
             };
         }
 
-        function applyMonitorAutoScrapeOptions(options = {}) {
+        function applyMonitorInboxOrganizeOptions(options = {}) {
             const opts = options && typeof options === 'object' ? options : {};
             const setCheck = (id, value) => {
                 const el = document.getElementById(id);
@@ -3640,52 +4278,67 @@
                 const el = document.getElementById(id);
                 if (el) el.value = allowed.includes(String(value || '')) ? String(value) : allowed[0];
             };
-            setCheck('monitor_asc_rename_folders', opts.rename_selected_folders !== false);
-            setCheck('monitor_asc_season_subfolder', opts.use_season_subfolder !== false);
-            setCheck('monitor_asc_include_tmdb_id', opts.include_tmdb_id);
-            setCheck('monitor_asc_delete_ad_files', opts.delete_ad_files);
-            setCheck('monitor_asc_preserve_file_info', opts.preserve_file_info);
-            setSelect('monitor_asc_file_name_mode', opts.file_name_mode, ['standard', 'clean', 'keep']);
-            setSelect('monitor_asc_title_language', opts.title_language, ['auto', 'zh', 'en']);
-            setSelect('monitor_asc_episode_mode', opts.episode_mode, ['auto', 'seasonal', 'absolute']);
-            const seasonEl = document.getElementById('monitor_asc_season');
+            setCheck('monitor_inbox_asc_rename_folders', opts.rename_selected_folders !== false);
+            setCheck('monitor_inbox_asc_season_subfolder', opts.use_season_subfolder !== false);
+            setCheck('monitor_inbox_asc_include_tmdb_id', opts.include_tmdb_id);
+            setCheck('monitor_inbox_asc_delete_ad_files', opts.delete_ad_files);
+            setCheck('monitor_inbox_asc_preserve_file_info', opts.preserve_file_info);
+            setSelect('monitor_inbox_asc_file_name_mode', opts.file_name_mode, ['standard', 'clean', 'keep']);
+            setSelect('monitor_inbox_asc_title_language', opts.title_language, ['auto', 'zh', 'en']);
+            setSelect('monitor_inbox_asc_episode_mode', opts.episode_mode, ['auto', 'seasonal', 'absolute']);
+            const seasonEl = document.getElementById('monitor_inbox_asc_season');
             if (seasonEl) seasonEl.value = String(Math.max(1, Math.min(99, Number(opts.season || 1) || 1)));
             const tags = (opts.preserve_tags && typeof opts.preserve_tags === 'object') ? opts.preserve_tags : {};
-            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
-                const key = String(input.dataset.monitorAscTag || '').trim();
+            document.querySelectorAll('[data-monitor-inbox-asc-tag]').forEach((input) => {
+                const key = String(input.dataset.monitorInboxAscTag || '').trim();
                 if (Object.prototype.hasOwnProperty.call(tags, key)) input.checked = !!tags[key];
             });
-            syncMonitorAutoScrapeOptions();
+            syncMonitorInboxOrganizeUI();
         }
 
-        function resetMonitorAutoScrapeOptions() {
-            document.getElementById('monitor_asc_rename_folders').checked = true;
-            document.getElementById('monitor_asc_season_subfolder').checked = true;
-            document.getElementById('monitor_asc_include_tmdb_id').checked = false;
-            document.getElementById('monitor_asc_delete_ad_files').checked = false;
-            document.getElementById('monitor_asc_preserve_file_info').checked = false;
-            document.getElementById('monitor_asc_file_name_mode').value = 'standard';
-            document.getElementById('monitor_asc_title_language').value = 'auto';
-            document.getElementById('monitor_asc_episode_mode').value = 'auto';
-            document.getElementById('monitor_asc_season').value = '1';
-            document.querySelectorAll('[data-monitor-asc-tag]').forEach((input) => {
+        function resetMonitorInboxOrganizeOptions() {
+            document.getElementById('monitor_inbox_asc_rename_folders').checked = true;
+            document.getElementById('monitor_inbox_asc_season_subfolder').checked = true;
+            document.getElementById('monitor_inbox_asc_include_tmdb_id').checked = false;
+            document.getElementById('monitor_inbox_asc_delete_ad_files').checked = false;
+            document.getElementById('monitor_inbox_asc_preserve_file_info').checked = false;
+            document.getElementById('monitor_inbox_asc_file_name_mode').value = 'standard';
+            document.getElementById('monitor_inbox_asc_title_language').value = 'zh';
+            document.getElementById('monitor_inbox_asc_episode_mode').value = 'auto';
+            document.getElementById('monitor_inbox_asc_season').value = '1';
+            document.querySelectorAll('[data-monitor-inbox-asc-tag]').forEach((input) => {
                 input.checked = true;
             });
-            syncMonitorAutoScrapeOptions();
+            syncMonitorInboxOrganizeUI();
         }
 
         function currentMonitorFormData() {
             const rawScanPath = document.getElementById('monitor_scan_path').value.trim();
+            const taskType = monitorFormType === 'inbox' ? 'inbox' : 'scan';
+            const inboxProvider = taskType === 'inbox'
+                ? (normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '') || '115')
+                : '';
+            // webhook 只对 115 的接收夹有意义，落库前再兜一次，避免旧配置或手工改配置把开关带进来。
+            const webhookSupported = taskType !== 'inbox' || inboxProvider === '115';
             return {
                 name: document.getElementById('monitor_name').value.trim(),
-                webhook_enabled: document.getElementById('monitor_webhook_enabled').checked,
+                task_type: taskType,
+                provider: inboxProvider,
+                enabled: document.getElementById('monitor_enabled')?.checked !== false,
+                distribute_targets: taskType === 'inbox'
+                    ? {
+                        movie: String(document.getElementById('monitor_inbox_target_movie')?.value || '').trim(),
+                        tv: String(document.getElementById('monitor_inbox_target_tv')?.value || '').trim(),
+                    }
+                    : {},
+                webhook_enabled: webhookSupported && document.getElementById('monitor_webhook_enabled').checked,
                 scan_path: rawScanPath ? normalizeRemotePathInput(rawScanPath) : '',
                 target_path: document.getElementById('monitor_target_path').value.trim(),
                 skip_by_dir_mtime: document.getElementById('monitor_skip_by_dir_mtime').checked,
                 strm_write_mode: document.getElementById('monitor_strm_write_mode')?.value || 'incremental',
                 sync_clean: document.getElementById('monitor_sync_clean').checked,
-                auto_scrape_on_new: document.getElementById('monitor_auto_scrape_on_new').checked,
-                auto_scrape_options: collectMonitorAutoScrapeOptions(),
+                quick_import_target: '',
+                auto_scrape_options: taskType === 'inbox' ? collectMonitorInboxOrganizeOptions() : {},
                 incremental: !document.getElementById('monitor_sync_clean').checked,
                 retries: parseInt(document.getElementById('monitor_retries').value || '3', 10) || 3,
                 list_delay_ms: document.getElementById('monitor_list_delay_ms').value === ''
@@ -3693,26 +4346,40 @@
                     : (parseInt(document.getElementById('monitor_list_delay_ms').value, 10) || 0),
                 min_file_size_mb: parseFloat(document.getElementById('monitor_min_file_size_mb').value || '0') || 0,
                 delay_seconds: parseInt(document.getElementById('monitor_delay_seconds').value || '0', 10) || 0,
-                cron_minutes: parseInt(document.getElementById('monitor_cron_minutes').value || '0', 10) || 0
+                cron_minutes: parseInt(document.getElementById('monitor_cron_minutes').value || '0', 10) || 0,
+                inbox_idle_seconds: taskType === 'inbox'
+                    ? Math.max(0, Math.min(3600, parseInt(document.getElementById('monitor_inbox_idle_seconds').value || '120', 10) || 120))
+                    : 120,
+                inbox_max_items_per_run: taskType === 'inbox'
+                    ? Math.max(1, Math.min(500, parseInt(document.getElementById('monitor_inbox_max_items_per_run').value || '100', 10) || 100))
+                    : 100,
+                inbox_batch_pause_seconds: taskType === 'inbox'
+                    ? Math.max(0, Math.min(300, parseInt(document.getElementById('monitor_inbox_batch_pause_seconds').value || '5', 10) || 5))
+                    : 5
             };
         }
 
-        function getMonitorMountPrefix() {
-            return normalizeRemotePathInput(getMountPrefixByProvider('115') || '/115');
+        function getMonitorMountPrefix(provider = '115') {
+            const providerKey = normalizeMountProviderInput(provider) || '115';
+            return normalizeRemotePathInput(getMountPrefixByProvider(providerKey) || `/${providerKey}`);
         }
 
         function updateMonitorScanPathHint(scanPath = '') {
             const hintEl = document.getElementById('monitor_scan_path_hint');
             if (!hintEl) return;
             const normalized = normalizeRemotePathInput(scanPath || '');
+            const providerKey = monitorFormTaskType() === 'inbox'
+                ? (normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '115') || '115')
+                : '115';
+            const providerLabel = getProviderLabel(providerKey);
             hintEl.textContent = normalized && normalized !== '/'
-                ? `当前保存路径：${normalized}。保存的是 115 路径字符串；即使 Cookie 暂时失效，路径也会保留，恢复后可继续使用。`
-                : '保存的是 115 路径字符串；即使 Cookie 暂时失效，路径也会保留，恢复后可继续使用。';
+                ? `当前保存路径：${normalized}。保存的是 ${providerLabel} 路径字符串；即使认证暂时失效，路径也会保留，恢复后可继续使用。`
+                : `保存的是 ${providerLabel} 路径字符串；即使认证暂时失效，路径也会保留，恢复后可继续使用。`;
         }
 
-        function getMonitorScanPathRelative(scanPath = '') {
+        function getMonitorScanPathRelative(scanPath = '', provider = '115') {
             const normalized = normalizeRemotePathInput(scanPath || '');
-            const mountPrefix = getMonitorMountPrefix();
+            const mountPrefix = getMonitorMountPrefix(provider);
             if (!normalized || normalized === '/' || normalized === mountPrefix) return '';
             if (normalized.startsWith(`${mountPrefix}/`)) {
                 return normalizeRelativePathInput(normalized.slice(mountPrefix.length));
@@ -3722,7 +4389,7 @@
 
         function buildMonitorScanPathFromTrail(trail = []) {
             const relativePath = buildResourceFolderDisplayPathFromTrail(trail);
-            return normalizeRemotePathInput(joinRelativePathInput(getMonitorMountPrefix(), relativePath));
+            return normalizeRemotePathInput(joinRelativePathInput(getMonitorMountPrefix(monitorFolderProvider), relativePath));
         }
 
         function renderMonitorFolderBreadcrumbs() {
@@ -3765,7 +4432,7 @@
                     : `当前目录下共有 ${folderCount} 个文件夹 / ${fileCount} 个文件，这里只展示文件夹，方便精确选择监控范围。`;
             }
             if (monitorFolderLoading && !monitorFolderEntries.length) {
-                container.innerHTML = renderEmpty('正在读取 115 目录...');
+                container.innerHTML = renderEmpty(`正在读取 ${getProviderLabel(monitorFolderProvider)} 目录...`);
                 return;
             }
             if (!monitorFolderEntries.length) {
@@ -3846,7 +4513,7 @@
             renderMonitorFolderList();
             try {
                 const result = await fetchResourceFolderData(targetCid, {
-                    provider: '115',
+                    provider: monitorFolderProvider,
                     foldersOnly: true,
                     forceRefresh,
                     offset: 0,
@@ -3890,7 +4557,7 @@
             renderMonitorFolderList();
             try {
                 const result = await fetchResourceFolderData(currentCid, {
-                    provider: '115',
+                    provider: monitorFolderProvider,
                     foldersOnly: true,
                     offset: monitorFolderNextOffset || 0,
                     limit: RESOURCE_FOLDER_PAGE_LIMIT
@@ -3916,7 +4583,7 @@
         }
 
         async function resolveMonitorFolderTrailByPath(scanPath = '') {
-            const relativePath = getMonitorScanPathRelative(scanPath);
+            const relativePath = getMonitorScanPathRelative(scanPath, monitorFolderProvider);
             const resolvedTrail = [{ id: '0', name: '根目录' }];
             if (!relativePath) return resolvedTrail;
 
@@ -3924,7 +4591,7 @@
             const parts = relativePath.split('/').filter(Boolean);
             for (const part of parts) {
                 const result = await fetchResourceFolderData(parentCid, {
-                    provider: '115',
+                    provider: monitorFolderProvider,
                     foldersOnly: true,
                 });
                 const entries = Array.isArray(result.entries) ? result.entries : [];
@@ -3938,22 +4605,51 @@
             return resolvedTrail;
         }
 
-        async function openMonitorFolderModal() {
-            const hasConfiguredCookie = !!(resourceState.cookie_configured || sensitiveConfigMeta.cookie_115);
-            if (!hasConfiguredCookie) {
-                showToast('请先在参数配置中填写 115 Cookie', {
+        function resolveMonitorFolderProvider(targetInputId = '') {
+            // 扫描路径固定 115；接收夹路径 / 分发目标跟随接收夹任务所选的网盘。
+            if (String(targetInputId || '').startsWith('monitor_inbox')) {
+                return normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '115') || '115';
+            }
+            if (monitorFormTaskType() === 'inbox') {
+                return normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '115') || '115';
+            }
+            return '115';
+        }
+
+        async function openMonitorFolderModal(targetInputId = 'monitor_scan_path', provider = '') {
+            monitorFolderPickerTargetId = String(targetInputId || 'monitor_scan_path');
+            const providerKey = normalizeMountProviderInput(provider) || resolveMonitorFolderProvider(monitorFolderPickerTargetId);
+            monitorFolderProvider = providerKey || '115';
+            const providerLabel = getProviderLabel(monitorFolderProvider);
+            if (!isProviderAuthConfigured(monitorFolderProvider)) {
+                showToast(`请先在参数配置中填写 ${providerLabel} 认证信息`, {
                     tone: 'warn',
                     duration: 2800,
                     placement: 'top-center'
                 });
                 return;
             }
+            const titleEl = document.getElementById('monitor-folder-modal-title');
+            if (titleEl) titleEl.textContent = `选择 ${providerLabel} 文件夹`;
+            const pathLabelEl = document.getElementById('monitor-folder-path-label');
+            if (pathLabelEl) {
+                pathLabelEl.textContent = String(monitorFolderPickerTargetId).startsWith('monitor_inbox_target')
+                    ? '当前分发目标'
+                    : (monitorFormTaskType() === 'inbox' ? '当前接收夹路径' : '当前监控路径');
+            }
+            const summaryEl = document.getElementById('monitor-folder-summary');
+            if (summaryEl) {
+                summaryEl.textContent = `这里只展示 ${providerLabel} 当前目录下的子文件夹，选择后会直接保存成完整路径。`;
+            }
+            const createInput = document.getElementById('monitor-folder-create-name');
+            if (createInput) createInput.value = '';
+            setMonitorFolderCreateBusy(false);
             showLockedModal('monitor-folder-modal');
             renderMonitorFolderBreadcrumbs();
             renderMonitorFolderList();
             try {
                 monitorFolderTrail = await resolveMonitorFolderTrailByPath(
-                    document.getElementById('monitor_scan_path')?.value || ''
+                    document.getElementById(monitorFolderPickerTargetId)?.value || ''
                 );
             } catch (e) {
                 monitorFolderTrail = [{ id: '0', name: '根目录' }];
@@ -3991,18 +4687,264 @@
             }
         }
 
+        function setMonitorFolderCreateBusy(loading) {
+            monitorFolderCreateBusy = !!loading;
+            const btn = document.getElementById('monitor-folder-create-btn');
+            const nameInput = document.getElementById('monitor-folder-create-name');
+            if (btn) {
+                btn.disabled = monitorFolderCreateBusy;
+                btn.classList.toggle('btn-disabled', monitorFolderCreateBusy);
+                btn.textContent = monitorFolderCreateBusy ? '新建中...' : '新建文件夹';
+            }
+            if (nameInput) nameInput.disabled = monitorFolderCreateBusy;
+        }
+
+        async function createMonitorFolderInCurrent() {
+            // 目录选择弹窗要能「新建 + 选择」：在这里建目录，避免让用户先回网盘客户端建好再回来找。
+            if (monitorFolderLoading || monitorFolderCreateBusy) return;
+            const nameInput = document.getElementById('monitor-folder-create-name');
+            const folderName = String(nameInput?.value || '').trim();
+            if (!folderName) {
+                showToast('请输入新文件夹名称', { tone: 'warn', duration: 2200, placement: 'top-center' });
+                return;
+            }
+            const current = monitorFolderTrail[monitorFolderTrail.length - 1] || { id: '0', name: '根目录' };
+            const currentCid = String(current.id || '0').trim() || '0';
+            try {
+                setMonitorFolderCreateBusy(true);
+                const result = await createResourceFolder(currentCid, folderName, { provider: monitorFolderProvider });
+                const folder = result?.folder || {};
+                const createdFolderId = String(folder.id || '').trim();
+                const createdFolderName = String(folder.name || folderName).trim() || folderName;
+                if (nameInput) nameInput.value = '';
+                // 刚建出来的目录不在前端分支缓存里，清掉本网盘缓存再重读，否则列表看不到它。
+                if (typeof invalidateResourceFolderBranchCache === 'function') {
+                    invalidateResourceFolderBranchCache(monitorFolderProvider);
+                }
+                if (createdFolderId) {
+                    monitorFolderTrail = monitorFolderTrail.concat([{ id: createdFolderId, name: createdFolderName }]);
+                }
+                await loadMonitorFolders(createdFolderId || currentCid, { forceRefresh: true });
+                showToast(
+                    createdFolderId
+                        ? `已创建并进入文件夹：${createdFolderName}，点「选择当前目录」即可保存`
+                        : `已创建文件夹：${createdFolderName}`,
+                    { tone: 'success', duration: 3200, placement: 'top-center' }
+                );
+            } catch (e) {
+                showToast(`新建文件夹失败：${e?.message || '请稍后重试'}`, { tone: 'error', duration: 3600, placement: 'top-center' });
+            } finally {
+                setMonitorFolderCreateBusy(false);
+            }
+        }
+
         function selectCurrentMonitorFolder() {
             const scanPath = buildMonitorScanPathFromTrail(monitorFolderTrail);
-            const inputEl = document.getElementById('monitor_scan_path');
+            const targetInputId = monitorFolderPickerTargetId || 'monitor_scan_path';
+            const inputEl = document.getElementById(targetInputId);
             if (inputEl) inputEl.value = scanPath;
-            updateMonitorScanPathHint(scanPath);
+            if (targetInputId === 'monitor_scan_path') updateMonitorScanPathHint(scanPath);
+            monitorFolderPickerTargetId = 'monitor_scan_path';
             closeMonitorFolderModal();
+        }
+
+        function monitorFormTaskType() {
+            // 类型跟着入口走：新建 / 编辑时由 openNewMonitorTask / openNewInboxTask / editMonitorTask 设好。
+            return monitorFormType === 'inbox' ? 'inbox' : 'scan';
+        }
+
+        function showMonitorNameHelp() {
+            // 「任务名」那句提示原来写死了 webhook：非 115 的接收夹根本没有 webhook，点开就是错的，
+            // 这里跟着当前表单类型 / 网盘给对应说法。
+            const isInbox = monitorFormTaskType() === 'inbox';
+            const provider = isInbox
+                ? (normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '') || '115')
+                : '115';
+            if (isInbox && provider !== '115') {
+                showHelp('任务名用于区分任务，也是任务卡片上显示的名字。非 115 网盘的接收夹没有 Webhook，改名只影响显示，不涉及地址；建议用中文短名，且保持唯一。');
+                return;
+            }
+            showHelp('任务名用于区分任务，也是 webhook 地址 /webhook/任务名 的一部分（Webhook 只对 115 网盘的接收夹开放）。建议用中文短名，且保持唯一。');
+        }
+
+        function syncMonitorNameHint() {
+            // 任务名的示例文案跟着任务类型走：接收夹的「接收」和扫描任务的「自存影视」不是一回事，
+            // 非 115 的接收夹又用不上 webhook，所以标签里那段 webhook 说明也要跟着摘掉。
+            const input = document.getElementById('monitor_name');
+            const labelText = document.getElementById('monitor-name-label-text');
+            const isInbox = monitorFormTaskType() === 'inbox';
+            const provider = isInbox
+                ? (normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '') || '115')
+                : '';
+            if (input) {
+                input.placeholder = isInbox
+                    ? (provider === '115' ? '例如：接收' : `例如：${getProviderLabel(provider)}接收`)
+                    : '例如：自存影视';
+            }
+            if (labelText) {
+                labelText.textContent = isInbox && provider !== '115'
+                    ? '任务名'
+                    : '任务名 (用于 webhook 路径)';
+            }
+        }
+
+        function inboxProvidersTaken() {
+            // 每个网盘只能有一个接收夹：这里收集「已被别的接收夹占用」的网盘，用于禁选与提示。
+            const taken = new Map();
+            (monitorState.tasks || []).forEach((item) => {
+                if (String(item?.task_type || 'scan') !== 'inbox') return;
+                if (editingMonitorName && item.name === editingMonitorName) return;
+                const key = normalizeMountProviderInput(item.provider || '115') || '115';
+                if (!taken.has(key)) taken.set(key, String(item.name || '').trim());
+            });
+            return taken;
+        }
+
+        function renderMonitorInboxProviderHint() {
+            const hint = document.getElementById('monitor-inbox-provider-hint');
+            if (!hint) return;
+            const taken = inboxProvidersTaken();
+            const free = (window.providerMeta || [])
+                .filter((p) => !!p?.supports_folder_browse)
+                .map((p) => normalizeMountProviderInput(p.name || '') || String(p.name || ''))
+                .filter((name) => name && !taken.has(name));
+            if (!taken.size) {
+                hint.textContent = '每个网盘只能有一个接收夹：内置的「接收」是 115 那份，其他网盘可以各加一个。';
+                return;
+            }
+            const takenText = [...taken.entries()]
+                .map(([key, name]) => `${getProviderLabel(key)}${name ? `（${name}）` : ''}`)
+                .join('、');
+            hint.textContent = free.length
+                ? `每个网盘只能有一个接收夹：${takenText} 已经有了，请改选其它网盘；要调整已有那条，直接点它的编辑。`
+                : `每个网盘只能有一个接收夹：${takenText} 都已经有了，不能再新增；要调整请直接编辑已有接收夹。`;
+        }
+
+        function populateMonitorInboxProviderSelect(task = {}) {
+            const el = document.getElementById('monitor_inbox_provider');
+            if (!el) return;
+            const providers = (window.providerMeta || []).filter((p) => !!p?.supports_folder_browse);
+            const usable = providers.length ? providers : [{ name: '115', label: '115' }];
+            const taken = inboxProvidersTaken();
+            el.innerHTML = usable.map((p) => {
+                const name = String(p.name || '');
+                const label = String(p.label || p.name || '');
+                const takenBy = taken.get(normalizeMountProviderInput(name) || name);
+                const text = takenBy ? `${label}（已有接收夹「${takenBy}」，每个网盘只能有一个）` : label;
+                return `<option value="${escapeHtml(name)}"${takenBy ? ' disabled' : ''}>${escapeHtml(text)}</option>`;
+            }).join('');
+            const names = usable.map((p) => String(p.name || ''));
+            let current = normalizeMountProviderInput(task?.provider || '') || '';
+            if (!current || !names.includes(current) || taken.has(current)) {
+                // 新增时优先落在还没被占用的网盘上，避免默认选中一个不能用的选项。
+                current = names.find((name) => !taken.has(normalizeMountProviderInput(name) || name)) || current || '115';
+            }
+            if (!names.includes(current)) {
+                el.insertAdjacentHTML('afterbegin', `<option value="${escapeHtml(current)}">${escapeHtml(getProviderLabel(current))}</option>`);
+            }
+            el.value = current;
+            renderMonitorInboxProviderHint();
+        }
+
+        function populateMonitorInboxTargetFields(task = {}) {
+            const targets = task && typeof task.distribute_targets === 'object' && task.distribute_targets
+                ? task.distribute_targets
+                : {};
+            [['monitor_inbox_target_movie', 'movie'], ['monitor_inbox_target_tv', 'tv']].forEach(([elementId, key]) => {
+                const el = document.getElementById(elementId);
+                if (!el) return;
+                el.value = String(targets[key] || '').trim();
+            });
+        }
+
+        function syncMonitorInboxProviderUI() {
+            if (monitorFormTaskType() !== 'inbox') return;
+            const provider = normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '') || '115';
+            const mountPrefix = getMonitorMountPrefix(provider);
+            const pathInput = document.getElementById('monitor_scan_path');
+            if (pathInput) {
+                pathInput.placeholder = `${mountPrefix}/接收`;
+                const currentPath = normalizeRemotePathInput(pathInput.value || '');
+                if (currentPath && currentPath !== '/' && currentPath !== mountPrefix && !currentPath.startsWith(`${mountPrefix}/`)) {
+                    pathInput.value = '';
+                }
+            }
+            [['monitor_inbox_target_movie', 'movie'], ['monitor_inbox_target_tv', 'tv']].forEach(([elementId]) => {
+                const el = document.getElementById(elementId);
+                if (!el) return;
+                const currentValue = normalizeRemotePathInput(String(el.value || '').trim());
+                if (currentValue && currentValue !== '/' && currentValue !== mountPrefix && !currentValue.startsWith(`${mountPrefix}/`)) {
+                    el.value = '';
+                }
+            });
+            updateMonitorScanPathHint(pathInput?.value || '');
+            syncMonitorNameHint();
+            // 换网盘会决定这条任务能不能开 webhook，所以一起刷新开关状态。
+            syncWebhookToggleState();
+        }
+
+        function openMonitorInboxTargetFolder(kind) {
+            const key = String(kind || '').trim() === 'tv' ? 'tv' : 'movie';
+            const targetInputId = key === 'tv' ? 'monitor_inbox_target_tv' : 'monitor_inbox_target_movie';
+            const provider = normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '') || '115';
+            void openMonitorFolderModal(targetInputId, provider);
+        }
+
+        function applyMonitorTaskTypeUI() {
+            const isInbox = monitorFormTaskType() === 'inbox';
+            document.getElementById('monitor-scan-fields')?.classList.toggle('hidden', isInbox);
+            document.getElementById('monitor-inbox-fields')?.classList.toggle('hidden', !isInbox);
+            document.getElementById('monitor-inbox-provider-row')?.classList.toggle('hidden', !isInbox);
+            document.getElementById('monitor-scan-path-label')?.classList.toggle('hidden', isInbox);
+            document.getElementById('monitor-inbox-path-label')?.classList.toggle('hidden', !isInbox);
+            const pathInput = document.getElementById('monitor_scan_path');
+            if (pathInput) {
+                const inboxPrefix = getMonitorMountPrefix(
+                    normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '') || '115'
+                );
+                pathInput.placeholder = isInbox ? `${inboxPrefix}/接收` : '/115/自存影视/115自存电视剧';
+            }
+            renderMonitorWebhookUrl();
+            syncMonitorNameHint();
+            syncWebhookToggleState();
+            if (isInbox) {
+                // 新建时表单里还没有任务名：只渲染占位说明，避免把已有接收夹的运行状态显示进来。
+                if (editingMonitorName) void refreshInboxTaskStatus();
+                else renderInboxTaskStatus({});
+            }
+        }
+
+        function monitorWebhookProviderSupported() {
+            // webhook 只支持 115：油猴脚本上报的保存路径按 115 根目录解析，别的网盘配了也落不到本盘。
+            if (monitorFormTaskType() !== 'inbox') return true;
+            const provider = normalizeMountProviderInput(document.getElementById('monitor_inbox_provider')?.value || '') || '115';
+            return provider === '115';
+        }
+
+        function syncWebhookToggleState() {
+            // webhook 只在设置了签名密钥后才能开启，避免全新安装就暴露一个免鉴权的写入口；
+            // 另外只有 115 的接收夹能开（脚本里的保存路径按 115 根目录解析）。
+            const checkbox = document.getElementById('monitor_webhook_enabled');
+            const secretHint = document.getElementById('webhook-secret-hint');
+            const providerHint = document.getElementById('webhook-provider-hint');
+            const webhookBlock = document.getElementById('inbox-webhook-block');
+            const providerOk = monitorWebhookProviderSupported();
+            // 非 115 的接收夹不支持 webhook：开关禁用的同时，连「推送地址」整块（地址 + 复制 + 油猴脚本说明）一起收起。
+            if (webhookBlock) webhookBlock.classList.toggle('hidden', !providerOk);
+            if (!checkbox) return;
+            const hasSecret = !!sensitiveConfigMeta.webhook_secret;
+            checkbox.disabled = !hasSecret || !providerOk;
+            if ((!hasSecret || !providerOk) && checkbox.checked) checkbox.checked = false;
+            if (secretHint) secretHint.classList.toggle('hidden', hasSecret);
+            if (providerHint) providerHint.classList.toggle('hidden', providerOk);
         }
 
         function resetMonitorForm() {
             editingMonitorName = null;
+            monitorFormType = 'scan';
             document.getElementById('monitor-modal-title').innerText = '新增监控任务';
             document.getElementById('monitor_name').value = '';
+            document.getElementById('monitor_enabled').checked = true;
             document.getElementById('monitor_webhook_enabled').checked = false;
             document.getElementById('monitor_scan_path').value = '';
             updateMonitorScanPathHint('');
@@ -4014,18 +4956,31 @@
             document.getElementById('monitor_skip_by_dir_mtime').checked = false;
             document.getElementById('monitor_strm_write_mode').value = 'incremental';
             document.getElementById('monitor_sync_clean').checked = true;
-            document.getElementById('monitor_auto_scrape_on_new').checked = false;
-            resetMonitorAutoScrapeOptions();
+            resetMonitorInboxOrganizeOptions();
             document.getElementById('monitor_retries').value = 3;
             document.getElementById('monitor_list_delay_ms').value = 250;
             document.getElementById('monitor_min_file_size_mb').value = 0;
             document.getElementById('monitor_delay_seconds').value = 0;
             document.getElementById('monitor_cron_minutes').value = 0;
-            refreshWebhookHint();
+            document.getElementById('monitor_inbox_idle_seconds').value = 120;
+            document.getElementById('monitor_inbox_max_items_per_run').value = 100;
+            document.getElementById('monitor_inbox_batch_pause_seconds').value = 5;
+            populateMonitorInboxTargetFields({});
+            populateMonitorInboxProviderSelect({});
+            applyMonitorTaskTypeUI();
         }
 
         function openNewMonitorTask() {
             resetMonitorForm();
+            showLockedModal('monitor-modal');
+        }
+
+        function openNewInboxTask() {
+            // 接收夹按网盘各一个：从「接收夹整理」列表进来，弹窗直接就是接收夹类型，不用再选。
+            resetMonitorForm();
+            document.getElementById('monitor-modal-title').innerText = '新增接收夹任务';
+            monitorFormType = 'inbox';
+            applyMonitorTaskTypeUI();
             showLockedModal('monitor-modal');
         }
 
@@ -4044,25 +4999,30 @@
                 const data = await window.MediaHubApi.getJson(`/monitor/manual-required?task_name=${encodeURIComponent(taskName || '')}`);
                 const items = Array.isArray(data.items) ? data.items : [];
                 if (!items.length) {
-                    listEl.innerHTML = '<div class="text-slate-400 text-sm">当前没有需手动监控的路径（可能已被扫描清除）。</div>';
+                    listEl.innerHTML = '<div class="text-slate-400 text-sm">当前没有等待系统补扫的目录（可能已被扫描清除）。</div>';
                 } else {
                     const OPERATION_LABELS = { copy: '复制', move: '移动', rename: '重命名', delete: '删除', create: '新建' };
                     listEl.innerHTML = items.map((item, index) => {
                         const opLabel = OPERATION_LABELS[item.operation] || item.operation || '变更';
                         const oldPath = String(item.old_path || '').trim();
                         const newPath = String(item.remote_path || item.new_path || '').trim();
+                        const retryBlocked = Boolean(item.retry_blocked);
                         const pathLine = oldPath && newPath && oldPath !== newPath
                             ? `${escapeHtml(oldPath)} → ${escapeHtml(newPath)}`
                             : escapeHtml(newPath || oldPath || '--');
+                        const hint = retryBlocked
+                            ? `自动补扫已失败一次，不再自动重试${item.failed_at ? `（${escapeHtml(String(item.failed_at))}）` : ''}：${escapeHtml(String(item.failed_summary || '目录读取失败'))}。请点下方「立即扫描该任务」重试，或先修复网盘目录。`
+                            : '该目录的内容清单未确认；系统会自动按目录逐个排队补扫并补齐本地播放文件，无需手动操作。';
                         return `
                             <div class="py-2 px-1 border-b border-slate-800 last:border-0">
                                 <div class="flex items-center gap-2 text-xs text-slate-400">
-                                    <span class="rounded bg-amber-500/15 text-amber-300 px-1.5 py-0.5 font-bold">#${escapeHtml(String(item.event_id || ''))}</span>
+                                    <span class="rounded ${retryBlocked ? 'bg-red-500/15 text-red-300' : 'bg-amber-500/15 text-amber-300'} px-1.5 py-0.5 font-bold">#${escapeHtml(String(item.event_id || ''))}</span>
                                     <span>${escapeHtml(opLabel)}</span>
                                     ${item.created_at ? `<span>· ${escapeHtml(String(item.created_at))}</span>` : ''}
+                                    ${retryBlocked ? '<span class="text-red-300 font-bold">补扫失败</span>' : ''}
                                 </div>
                                 <div class="font-semibold text-slate-200 mt-1 break-all">${index + 1}. ${pathLine}</div>
-                                <div class="text-xs text-slate-500 mt-1">该目录变更时内容清单未确认；重新扫描该任务后会自动补齐 STRM 并清除此提示。</div>
+                                <div class="text-xs ${retryBlocked ? 'text-red-300' : 'text-slate-500'} mt-1">${hint}</div>
                             </div>
                         `;
                     }).join('');
@@ -4086,19 +5046,6 @@
         window.closeMonitorManualRequired = closeMonitorManualRequired;
         window.rescanMonitorManualRequired = rescanMonitorManualRequired;
 
-        function refreshWebhookHint() {
-            const name = document.getElementById('monitor_name').value.trim() || '任务名';
-            document.getElementById('webhook-hint').innerHTML = [
-                `webhook 地址：IP:容器端口/webhook/${escapeHtml(name)}（任务名用于绑定这个监控任务）`,
-                '磁力导入必填：magnet 或 link_url + savepath',
-                'savepath 是 115 保存目录；必须落在本任务扫描路径内，导入后才会自动刷新 strm',
-                'delayTime 可选：本次导入成功后延迟几秒刷新；不传则使用任务默认延迟',
-                'title / sharetitle 可选：仅用于日志或局部刷新提示',
-                '签名校验（可选）：X-Webhook-Ts / X-Webhook-Nonce / X-Webhook-Sign 或 X-Webhook-Token',
-                '说明：签名密钥在「参数配置 -> 后台安全管理」里设置；为空时不校验'
-            ].join('<br>');
-        }
-
         async function persistMonitorTasks(tasks) {
             const data = await window.MediaHubApi.postJson('/monitor/save', { tasks });
             applyMonitorState({ ...monitorState, tasks: data.tasks || [] }, { forceRender: true });
@@ -4106,12 +5053,37 @@
 
         async function saveMonitorTask() {
             const task = currentMonitorFormData();
+            const isInbox = task.task_type === 'inbox';
             if (!task.name) return showToast('任务名不能为空', { tone: 'warn', duration: 2600, placement: 'top-center' });
-            if (!task.scan_path) return showToast('扫描路径不能为空', { tone: 'warn', duration: 2600, placement: 'top-center' });
-            if (!task.target_path) return showToast('目标路径不能为空', { tone: 'warn', duration: 2600, placement: 'top-center' });
-            const mountPrefix = getMonitorMountPrefix();
+            if (!task.scan_path) {
+                return showToast(isInbox ? '接收夹路径不能为空' : '扫描路径不能为空', { tone: 'warn', duration: 2600, placement: 'top-center' });
+            }
+            if (!isInbox && !task.target_path) return showToast('目标路径不能为空', { tone: 'warn', duration: 2600, placement: 'top-center' });
+            const mountPrefix = getMonitorMountPrefix(isInbox ? task.provider : '115');
             if (task.scan_path !== mountPrefix && !task.scan_path.startsWith(`${mountPrefix}/`)) {
-                return showToast(`扫描路径必须位于 ${mountPrefix} 下`, { tone: 'warn', duration: 3200, placement: 'top-center' });
+                return showToast(`${isInbox ? '接收夹路径' : '扫描路径'}必须位于 ${mountPrefix} 下`, { tone: 'warn', duration: 3200, placement: 'top-center' });
+            }
+            if (isInbox) {
+                if (!task.distribute_targets.movie && !task.distribute_targets.tv) {
+                    return showToast('接收夹任务至少要指定一个电影 / 电视剧分发目标', { tone: 'warn', duration: 3200, placement: 'top-center' });
+                }
+                const offMount = ['movie', 'tv'].find((key) => {
+                    const target = String(task.distribute_targets[key] || '').trim();
+                    if (!target) return false;
+                    return target !== mountPrefix && !target.startsWith(`${mountPrefix}/`);
+                });
+                if (offMount) {
+                    return showToast(`分发目标必须和接收夹在同一个网盘（${mountPrefix} 下）`, { tone: 'warn', duration: 3400, placement: 'top-center' });
+                }
+                const providerKey = normalizeMountProviderInput(task.provider || '115') || '115';
+                const otherInbox = (monitorState.tasks || []).find((item) => (
+                    item.name !== editingMonitorName
+                    && String(item.task_type || 'scan') === 'inbox'
+                    && (normalizeMountProviderInput(item.provider || '115') || '115') === providerKey
+                ));
+                if (otherInbox) {
+                    return showToast(`每个网盘只能有一个接收夹：「${getProviderLabel(providerKey)}」已经有接收夹「${otherInbox.name}」，请直接编辑它`, { tone: 'warn', duration: 3600, placement: 'top-center' });
+                }
             }
             if (task.retries < 1 || task.retries > 5) return showToast('读取失败尝试次数只能在 1 到 5 之间', { tone: 'warn', duration: 2600, placement: 'top-center' });
             if (task.cron_minutes < 0) return showToast('定时执行分钟不能小于 0', { tone: 'warn', duration: 2600, placement: 'top-center' });
@@ -4138,8 +5110,11 @@
             const task = (monitorState.tasks || []).find(item => item.name === name);
             if (!task) return;
             editingMonitorName = task.name;
+            // 已有任务的类型不可改：编辑时按任务原本的类型渲染弹窗。
+            monitorFormType = String(task.task_type || 'scan') === 'inbox' ? 'inbox' : 'scan';
             document.getElementById('monitor-modal-title').innerText = `编辑监控任务：${task.name}`;
             document.getElementById('monitor_name').value = task.name || '';
+            document.getElementById('monitor_enabled').checked = task.enabled !== false;
             document.getElementById('monitor_webhook_enabled').checked = !!task.webhook_enabled;
             document.getElementById('monitor_scan_path').value = task.scan_path || '';
             updateMonitorScanPathHint(task.scan_path || '');
@@ -4153,14 +5128,19 @@
             document.getElementById('monitor_sync_clean').checked = Object.prototype.hasOwnProperty.call(task, 'sync_clean')
                 ? !!task.sync_clean
                 : !task.incremental;
-            document.getElementById('monitor_auto_scrape_on_new').checked = !!task.auto_scrape_on_new;
-            applyMonitorAutoScrapeOptions(task.auto_scrape_options);
+            populateMonitorInboxTargetFields(task);
+            populateMonitorInboxProviderSelect(task);
+            applyMonitorInboxOrganizeOptions(task.auto_scrape_options);
+            syncMonitorInboxProviderUI();
             document.getElementById('monitor_retries').value = task.retries ?? 3;
             document.getElementById('monitor_list_delay_ms').value = task.list_delay_ms ?? 250;
             document.getElementById('monitor_min_file_size_mb').value = task.min_file_size_mb ?? 0;
             document.getElementById('monitor_delay_seconds').value = task.delay_seconds ?? 0;
             document.getElementById('monitor_cron_minutes').value = task.cron_minutes ?? 0;
-            refreshWebhookHint();
+            document.getElementById('monitor_inbox_idle_seconds').value = task.inbox_idle_seconds ?? 120;
+            document.getElementById('monitor_inbox_max_items_per_run').value = task.inbox_max_items_per_run ?? 100;
+            document.getElementById('monitor_inbox_batch_pause_seconds').value = task.inbox_batch_pause_seconds ?? 5;
+            applyMonitorTaskTypeUI();
             showLockedModal('monitor-modal');
             switchTab('monitor');
         }
@@ -4190,6 +5170,17 @@
             setMonitorActionLock('start', name, true);
             try {
                 const data = await window.MediaHubApi.postJson('/monitor/start', { name });
+                const targetTask = (monitorState.tasks || []).find((item) => item.name === name);
+                if (String(targetTask?.task_type || 'scan') === 'inbox') {
+                    // 接收夹任务没有“运行中/中断”语义：跑一次就是把接收夹整理分发一次。
+                    showToast(String((data && (data.result?.summary || data.status)) || '接收夹整理完成'), {
+                        tone: 'success',
+                        duration: 3200,
+                        placement: 'top-center',
+                    });
+                    await refreshInboxTaskStatus();
+                    return;
+                }
 
                 const queued = Array.isArray(monitorState.queued) ? [...monitorState.queued] : [];
                 if (data.status === 'queued') {
@@ -4221,6 +5212,16 @@
                     showToast('当前没有这个任务在运行', { tone: 'warn', duration: 2600, placement: 'top-center' });
                     return;
                 }
+                const stopTargetTask = (monitorState.tasks || []).find((item) => item.name === name);
+                if (String(stopTargetTask?.task_type || 'scan') === 'inbox') {
+                    showToast('已请求中断接收夹整理：正在处理的条目结束后生效，已整理完的不会回滚', {
+                        tone: 'warn',
+                        duration: 3600,
+                        placement: 'top-center',
+                    });
+                    await refreshInboxTaskStatus();
+                    return;
+                }
                 const clearedCount = Math.max(0, Number(data.cleared || 0));
                 let detailText = `${name} 已发送中断请求`;
                 if (data.status === 'cleared') {
@@ -4239,6 +5240,28 @@
         }
 
         function buildMonitorTaskIntro(task, { running = false, queued = false, nextRun = '' } = {}) {
+            if (String(task?.task_type || 'scan') === 'inbox') {
+                const enabled = task?.enabled !== false;
+                const statusText = enabled ? (running ? '运行中' : '待命') : '未启用';
+                const inboxPath = String(task?.scan_path || '').trim() || '--';
+                const targets = task?.distribute_targets && typeof task.distribute_targets === 'object'
+                    ? task.distribute_targets
+                    : {};
+                const movie = String(targets.movie || '').trim() || '未指定';
+                const tv = String(targets.tv || '').trim() || '未指定';
+                const inboxProvider = normalizeMountProviderInput(task?.provider || '') || '115';
+                // 非 115 的接收夹没有 webhook（脚本上报的保存路径按 115 根目录解析），别只说“未启用”。
+                const webhookText = inboxProvider !== '115'
+                    ? '非 115 网盘不支持 Webhook'
+                    : (task?.webhook_enabled ? '已启用 Webhook 触发' : '未启用 Webhook');
+                const status = inboxStatusForTask(task?.name);
+                const count24h = Math.max(0, Number(status.recent_job_count_24h || 0) || 0);
+                const latest = status.latest && typeof status.latest === 'object' ? status.latest : {};
+                const latestText = latest.id
+                    ? `最近整理：${String(latest.summary || '--')}`
+                    : '还没有整理记录';
+                return `状态：${statusText}。接收夹路径 ${inboxPath}，识别后分发：电影 → ${movie}，电视剧 → ${tv}；${webhookText}；最近接收：24 小时 ${count24h} 个；${latestText}。`;
+            }
             const statusText = running ? '运行中' : (queued ? '已排队' : '待命');
             const scanPath = String(task?.scan_path || '').trim() || '--';
             const targetPath = String(task?.target_path || '').trim() || '--';
@@ -4251,7 +5274,8 @@
                 ? `每 ${scheduleMinutes} 分钟自动执行一次，下次定时 ${String(nextRun || '计算中')}`
                 : '未开启定时，仅手动运行或通过 Webhook 触发';
             const webhookText = task?.webhook_enabled ? '已启用 Webhook 触发' : '未启用 Webhook';
-            return `状态：${statusText}。该任务会扫描 ${scanPath}，输出到 /strm/${targetPath}，写入模式为 ${writeModeText}，清理策略为 ${cleanupText}；${scheduleText}；${webhookText}。`;
+            const enabledText = task?.enabled === false ? '本任务已停用，不会参与定时扫描；' : '';
+            return `状态：${statusText}。${enabledText}该任务会扫描 ${scanPath}，输出到 /strm/${targetPath}，写入模式为 ${writeModeText}，清理策略为 ${cleanupText}；${scheduleText}；${webhookText}。`;
         }
 
         function toggleMonitorTaskIntro(taskName) {
@@ -4303,32 +5327,46 @@
 
         function renderMonitorTasks() {
             const container = document.getElementById('monitor-task-list');
+            // 页面分区：上部只渲染接收夹（inbox），下部只渲染目录同步（scan）。
+            const inboxContainer = document.getElementById('monitor-inbox-task-list');
             const tasks = monitorState.tasks || [];
             if (!tasks.length) {
                 container.innerHTML = `<div class="rounded-2xl border border-dashed border-slate-700 p-8 text-center text-slate-400 text-sm">还没有文件夹监控任务，点击“新增任务”即可创建。</div>`;
+                if (inboxContainer) inboxContainer.innerHTML = '';
                 return;
             }
 
-            container.innerHTML = tasks.map(task => {
+            const renderTaskCard = (task) => {
                 const taskName = String(task?.name || '').trim();
                 const taskKey = encodeURIComponent(taskName);
+                const isInboxTask = String(task?.task_type || 'scan') === 'inbox';
                 const changeCount = monitorState.change_counts?.[taskName] || {};
                 const pendingChanges = Math.max(0, Number(changeCount.pending || 0) || 0);
                 const failedChanges = Math.max(0, Number(changeCount.failed || 0) || 0);
                 const manualRequiredChanges = Math.max(0, Number(changeCount.manual_required || 0) || 0);
+                const manualRequiredFailed = Math.max(0, Number(changeCount.manual_required_failed || 0) || 0);
                 const manualRequiredTaskArg = String(taskName || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
                 const manualRequiredLabel = manualRequiredChanges
-                    ? `<button type="button" class="monitor-manual-required-link" onclick="openMonitorManualRequired('${escapeHtml(manualRequiredTaskArg)}')">需手动监控 ${manualRequiredChanges}</button>`
+                    ? `<button type="button" class="monitor-manual-required-link" onclick="openMonitorManualRequired('${escapeHtml(manualRequiredTaskArg)}')">待自动补扫 ${manualRequiredChanges}</button>`
+                    : '';
+                // 补扫只尝试一次：失败过的目录不会再自动重排，单独标红提示人工处理。
+                const manualRequiredFailedLabel = manualRequiredFailed
+                    ? `<button type="button" class="monitor-manual-required-link is-error" onclick="openMonitorManualRequired('${escapeHtml(manualRequiredTaskArg)}')" title="自动补扫失败过一次，需要人工处理：可点弹窗里的「立即扫描该任务」，或修复网盘目录后重试">补扫失败 ${manualRequiredFailed}</button>`
                     : '';
                 const changeLabels = [
                     pendingChanges ? `待同步 ${pendingChanges}` : '',
                     manualRequiredLabel,
+                    manualRequiredFailedLabel,
                     failedChanges ? `同步失败 ${failedChanges}` : '',
                 ].filter(Boolean);
                 const changeCountHtml = changeLabels.length
-                    ? `<div class="mt-1 text-xs font-semibold ${failedChanges ? 'text-red-400' : 'text-amber-300'}">${changeLabels.join(' / ')}</div>`
+                    ? `<div class="mt-1 text-xs font-semibold ${failedChanges || manualRequiredFailed ? 'text-red-400' : 'text-amber-300'}">${changeLabels.join(' / ')}</div>`
                     : '';
-                const running = monitorState.running && monitorState.current_task === taskName;
+                // 接收夹整理跑在工作线程里，运行状态来自 /scraper/quick-import/status，而不是监控扫描状态。
+                const inboxStatus = isInboxTask ? inboxStatusForTask(taskName) : {};
+                const running = isInboxTask
+                    ? !!inboxStatus.running
+                    : (monitorState.running && monitorState.current_task === taskName);
                 const queued = (monitorState.queued || []).includes(taskName);
                 const starting = isMonitorActionLocked('start', taskName);
                 const stopping = isMonitorActionLocked('stop', taskName);
@@ -4345,13 +5383,23 @@
                 const nextRun = (monitorState.next_runs || {})[taskName];
                 const introExpanded = isTaskIntroExpanded(monitorTaskIntroExpanded, taskName);
                 const introText = buildMonitorTaskIntro(task, { running, queued, nextRun });
+                const taskTypeBadge = isInboxTask
+                    ? '<span class="quick-import-chip">接收夹</span>'
+                    : '';
+                const inboxActivityHtml = isInboxTask ? buildInboxActivityHtml(taskName) : '';
                 const toggleRunButton = buildMonitorTaskIconButton({
                     action: 'toggle-run',
                     taskName,
-                    label: toggleRunLabel,
+                    label: isInboxTask
+                        ? (
+                            running
+                                ? (stopping || inboxStatus.cancelling ? '中断中' : '中断')
+                                : (starting ? '整理中' : '立即整理')
+                        )
+                        : toggleRunLabel,
                     icon: toggleRunIcon,
                     tone: toggleRunTone,
-                    disabled: toggleRunDisabled,
+                    disabled: isInboxTask ? (starting || stopping || deleting) : toggleRunDisabled,
                     extraAttrs: `data-monitor-run-action="${escapeHtml(toggleRunAction)}"`,
                 });
                 const editButton = buildMonitorTaskIconButton({
@@ -4361,7 +5409,8 @@
                     icon: 'edit',
                     tone: 'edit',
                 });
-                const deleteButton = buildMonitorTaskIconButton({
+                // 接收夹按网盘各一个：暂不给删除入口（不想用时把「启用本任务」关掉），服务端也会拒绝删除。
+                const deleteButton = isInboxTask ? '' : buildMonitorTaskIconButton({
                     action: 'delete',
                     taskName,
                     label: deleting ? '删除中' : '删除',
@@ -4379,8 +5428,12 @@
                                     aria-expanded="${introExpanded ? 'true' : 'false'}"
                                     class="min-w-0 flex-1 text-left rounded-lg border border-transparent hover:border-slate-700/75 focus:outline-none focus:ring-2 focus:ring-sky-500/45 px-1 py-0.5"
                                 >
-                                    <div class="text-lg font-black text-white break-all leading-tight">${escapeHtml(taskName)}</div>
+                                    <div class="flex flex-wrap items-center gap-2">
+                                        <div class="text-lg font-black text-white break-all leading-tight">${escapeHtml(taskName)}</div>
+                                        ${taskTypeBadge}
+                                    </div>
                                     ${changeCountHtml}
+                                    ${inboxActivityHtml}
                                 </button>
                                 <button
                                     type="button"
@@ -4400,88 +5453,499 @@
                         ${introExpanded ? `<div class="mt-3 text-xs text-slate-300 leading-6 rounded-xl border border-slate-700/90 bg-slate-950/45 px-3 py-2">${escapeHtml(introText)}</div>` : ''}
                     </div>
                 `;
-            }).join('');
+            };
+            const inboxTasks = tasks.filter((task) => String(task?.task_type || 'scan') === 'inbox');
+            const scanTasks = tasks.filter((task) => String(task?.task_type || 'scan') !== 'inbox');
+            const inboxHtml = inboxTasks.map(renderTaskCard).join('');
+            const scanHtml = scanTasks.map(renderTaskCard).join('');
+            container.innerHTML = scanHtml || `<div class="rounded-2xl border border-dashed border-slate-700 p-8 text-center text-slate-400 text-sm">还没有文件夹监控任务，点击“新增任务”即可创建。</div>`;
+            if (inboxContainer) {
+                inboxContainer.innerHTML = inboxHtml || `<div class="rounded-2xl border border-dashed border-slate-700 p-8 text-center text-slate-400 text-sm">还没有接收夹任务，点击“新增接收夹”即可给某个网盘加一个。</div>`;
+            }
         }
 
-        function buildMonitorLogSignature() {
-            const segments = Array.isArray(monitorState.log_segments) && monitorState.log_segments.length
-                ? monitorState.log_segments
-                : [{ id: 'legacy', entries: monitorState.logs || [] }];
-            return buildLogSignature(segments, (segment) => {
-                const entries = Array.isArray(segment?.entries) ? segment.entries : [];
-                return `${segment?.id || ''}:${segment?.entry_count || entries.length}:${segment?.complete ? 1 : 0}:${entries.map((item) => `${item?.level || 'info'}:${item?.text || ''}`).join('||')}`;
+        const monitorRunStatusLabels = window.MonitorRunView.statuses;
+        function monitorRunTime(value) { return window.MonitorRunView.time(value); }
+        function monitorRunSources(run) { return window.MonitorRunView.sourceText(run); }
+
+        function renderMonitorRunFilters() {
+            const select = document.getElementById('monitor-run-task-filter');
+            if (!select) return;
+            const previous = select.value;
+            const taskLabels = new Map();
+            (monitorState.tasks || []).forEach(task => {
+                const name = String(task?.name || '').trim();
+                if (!name) return;
+                const typeLabel = String(task?.task_type || 'scan') === 'inbox' ? '接收夹整理' : '目录监控';
+                taskLabels.set(name, `${name}（${typeLabel}）`);
+            });
+            if (previous && !taskLabels.has(previous)) taskLabels.set(previous, previous);
+            select.innerHTML = `<option value="">全部配置任务</option>${[...taskLabels.entries()].map(([name, label]) => `<option value="${escapeHtml(name)}">${escapeHtml(label)}</option>`).join('')}`;
+            select.value = previous;
+        }
+
+        function updateMonitorRunSummary() {
+            const summary = document.getElementById('monitor-run-summary');
+            const previous = document.getElementById('monitor-run-prev');
+            const next = document.getElementById('monitor-run-next');
+            const pageLabel = document.getElementById('monitor-run-page-label');
+            const previousBottom = document.getElementById('monitor-run-prev-bottom');
+            const nextBottom = document.getElementById('monitor-run-next-bottom');
+            const pageLabelBottom = document.getElementById('monitor-run-page-label-bottom');
+            const runs = Array.isArray(monitorState.runs) ? monitorState.runs : [];
+            if (summary) summary.innerText = monitorRunLoadBusy ? '正在加载运行记录...' : `按开始时间排序 · 本页 ${runs.length} 条`;
+            if (pageLabel) pageLabel.innerText = `第 ${monitorRunPage} 页`;
+            if (previous) previous.disabled = monitorRunLoadBusy || monitorRunPage <= 1;
+            if (next) next.disabled = monitorRunLoadBusy || !monitorRunPageHasMore;
+            if (pageLabelBottom) pageLabelBottom.innerText = `第 ${monitorRunPage} 页`;
+            if (previousBottom) previousBottom.disabled = monitorRunLoadBusy || monitorRunPage <= 1;
+            if (nextBottom) nextBottom.disabled = monitorRunLoadBusy || !monitorRunPageHasMore;
+        }
+
+        function renderMonitorLogs() {
+            const box = document.getElementById('monitor-run-list');
+            if (!box) return;
+            renderMonitorRunFilters();
+            monitorRunPage = Number(monitorState.run_page || 1);
+            monitorRunPageHasMore = !!monitorState.run_has_more;
+            monitorRunPageCursors[monitorRunPage] = String(monitorState.run_next_cursor || '');
+            const runs = Array.isArray(monitorState.runs) ? monitorState.runs : [];
+            box.innerHTML = runs.length ? runs.map(window.MonitorRunView.listRow).join('')
+                : `<div class="monitor-run-empty">${monitorState.run_filtered ? '没有符合筛选条件的记录，可调整筛选后查看。' : '暂无运行记录。扫描或接收夹整理开始后，将在这里显示过程和结果。'}</div>`;
+            document.getElementById('monitor-run-pagination-bottom')?.classList.toggle('hidden', !runs.length);
+            updateMonitorRunSummary();
+            syncMonitorRunFilterReset();
+            syncMonitorRunTaskClearButton();
+            lastMonitorRunRenderKey = buildMonitorRunRenderKey(monitorState);
+        }
+
+        function monitorRunFilterQuery() {
+            return {
+                task_name: document.getElementById('monitor-run-task-filter')?.value || '',
+                run_kind: document.getElementById('monitor-run-kind-filter')?.value || '',
+                source_group: document.getElementById('monitor-run-source-filter')?.value || '',
+                status_group: document.getElementById('monitor-run-status-filter')?.value || '',
+            };
+        }
+
+        function syncMonitorRunFilterReset() {
+            const button = document.getElementById('monitor-run-filter-reset');
+            if (!button) return;
+            button.classList.toggle('hidden', !Object.values(monitorRunFilterQuery()).some(Boolean));
+        }
+
+        // “清空”按当前所选任务生效：只有在任务筛选里选中了具体任务时才出现。
+        function monitorRunSelectedTaskName() {
+            return String(document.getElementById('monitor-run-task-filter')?.value || '').trim();
+        }
+
+        function syncMonitorRunTaskClearButton() {
+            const button = document.getElementById('monitor-run-clear-task');
+            if (!button) return;
+            const taskName = monitorRunSelectedTaskName();
+            button.classList.toggle('hidden', !taskName);
+            button.setAttribute(
+                'title',
+                taskName ? `清空「${taskName}」的已结束运行记录` : '请先在上方选择一个监控任务',
+            );
+        }
+
+        async function resetMonitorRunFilters() {
+            ['monitor-run-task-filter', 'monitor-run-kind-filter', 'monitor-run-source-filter', 'monitor-run-status-filter']
+                .forEach(id => {
+                    const control = document.getElementById(id);
+                    if (control) control.value = '';
+                });
+            // 立刻收起按钮并作废渲染键：即使随后的请求较慢或被状态推送打断，
+            // 下一次渲染也会按“无筛选”重画，不会停留在旧筛选结果上。
+            syncMonitorRunFilterReset();
+            lastMonitorRunRenderKey = '';
+            await refreshMonitorRuns();
+        }
+
+        async function fetchMonitorRunPage(page, cursor = '') {
+            const revision = ++monitorRunRequestRevision;
+            const filters = monitorRunFilterQuery();
+            monitorRunLoadBusy = true;
+            monitorState = { ...monitorState, run_filtered: Object.values(filters).some(Boolean), run_loading: true };
+            updateMonitorRunSummary();
+            try {
+                // 与后端 build_monitor_status_payload 的 list_runs(limit=5) 保持一致，
+                // 否则首屏会被状态推送重新填成 10 条。
+                const query = new URLSearchParams({ limit: '5', cursor, ...filters });
+                const data = await window.MediaHubApi.getJson(`/monitor/runs?${query.toString()}`);
+                if (revision !== monitorRunRequestRevision) return;
+                if (page === 1) monitorRunPageCursors = [''];
+                monitorState = {
+                    ...monitorState, runs: Array.isArray(data?.runs) ? data.runs : [], run_page: page,
+                    run_has_more: !!data?.has_more, run_next_cursor: String(data?.next_cursor || ''),
+                };
+                renderMonitorLogs();
+            } catch (e) {
+                if (revision === monitorRunRequestRevision) {
+                    document.getElementById('monitor-run-list').innerHTML = '<div class="monitor-run-empty" role="alert">运行记录加载失败，请点击刷新重试。</div>';
+                    showToast('运行记录加载失败，请重试。', { tone: 'error' });
+                }
+            } finally {
+                if (revision === monitorRunRequestRevision) {
+                    monitorRunLoadBusy = false;
+                    monitorState = { ...monitorState, run_loading: false };
+                    updateMonitorRunSummary();
+                }
+            }
+        }
+
+        async function refreshMonitorRuns() { return fetchMonitorRunPage(1); }
+
+        async function loadMonitorRunPage(direction) {
+            const nextPage = monitorRunPage + (Number(direction) < 0 ? -1 : 1);
+            if (monitorRunLoadBusy || nextPage < 1 || (Number(direction) > 0 && !monitorRunPageHasMore)) return;
+            return fetchMonitorRunPage(nextPage, monitorRunPageCursors[nextPage - 1] || '');
+        }
+
+        function renderMonitorRunDetail(detail) {
+            const run = detail?.run || {};
+            const body = document.getElementById('monitor-run-modal-body');
+            if (!body) return;
+            document.getElementById('monitor-run-modal-eyebrow').innerText = monitorRunSources(run);
+            document.getElementById('monitor-run-modal-title').innerText = `${run.task_name || '文件夹监控'} · ${run.subject || '全部目录'}`;
+            document.getElementById('monitor-run-modal-meta').innerText = `${run.started_at ? '开始' : '入队'} ${monitorRunTime(run.started_at || run.queued_at)}${run.finished_at ? ` · 结束 ${monitorRunTime(run.finished_at)}` : ''}`;
+            // 当前页签可能对这条运行不适用（例如切换运行后），统一回到概览。
+            activeMonitorRunCategory = window.MonitorRunView.resolveTab(detail, activeMonitorRunCategory);
+            const tabs = document.getElementById('monitor-run-tabs');
+            if (tabs) tabs.innerHTML = window.MonitorRunView.tabsHtml(detail, activeMonitorRunCategory);
+            body.innerHTML = window.MonitorRunView.detailHtml(detail, activeMonitorRunCategory);
+        }
+
+        // 四个页签互斥：切换只重渲染当前页签，不重新请求（事件快照一次取全）。
+        function setMonitorRunTab(category) {
+            activeMonitorRunCategory = String(category || '');
+            if (!monitorRunDetailData) return;
+            renderMonitorRunDetail(monitorRunDetailData);
+        }
+
+        window.setMonitorRunTab = setMonitorRunTab;
+
+        async function openMonitorRun(runId) {
+            const modal = document.getElementById('monitor-run-modal');
+            if (!runId || !modal) return;
+            if (!activeMonitorRunId) monitorRunReturnFocus = document.activeElement;
+            activeMonitorRunId = String(runId);
+            activeMonitorRunCategory = '';
+            monitorRunDetailData = null;
+            showLockedModal('monitor-run-modal');
+            modal.querySelector('.monitor-run-close')?.focus();
+            await loadMonitorRunDetail();
+        }
+
+        async function loadMonitorRunDetail({ append = false, quiet = false } = {}) {
+            clearTimeout(monitorRunDetailTimer);
+            const runId = activeMonitorRunId;
+            if (!runId) return;
+            const revision = ++monitorRunDetailRevision;
+            const body = document.getElementById('monitor-run-modal-body');
+            const scroll = body.scrollTop;
+            if (!quiet && !append) {
+                body.innerHTML = '<div class="monitor-run-empty" role="status">正在加载运行详情...</div>';
+                body.scrollTop = 0;
+            }
+            body.setAttribute('aria-busy', 'true');
+            try {
+                const query = new URLSearchParams({
+                    offset: String(append ? monitorRunDetailData?.next_offset || 0 : 0), limit: '50',
+                });
+                const data = await window.MediaHubApi.getJson(`/monitor/runs/${encodeURIComponent(runId)}?${query.toString()}`);
+                if (revision !== monitorRunDetailRevision || runId !== activeMonitorRunId) return;
+                const loadedMore = Number(monitorRunDetailData?.next_offset || 0) > 50;
+                if (append && monitorRunDetailData) {
+                    data.events = [...monitorRunDetailData.events, ...(data.events || [])];
+                    monitorRunDetailData = data;
+                } else if (quiet && loadedMore && monitorRunDetailData) {
+                    // 静默刷新只更新摘要与第一页：保留已加载的分页，新增记录用提示告知。
+                    const previousTotal = Number(monitorRunDetailData.total || 0);
+                    monitorRunDetailData = {
+                        ...monitorRunDetailData,
+                        run: data.run,
+                        counts: data.counts,
+                        total: data.total,
+                        stale: Number(data.total || 0) > previousTotal,
+                    };
+                } else {
+                    monitorRunDetailData = data;
+                }
+                renderMonitorRunDetail(monitorRunDetailData);
+                if (quiet || append) body.scrollTop = scroll;
+                if (['queued', 'running', 'waiting'].includes(data.run?.status) && !data.has_more) {
+                    // 静默刷新只更新概览数字与页签计数，不打断当前页签与已加载分页。
+                    monitorRunDetailTimer = setTimeout(() => loadMonitorRunDetail({ quiet: true }), 5000);
+                }
+            } catch (e) {
+                if (revision === monitorRunDetailRevision && runId === activeMonitorRunId) {
+                    if (append || quiet) showToast('更新详情失败，可点击刷新重试。', { tone: 'error' });
+                    else body.innerHTML = '<div class="monitor-run-empty" role="alert">无法加载运行详情。<button type="button" class="log-header-btn" onclick="refreshMonitorRunDetail()">重新加载</button></div>';
+                }
+            } finally {
+                if (revision === monitorRunDetailRevision) body.setAttribute('aria-busy', 'false');
+            }
+        }
+
+        async function loadMoreMonitorRunEvents() {
+            if (!monitorRunDetailData?.has_more) return;
+            await loadMonitorRunDetail({ append: true });
+        }
+
+        function refreshMonitorRunDetail() {
+            if (!activeMonitorRunId) return;
+            monitorRunDetailData = null;
+            void loadMonitorRunDetail();
+        }
+
+        window.refreshMonitorRunDetail = refreshMonitorRunDetail;
+
+        function reloadMonitorRunDetail() {
+            if (!activeMonitorRunId) return;
+            monitorRunDetailData = null;
+            void loadMonitorRunDetail();
+        }
+
+        window.reloadMonitorRunDetail = reloadMonitorRunDetail;
+
+        function closeMonitorRunModal() {
+            ++monitorRunDetailRevision;
+            clearTimeout(monitorRunDetailTimer);
+            hideLockedModal('monitor-run-modal');
+            activeMonitorRunId = '';
+            monitorRunDetailData = null;
+            monitorRunReturnFocus?.focus();
+        }
+
+        async function retryMonitorRun() {
+            if (!activeMonitorRunId || monitorRunActionBusy) return;
+            monitorRunActionBusy = true;
+            try {
+                const data = await window.MediaHubApi.postJson(`/monitor/runs/${encodeURIComponent(activeMonitorRunId)}/retry`, {});
+                const previousRunId = activeMonitorRunId;
+                showToast('已按原范围创建新的运行记录。', { tone: 'success', placement: 'top-center' });
+                await refreshMonitorRuns();
+                if (activeMonitorRunId === previousRunId) await openMonitorRun(data?.run_id || previousRunId);
+            } catch (e) {
+                showToast(`重试失败：${e?.message || '未知错误'}`, { tone: 'error', placement: 'top-center' });
+            } finally { monitorRunActionBusy = false; }
+        }
+
+        async function cancelMonitorRun() {
+            if (!activeMonitorRunId || monitorRunActionBusy) return;
+            monitorRunActionBusy = true;
+            try {
+                await window.MediaHubApi.postJson(`/monitor/runs/${encodeURIComponent(activeMonitorRunId)}/cancel`, {});
+                showToast('已取消尚未开始的运行。', { tone: 'success', placement: 'top-center' });
+                await refreshMonitorRuns();
+                refreshMonitorRunDetail();
+            } catch (e) {
+                showToast(`取消失败：${e?.message || '未知错误'}`, { tone: 'error', placement: 'top-center' });
+            } finally { monitorRunActionBusy = false; }
+        }
+        const LEGACY_MONITOR_LOG_LIMIT = 10;
+        let legacyMonitorLogClearBusy = false;
+        let legacyMonitorLogOffset = 0;
+        let legacyMonitorLogHasMore = false;
+        let legacyMonitorLogLoading = false;
+
+        function setLegacyMonitorLogStatus(message, tone = 'info') {
+            const status = document.getElementById('monitor-legacy-log-status');
+            if (!status) return;
+            status.innerText = String(message || '');
+            status.classList.toggle('is-error', String(tone) === 'error');
+        }
+
+        function updateLegacyMonitorLogMoreButton() {
+            const wrap = document.getElementById('monitor-legacy-log-more');
+            if (wrap) wrap.classList.toggle('hidden', !legacyMonitorLogHasMore);
+        }
+
+        async function loadLegacyMonitorLogs({ append = false } = {}) {
+            const body = document.getElementById('monitor-legacy-log-body');
+            if (!body || legacyMonitorLogLoading) return;
+            legacyMonitorLogLoading = true;
+            const offset = append ? legacyMonitorLogOffset : 0;
+            if (!append) body.innerText = '正在加载...';
+            else setLegacyMonitorLogStatus('正在加载更早的日志…');
+            try {
+                const data = await window.MediaHubApi.getJson(
+                    `/monitor/logs/tasks?limit=${LEGACY_MONITOR_LOG_LIMIT}&offset=${offset}`,
+                );
+                const text = (data?.segments || [])
+                    .flatMap(segment => segment?.entries || [])
+                    .map(item => item?.text || '')
+                    .join('\n');
+                if (append) {
+                    body.innerText = text ? `${text}\n${body.innerText}` : body.innerText;
+                    setLegacyMonitorLogStatus(text ? '' : '没有更早的日志了。');
+                } else {
+                    body.innerText = text || '暂无历史文本日志';
+                }
+                legacyMonitorLogOffset = Number(data?.next_offset || 0) || 0;
+                legacyMonitorLogHasMore = !!data?.has_more;
+            } catch (e) {
+                if (append) setLegacyMonitorLogStatus('加载更早的日志失败，请稍后重试。', 'error');
+                else body.innerText = '无法加载历史文本日志。';
+            } finally {
+                legacyMonitorLogLoading = false;
+                updateLegacyMonitorLogMoreButton();
+            }
+        }
+
+        function loadMoreLegacyMonitorLogs() {
+            if (legacyMonitorLogLoading || !legacyMonitorLogHasMore) return;
+            void loadLegacyMonitorLogs({ append: true });
+        }
+
+        function openLegacyMonitorLogs() {
+            const modal = document.getElementById('monitor-legacy-log-modal');
+            if (!modal) return;
+            setLegacyMonitorLogStatus('');
+            legacyMonitorLogOffset = 0;
+            legacyMonitorLogHasMore = false;
+            updateLegacyMonitorLogMoreButton();
+            modal.classList.remove('hidden');
+            void loadLegacyMonitorLogs();
+        }
+
+        async function clearLegacyMonitorLogs() {
+            if (legacyMonitorLogClearBusy) return;
+            const confirmed = await showAppConfirm('将删除全部历史文本日志（含轮转备份）。运行记录不受影响，可在“记录管理”里单独清理。是否继续？', {
+                title: '清空历史文本日志',
+                confirmText: '清空日志',
+                tone: 'warn',
+            });
+            if (!confirmed) return;
+            const button = document.getElementById('monitor-legacy-log-clear');
+            legacyMonitorLogClearBusy = true;
+            if (button) button.disabled = true;
+            setLegacyMonitorLogStatus('正在清空历史文本日志…');
+            try {
+                await clearMonitorLogs();
+                await loadLegacyMonitorLogs();
+                setLegacyMonitorLogStatus('已清空历史文本日志。运行记录未受影响。');
+                showToast('已清空历史文本日志', { tone: 'success', placement: 'top-center' });
+            } catch (error) {
+                setLegacyMonitorLogStatus(`清空失败：${error?.message || '未知错误'}，请稍后重试。`, 'error');
+            } finally {
+                legacyMonitorLogClearBusy = false;
+                if (button) button.disabled = false;
+            }
+        }
+        function closeLegacyMonitorLogs() { document.getElementById('monitor-legacy-log-modal')?.classList.add('hidden'); }
+        function openMonitorRunRetention() {
+            const retention = monitorState.run_retention || { mode: 'longterm', days: 30 };
+            document.getElementById(`monitor-run-retention-${retention.mode === 'days' ? 'days' : 'longterm'}`).checked = true;
+            document.getElementById('monitor-run-retention-days-input').value = Number(retention.days || 30);
+            setMonitorRunRetentionResult('');
+            syncMonitorRunRetentionUI();
+            document.getElementById('monitor-run-retention-modal')?.classList.remove('hidden');
+        }
+        function closeMonitorRunRetention() { document.getElementById('monitor-run-retention-modal')?.classList.add('hidden'); }
+        function setMonitorRunRetentionResult(message, tone = 'info') { const result = document.getElementById('monitor-run-retention-result'); if (!result) return; result.innerText = message; result.classList.toggle('is-error', tone === 'error'); }
+        function monitorRunRetentionSettings() {
+            const mode = document.getElementById('monitor-run-retention-days')?.checked ? 'days' : 'longterm';
+            const days = Math.max(1, Number(document.getElementById('monitor-run-retention-days-input')?.value || 30));
+            return { mode, days };
+        }
+        function syncMonitorRunRetentionUI() {
+            const { mode } = monitorRunRetentionSettings();
+            const enabled = mode === 'days';
+            document.getElementById('monitor-run-retention-days-wrap')?.classList.toggle('is-disabled', !enabled);
+            document.getElementById('monitor-run-retention-days-input').disabled = !enabled;
+            ['monitor-run-preview-expired', 'monitor-run-cleanup-expired'].forEach(id => {
+                const button = document.getElementById(id);
+                if (button) button.disabled = !enabled;
             });
         }
-
-        function updateMonitorLogSegmentSummary() {
-            const summary = document.getElementById('monitor-log-segment-summary');
-            const loadMoreBtn = document.getElementById('monitor-log-load-more');
-            if (summary) {
-                const total = Number(monitorState.log_segment_total || 0) || 0;
-                const visible = Array.isArray(monitorState.log_segments) && monitorState.log_segments.length
-                    ? monitorState.log_segments.filter(segment => String(segment?.kind || '') === 'task').length || monitorState.log_segments.length
-                    : (Array.isArray(monitorState.logs) ? 1 : 0);
-                summary.innerText = total > 0 ? `已显示最近 ${visible} / ${total} 条任务` : '暂无任务日志';
-            }
-            if (loadMoreBtn) {
-                const hasMore = !!monitorState.log_segment_has_more;
-                loadMoreBtn.classList.toggle('hidden', !hasMore);
-                loadMoreBtn.disabled = !hasMore || monitorLogLoadBusy;
-                loadMoreBtn.innerText = monitorLogLoadBusy ? '加载中...' : '加载更早 3 条';
-            }
-        }
-
-        function renderMonitorLogs({ preserveScroll = false } = {}) {
-            const box = document.getElementById('monitor-log-box');
-            const segments = Array.isArray(monitorState.log_segments) && monitorState.log_segments.length
-                ? monitorState.log_segments
-                : null;
-            const logSignature = buildMonitorLogSignature();
-            if (logSignature === lastMonitorLogSignature) {
-                updateMonitorLogSegmentSummary();
-                return;
-            }
-            const previousScrollTop = preserveScroll ? box.scrollTop : 0;
-            const previousScrollHeight = preserveScroll ? box.scrollHeight : 0;
-            const logs = segments
-                ? segments.flatMap(segment => Array.isArray(segment?.entries) ? segment.entries : [])
-                : (monitorState.logs || []);
-            box.innerHTML = logs.map(item => `<div class="${getLogEntryClass(item)}">${formatMonitorLogHtml(item)}</div>`).join('');
-            if (preserveScroll) {
-                box.scrollTop = Math.max(0, box.scrollHeight - previousScrollHeight + previousScrollTop);
-            } else {
-                box.scrollTop = box.scrollHeight;
-            }
-            lastMonitorLogSignature = logSignature;
-            updateMonitorLogSegmentSummary();
-        }
-
-        async function loadOlderMonitorLogs() {
-            if (monitorLogLoadBusy || !monitorState.log_segment_has_more) return;
-            monitorLogLoadBusy = true;
-            updateMonitorLogSegmentSummary();
+        async function saveMonitorRunRetention() {
+            const { mode, days } = monitorRunRetentionSettings();
             try {
-                const offset = Array.isArray(monitorState.log_segments)
-                    ? monitorState.log_segments.filter(segment => String(segment?.kind || '') === 'task').length
-                    : 0;
-                const data = await window.MediaHubApi.getJson(`/monitor/logs/tasks?offset=${offset}&limit=3`);
-                const olderSegments = Array.isArray(data?.segments) ? data.segments : [];
-                const currentSegments = Array.isArray(monitorState.log_segments) ? monitorState.log_segments : [];
-                const existingIds = new Set(currentSegments.map(segment => String(segment?.id || '')).filter(Boolean));
-                const merged = [
-                    ...olderSegments.filter(segment => !existingIds.has(String(segment?.id || ''))),
-                    ...currentSegments,
-                ];
-                monitorState = {
-                    ...monitorState,
-                    log_segments: merged,
-                    log_segment_total: Number(data?.total || monitorState.log_segment_total || merged.length) || merged.length,
-                    log_segment_has_more: !!data?.has_more,
-                };
-                renderMonitorLogs({ preserveScroll: true });
-            } catch (e) {}
-            monitorLogLoadBusy = false;
-            updateMonitorLogSegmentSummary();
+                const data = await window.MediaHubApi.postJson('/monitor/runs/retention', { mode, days });
+                monitorState = { ...monitorState, run_retention: data.retention || { mode, days } };
+                setMonitorRunRetentionResult(mode === 'days' ? `已保存：保留最近 ${days} 天的已结束记录。` : '已保存：长期保留，不自动按时间清理。');
+            } catch (error) { setMonitorRunRetentionResult('保存保留策略失败，请稍后重试。', 'error'); }
+        }
+        async function requestMonitorRunCleanup(scope, { preview = false, taskName = '' } = {}) {
+            const { mode, days } = monitorRunRetentionSettings();
+            if (scope === 'expired' && mode !== 'days') {
+                setMonitorRunRetentionResult('请先选择“保留最近 N 天”，再清理过期记录。', 'error');
+                return null;
+            }
+            return window.MediaHubApi.postJson('/monitor/runs/cleanup', {
+                scope,
+                days: scope === 'expired' ? days : 0,
+                preview,
+                task_name: String(taskName || '').trim(),
+            });
+        }
+        async function previewMonitorRunCleanup() {
+            const { days } = monitorRunRetentionSettings();
+            try {
+                const data = await requestMonitorRunCleanup('expired', { preview: true });
+                if (!data) return;
+                const count = Number(data.count || 0);
+                setMonitorRunRetentionResult(count ? `预计清理 ${count} 条早于 ${days} 天的已结束记录。` : `没有早于 ${days} 天的已结束记录，无需清理。`);
+            } catch (error) { setMonitorRunRetentionResult('预览过期记录失败，请稍后重试。', 'error'); }
+        }
+        async function runMonitorRunCleanup() {
+            const { days } = monitorRunRetentionSettings();
+            try {
+                const preview = await requestMonitorRunCleanup('expired', { preview: true });
+                if (!preview) return;
+                const count = Number(preview.count || 0);
+                if (!count) { setMonitorRunRetentionResult(`没有早于 ${days} 天的已结束记录，无需清理。`); return; }
+                if (!(await showAppConfirm(`将清理 ${count} 条早于 ${days} 天的已结束记录。运行中和等待后续同步的记录会保留。是否继续？`))) return;
+                const data = await requestMonitorRunCleanup('expired');
+                setMonitorRunRetentionResult(`已清理 ${Number(data.deleted || 0)} 条过期记录。`);
+                await refreshMonitorRuns(true);
+            } catch (error) { setMonitorRunRetentionResult('清理过期记录失败，请稍后重试。', 'error'); }
+        }
+        async function runMonitorRunCleanupAll() {
+            try {
+                const preview = await requestMonitorRunCleanup('all_finished', { preview: true });
+                const count = Number(preview?.count || 0);
+                if (!count) { setMonitorRunRetentionResult('没有可清除的已结束记录。'); return; }
+                if (!(await showAppConfirm(`将清除 ${count} 条已结束记录。运行中、排队中、等待后续同步及其依赖记录会保留。是否继续？`))) return;
+                const data = await requestMonitorRunCleanup('all_finished');
+                setMonitorRunRetentionResult(`已清除 ${Number(data.deleted || 0)} 条已结束记录。`);
+                await refreshMonitorRuns(true);
+            } catch (error) { setMonitorRunRetentionResult('清除全部已结束记录失败，请稍后重试。', 'error'); }
+        }
+
+        async function clearMonitorRunTaskRecords() {
+            const taskName = monitorRunSelectedTaskName();
+            if (!taskName || monitorRunActionBusy) return;
+            monitorRunActionBusy = true;
+            const button = document.getElementById('monitor-run-clear-task');
+            if (button) button.disabled = true;
+            try {
+                const preview = await requestMonitorRunCleanup('all_finished', { preview: true, taskName });
+                const count = Number(preview?.count || 0);
+                if (!count) {
+                    showToast(`「${taskName}」没有可清除的已结束记录。`, { tone: 'info', placement: 'top-center' });
+                    return;
+                }
+                const confirmed = await showAppConfirm(
+                    `将清除「${taskName}」的 ${count} 条已结束运行记录。运行中、排队中、等待后续同步的记录会保留，网盘文件与本地播放文件不受影响。是否继续？`,
+                    { title: '清空该任务记录', confirmText: '清空记录', tone: 'warn' },
+                );
+                if (!confirmed) return;
+                const data = await requestMonitorRunCleanup('all_finished', { taskName });
+                showToast(`已清除「${taskName}」的 ${Number(data?.deleted || 0)} 条运行记录。`, {
+                    tone: 'success',
+                    placement: 'top-center',
+                });
+                await refreshMonitorRuns();
+            } catch (error) {
+                showToast(`清空该任务记录失败：${error?.message || '未知错误'}`, { tone: 'error', placement: 'top-center' });
+            } finally {
+                monitorRunActionBusy = false;
+                if (button) button.disabled = false;
+            }
         }
 
         async function refreshMainLogs({ compact = false } = {}) {

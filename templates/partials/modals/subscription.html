@@ -94,6 +94,39 @@
                         <input type="checkbox" id="subscription_anime_mode" class="ui-checkbox">
                         多季合一（功能已下线）
                     </label>
+                    <div id="subscription-organize-block" class="rounded-2xl border border-slate-700 bg-slate-900/60 p-4 space-y-3">
+                        <label class="flex items-start gap-3 cursor-pointer text-sm">
+                            <input type="checkbox" id="subscription_organize_on_import" class="ui-checkbox mt-0.5" checked onchange="syncSubscriptionOrganizeUI()">
+                            <span class="min-w-0">
+                                <span class="block font-bold text-slate-100">入库后整理（电视剧）</span>
+                                <span class="block text-[11px] text-slate-500 mt-1 leading-5">只用现有刮削引擎把新集原地改名成「片名 - S01E02」这类标准名，不建目录、不移动文件；没有绑定 TMDB、或识别不出集数时保留原名。</span>
+                            </span>
+                        </label>
+                        <div id="subscription-organize-options" class="space-y-3">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <label class="block">
+                                    <span class="text-xs text-slate-500">标题语言</span>
+                                    <select id="subscription_organize_title_language" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
+                                        <option value="zh">中文名</option>
+                                        <option value="auto">跟随 TMDB 配置</option>
+                                        <option value="en">英文名</option>
+                                    </select>
+                                </label>
+                                <label class="block">
+                                    <span class="text-xs text-slate-500">文件命名方式</span>
+                                    <select id="subscription_organize_file_name_mode" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
+                                        <option value="standard">按识别结果重命名</option>
+                                        <option value="clean">仅清理广告信息（保留原始命名）</option>
+                                        <option value="keep">保持原名（不重命名）</option>
+                                    </select>
+                                </label>
+                            </div>
+                            <label class="flex items-center gap-3 cursor-pointer text-sm">
+                                <input type="checkbox" id="subscription_organize_delete_ad_files" class="ui-checkbox">
+                                <span>整理时删除广告文件（图片/网页/文本，删除进入网盘回收站）</span>
+                            </label>
+                        </div>
+                    </div>
                     <div class="space-y-2">
                         <div id="subscription-savepath-provider-label" class="text-xs text-slate-500">115 保存目录</div>
                         <div class="resource-save-path-grid">
@@ -261,6 +294,7 @@
                     </div>
                     <div class="flex flex-col sm:flex-row gap-2">
                         <input id="subscription-folder-create-name" class="w-full sm:flex-1 bg-slate-900 border border-slate-700 rounded-xl p-3 text-sm" placeholder="在当前目录新建文件夹（例如：电影）">
+                        <button id="subscription-folder-recommend-btn" type="button" onclick="applySubscriptionRecommendedFolderName()" class="px-4 py-3 rounded-xl bg-sky-500/15 hover:bg-sky-500/25 text-sky-200 text-sm font-bold whitespace-nowrap border border-sky-500/30 hidden" title="一键填入推荐名称" aria-label="填入推荐名称">推荐名称</button>
                         <button id="subscription-folder-create-btn" type="button" onclick="createSubscriptionFolderInCurrent()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold whitespace-nowrap">新建文件夹</button>
                     </div>
                     <div id="subscription-folder-list" class="space-y-3"></div>
@@ -306,13 +340,13 @@
                     <input id="subscription-link-scan-task-name" type="hidden" value="">
                     <label class="block">
                         <span class="flex items-center justify-between gap-2">
-                            <span id="subscription-link-scan-input-label" class="subscription-link-scan-label">分享链接或完整分享文本</span>
+                            <span id="subscription-link-scan-input-label" class="subscription-link-scan-label">分享链接（每行一条，支持多条）</span>
                             <button id="subscription-link-scan-paste-btn" type="button" onclick="pasteSubscriptionLinkScan()" class="resource-search-input-action resource-search-paste-btn subscription-link-scan-paste-btn" aria-label="粘贴剪贴板内容">粘贴</button>
                         </span>
-                        <textarea id="subscription-link-scan-text" class="subscription-link-scan-input" rows="6" placeholder="粘贴分享链接，或包含链接与提取码的整段分享文本"></textarea>
+                        <textarea id="subscription-link-scan-text" class="subscription-link-scan-input" rows="6" placeholder="每行粘贴一条分享链接，或包含链接与提取码的整段分享文本；支持一次粘贴多条"></textarea>
                     </label>
                     <div id="subscription-link-scan-error" class="subscription-link-scan-error hidden"></div>
-                    <div id="subscription-link-scan-note" class="subscription-link-scan-note">提交后会跳过资源搜索，把这个链接当作已命中标题的候选资源，继续走订阅的集数识别、缺失判断和导入流程。</div>
+                    <div id="subscription-link-scan-note" class="subscription-link-scan-note">提交后会跳过资源搜索，把每条链接当作已命中标题的候选资源，按顺序继续走订阅的集数识别、缺失判断和导入流程。</div>
                 </div>
                 <div class="subscription-link-scan-footer">
                     <button type="button" onclick="closeSubscriptionLinkScanModal()" class="subscription-link-scan-btn subscription-link-scan-btn-secondary">取消</button>

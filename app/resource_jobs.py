@@ -143,24 +143,34 @@ def count_resource_jobs(status: str = "") -> int:
         row = cursor.fetchone()
     return int(row[0] if row else 0)
 
-def find_existing_resource_job(resource: Dict[str, Any], savepath: str) -> Dict[str, Any]:
+def find_existing_resource_job(
+    resource: Dict[str, Any],
+    savepath: str,
+    inbox_task_name: str = "",
+) -> Dict[str, Any]:
+    """按 savepath（+ 可选的接收夹归属）找同链接的已有导入任务。
+
+    传入 ``inbox_task_name`` 时只在这个接收夹的导入记录里查重：同一个分享链接导入
+    到不同网盘的同名目录时，两边各自算独立记录，不会互相误判「已有导入」。
+    """
     ensure_db()
     with db_connection() as conn:
         cursor = conn.cursor()
         normalized_savepath = normalize_relative_path(savepath)
+        normalized_inbox = str(inbox_task_name or "").strip()
         link_url = str(resource.get("link_url", "") or "").strip()
         message_url = str(resource.get("message_url", "") or "").strip()
         source_post_id = str(resource.get("source_post_id", "") or "").strip()
-        cursor.execute(
-            """
-            SELECT * FROM resource_jobs
-            WHERE savepath = ?
-              AND status IN ('pending', 'running', 'submitted', 'completed')
-            ORDER BY id DESC
-            LIMIT 40
-            """,
-            (normalized_savepath,),
+        sql = (
+            "SELECT * FROM resource_jobs WHERE savepath = ?"
+            " AND status IN ('pending', 'running', 'submitted', 'completed')"
         )
+        params: List[Any] = [normalized_savepath]
+        if normalized_inbox:
+            sql += " AND inbox_task_name = ?"
+            params.append(normalized_inbox)
+        sql += " ORDER BY id DESC LIMIT 40"
+        cursor.execute(sql, tuple(params))
         rows = cursor.fetchall()
     for row in rows:
         job = serialize_resource_job_row(row)
@@ -447,7 +457,7 @@ def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[st
         recovered = 0
         checked = 0
         recovered_resource_ids: Set[int] = set()
-        hint_text = "当前保存路径未纳入文件夹监控，导入成功后不会自动生成 strm"
+        hint_text = "未纳入文件夹监控，不会自动生成 STRM"
 
         for row in rows:
             data = sqlite_row_to_dict(row)
@@ -457,7 +467,8 @@ def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[st
             checked += 1
             detail = str(data.get("status_detail", "") or "").strip()
             next_detail = detail or hint_text
-            if hint_text not in next_detail:
+            # 旧记录里可能已经有老文案（小写 strm），避免重复追加同一层意思。
+            if hint_text not in next_detail and "不会自动生成 strm" not in next_detail.lower():
                 next_detail = f"{next_detail}；{hint_text}" if next_detail else hint_text
             cursor.execute(
                 """
@@ -543,6 +554,7 @@ def _build_resource_job_insert(resource: Dict[str, Any], data: Dict[str, Any]) -
     else:
         sharetitle = normalize_relative_path(resource.get("title", ""))
     monitor_task_name = str(data.get("monitor_task_name", "")).strip()
+    inbox_task_name = str(data.get("inbox_task_name", "") or "").strip()
     refresh_delay_seconds = max(0, int(data.get("refresh_delay_seconds", 0) or 0))
     auto_refresh = bool(data.get("auto_refresh", True))
     provider_label = (
@@ -569,6 +581,7 @@ def _build_resource_job_insert(resource: Dict[str, Any], data: Dict[str, Any]) -
             savepath,
             sharetitle,
             monitor_task_name,
+            inbox_task_name,
             refresh_delay_seconds,
             1 if auto_refresh else 0,
             status_detail,
@@ -592,10 +605,10 @@ def create_resource_jobs(entries: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -
                 """
                 INSERT INTO resource_jobs(
                     resource_id, title, link_url, link_type, folder_id, savepath, sharetitle,
-                    monitor_task_name, refresh_delay_seconds, auto_refresh, status, status_detail,
-                    created_at, updated_at, extra_json
+                    monitor_task_name, inbox_task_name, refresh_delay_seconds, auto_refresh,
+                    status, status_detail, created_at, updated_at, extra_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                 """,
                 record["params"],
             )

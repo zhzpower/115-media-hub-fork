@@ -528,12 +528,19 @@ def cmd_subscribe(args, c: Client):
 
     elif args.action == "start-with-link":
         link = args.link or ""
-        if not link:
-            sys.exit("请指定资源链接（--link 参数）")
+        links = [str(item or "").strip() for item in (args.links or []) if str(item or "").strip()]
+        if not link and not links:
+            sys.exit("请指定资源链接（--link 或 --links 参数）")
         name = " ".join(args.name) if args.name else ""
         if not name:
             sys.exit("请指定订阅名称")
-        data = c.json("POST", "/subscription/start_with_link", {"name": name, "link_url": link, "receive_code": args.receive_code or "", "savepath": args.savepath})
+        payload = {"name": name, "receive_code": args.receive_code or "", "savepath": args.savepath}
+        if links:
+            # 一次提交多条：后端按顺序排队执行，每条链接各自走一次扫描/离线入库
+            payload["links"] = [{"link_url": item} for item in links]
+        else:
+            payload["link_url"] = link
+        data = c.json("POST", "/subscription/start_with_link", payload)
         print(f"✅ 订阅已通过链接触发: {json.dumps(data, ensure_ascii=False)}")
 
 
@@ -841,7 +848,10 @@ def cmd_monitor(args, c: Client):
             path = str(t.get("scan_path", "") or "").strip()
             cron = t.get("cron_minutes", 0)
             enabled = "🟢" if t.get("enabled", True) else "🔴"
-            print(f"  {enabled} {name}  (扫描: {path}, 周期: {cron}分钟)")
+            kind = "接收夹" if str(t.get("task_type", "") or "scan") == "inbox" else "目录同步"
+            provider = str(t.get("provider", "") or "").strip() if kind == "接收夹" else ""
+            kind_text = f"{kind} · {provider}" if provider else kind
+            print(f"  {enabled} {name}  [{kind_text}]  (扫描: {path}, 周期: {cron}分钟)")
 
     elif args.action == "status":
         data = c.json("GET", "/monitor/status")
@@ -878,8 +888,6 @@ def cmd_monitor(args, c: Client):
             "retries": args.retries or 3,
             "list_delay_ms": args.list_delay_ms or 250,
             "min_file_size_mb": args.min_file_size_mb or 0,
-            "auto_scrape_on_new": args.auto_scrape_on_new,
-            "auto_scrape_options": _parse_auto_scrape_options(args.auto_scrape_options_json),
         }
         tasks.append(new_task)
         cfg["monitor_tasks"] = tasks
@@ -930,6 +938,48 @@ def cmd_monitor(args, c: Client):
             name = str(j.get("name", "") or j.get("task_name", "") or "").strip()
             status = j.get("status", "?")
             print(f"  • {name}  [{status}]")
+
+    elif args.action == "quick-import-status":
+        data = c.json("GET", "/scraper/quick-import/status")
+        # 接收夹按网盘隔离：每个接收夹的状态、目标、最近接收各自一份，逐个打印。
+        inboxes = data.get("inboxes") if isinstance(data.get("inboxes"), list) else []
+        if not inboxes:
+            print("没有接收夹任务")
+        else:
+            print(f"共 {len(inboxes)} 个接收夹：")
+        for inbox in inboxes:
+            if not isinstance(inbox, dict):
+                continue
+            name = str(inbox.get("task_name", "") or "(未命名)").strip()
+            provider = str(inbox.get("provider", "") or "115").strip()
+            enabled_text = "已启用" if inbox.get("enabled") else "未启用"
+            print(f"接收夹「{name}」（{provider}，{enabled_text}）")
+            print(f"  接收文件夹：{inbox.get('inbox_path') or '(未设置)'}")
+            targets = inbox.get("targets") if isinstance(inbox.get("targets"), dict) else {}
+            for key, label in (("movie", "电影"), ("tv", "电视剧")):
+                path = str((targets.get(key) or {}).get("target_path", "") or "").strip()
+                print(f"  {label}目标：{path or '(未设置)'}")
+            latest = inbox.get("latest") if isinstance(inbox.get("latest"), dict) else {}
+            if latest:
+                when = latest.get("finished_at") or latest.get("started_at") or "--"
+                print(f"  最近一次：{latest.get('summary') or '--'}（{when}）")
+                detail = inbox.get("latest_detail") if isinstance(inbox.get("latest_detail"), dict) else {}
+                for item in (detail.get("left") or [])[:10]:
+                    print(f"    · 留接收夹：{item.get('name') or '--'}：{item.get('reason') or ''}")
+            else:
+                print("  尚未执行过")
+            print(f"  最近 24 小时接收：{int(inbox.get('recent_job_count_24h', 0) or 0)} 个")
+            config_error = str(inbox.get("config_error", "") or "").strip()
+            if config_error:
+                print(f"  ⚠️ {config_error}")
+
+    elif args.action == "quick-import-run":
+        data = c.json("POST", "/scraper/quick-import/run", {"trigger": "cli"})
+        print(f"✅ {data.get('summary') or '快捷导入已完成'}")
+        for item in (data.get("moved") or [])[:20]:
+            print(f"  · 已分发：{item.get('name') or '--'} → {item.get('target') or '--'}")
+        for item in (data.get("left") or [])[:20]:
+            print(f"  · 留接收夹：{item.get('name') or '--'}：{item.get('reason') or ''}")
 
 
 def cmd_tree(args, c: Client):
@@ -1401,19 +1451,6 @@ def _build_scrape_plan_options(args) -> Dict[str, Any]:
             sys.exit("--options-json 必须是 JSON 对象")
         options.update(extra)
     return options
-
-
-def _parse_auto_scrape_options(raw: str) -> Dict[str, Any]:
-    """解析 monitor add 的 --auto-scrape-options-json，非法 JSON 直接报错退出。"""
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (ValueError, TypeError):
-        sys.exit("--auto-scrape-options-json 必须是合法 JSON 对象")
-    if not isinstance(parsed, dict):
-        sys.exit("--auto-scrape-options-json 必须是 JSON 对象")
-    return parsed
 
 
 def cmd_scrape(args, c: Client):
@@ -2082,6 +2119,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_sub.add_argument("--savepath", default="", help="115 保存路径（留空自动按媒体类型从常用目录推断）")
     sp_sub.add_argument("--provider", default="115", choices=["115", "quark"], help="网盘提供商")
     sp_sub.add_argument("--link", default="", help="资源链接 (start-with-link)：115 分享/磁力/电驴")
+    sp_sub.add_argument("--links", action="append", default=[], help="资源链接，可重复 (start-with-link)：一次提交多条，按顺序排队执行")
     sp_sub.add_argument("--task-name", default="", help="订阅名称 (rebuild/episodes)")
     # 补充参数
     sp_sub.add_argument("--title", default="", help="订阅标题（用于显示，可与名称不同）")
@@ -2168,7 +2206,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # monitor
     sp_mon = sp.add_parser("monitor", help="文件夹监控管理")
-    sp_mon.add_argument("action", choices=["list", "status", "start", "stop", "logs", "logs-clear", "userscript-jobs", "add", "remove"])
+    sp_mon.add_argument("action", choices=["list", "status", "start", "stop", "logs", "logs-clear", "userscript-jobs", "add", "remove", "quick-import-status", "quick-import-run"])
     sp_mon.add_argument("name", nargs="?", default="", help="监控任务名称 (add/remove)")
     sp_mon.add_argument("--scan-path", default="/", help="扫描路径 (add)")
     sp_mon.add_argument("--cron-minutes", type=int, default=0, help="定时周期分钟数, 0=仅手动 (add)")
@@ -2182,8 +2220,6 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_mon.add_argument("--retries", type=int, default=3, help="最大重试次数 (add)")
     sp_mon.add_argument("--list-delay-ms", type=int, default=250, help="列表请求延迟毫秒数 (add)")
     sp_mon.add_argument("--min-file-size-mb", type=float, default=0.0, help="最小文件大小 MB (add)")
-    sp_mon.add_argument("--auto-scrape-on-new", action="store_true", help="新增资源自动刮削整理 (add)")
-    sp_mon.add_argument("--auto-scrape-options-json", default="", help="自动整理选项 JSON 对象 (add)，如 {\"file_name_mode\":\"keep\"}")
 
     # tree
     sp_tree = sp.add_parser("tree", help="目录树同步")

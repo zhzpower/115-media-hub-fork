@@ -13,6 +13,7 @@ from app import db
 from app import core
 from app.services import monitor_changes
 from app.services import monitor
+from app.services import monitor_runs
 from app.services import scraper
 
 
@@ -95,13 +96,14 @@ class ScraperMonitorSyncTest(unittest.TestCase):
             handle.write(content)
         return path
 
-    def _run_confirmed(self, cfg, operation, entries, *, source_action="direct", dedupe_key="case"):
+    def _run_confirmed(self, cfg, operation, entries, *, source_action="direct", dedupe_key="case", monitor_run_id=""):
         prepared = monitor_changes.prepare_monitor_change_events(
             provider="115",
             operation=operation,
             entries=entries,
             source_action=source_action,
             dedupe_key=dedupe_key,
+            monitor_run_id=monitor_run_id,
             cfg=cfg,
         )
         confirmed = monitor_changes.confirm_monitor_change_events(prepared, succeeded=True, enqueue=False)
@@ -662,7 +664,9 @@ class ScraperMonitorSyncTest(unittest.TestCase):
             status = conn.execute("SELECT status FROM monitor_change_events").fetchone()[0]
         self.assertEqual(status, "manual_required")
 
-    def test_folder_move_collects_new_media_items_for_auto_scrape(self):
+    def test_folder_move_no_longer_collects_auto_scrape_items(self):
+        """监控回归纯扫描：变更同步不再产出自动整理条目（整理改由接收夹 / 订阅自理）。"""
+        # 旧开关即便还写在配置里，也会在归一化时被丢弃，不再触发整理。
         cfg = self._cfg(self._task(auto_scrape_on_new=True))
         old_local = "媒体库/Media/Source/Episode.mkv"
         self._insert_monitor_file("影视监控", old_local, "Source/Episode.mkv", size=4096)
@@ -685,11 +689,9 @@ class ScraperMonitorSyncTest(unittest.TestCase):
         )
 
         self.assertEqual(result["completed"], 1)
-        new_items = result.get("new_media_items", [])
-        self.assertEqual(len(new_items), 1)
-        self.assertEqual(new_items[0]["remote_rel"], "Moved/Episode.mkv")
-        self.assertIn("Episode.mkv", new_items[0]["name"])
-        self.assertEqual(new_items[0]["size"], 4096)
+        self.assertNotIn("new_media_items", result)
+        # STRM 仍按变更正常刷新（扫描本职不受影响）。
+        self.assertTrue(os.path.isfile(self._strm_path("媒体库/Media/Moved/Episode.mkv")))
 
     def test_scraper_job_change_events_skip_auto_scrape_items(self):
         cfg = self._cfg(self._task(auto_scrape_on_new=True))
@@ -715,7 +717,7 @@ class ScraperMonitorSyncTest(unittest.TestCase):
         )
 
         self.assertEqual(result["completed"], 1)
-        self.assertEqual(result.get("new_media_items", []), [])
+        self.assertNotIn("new_media_items", result)
 
     def test_folder_move_plus_file_rename_reports_net_strm_counts(self):
         cfg = self._cfg()
@@ -793,7 +795,7 @@ class ScraperMonitorSyncTest(unittest.TestCase):
         )
 
         self.assertEqual(result["completed"], 1)
-        self.assertEqual(result.get("new_media_items", []), [])
+        self.assertNotIn("new_media_items", result)
 
     def test_unknown_folder_move_collects_manual_required_path(self):
         cfg = self._cfg()
@@ -821,6 +823,60 @@ class ScraperMonitorSyncTest(unittest.TestCase):
         self.assertEqual(result["completed"], 1)
         self.assertEqual(result["manual_required"], 1)
         self.assertEqual(result["manual_required_paths"], ["Media/Copied"])
+        # 不是接收夹分发（没有归属运行）的变更不该被当成“分发出的条目”。
+        self.assertEqual(result["dispatched_item_paths"], [])
+
+    def test_inbox_dispatch_move_reports_one_follow_up_scope_per_item(self):
+        cfg = self._cfg()
+        inbox_run = monitor_runs.create_run(run_kind="inbox", task_name="最近接收", source="manual")
+        with patch.object(
+            monitor_changes,
+            "list_remote_dir",
+            AsyncMock(side_effect=AssertionError("unknown folders must not list the target subtree")),
+        ):
+            _, _, result = self._run_confirmed(
+                cfg,
+                "move",
+                [
+                    {
+                        "id": "movie-dir",
+                        "name": "怪物 (2026)",
+                        "path": "最近接收/怪物 (2026)",
+                        "new_path": "Media/怪物 (2026)",
+                        "new_cid": "movie-cid",
+                        "is_dir": True,
+                    }
+                ],
+                dedupe_key="inbox-dispatch-move",
+                monitor_run_id=inbox_run,
+            )
+
+        # 接收夹分发出来的每个条目都要能对应一条单独的运行记录。
+        self.assertEqual(result["dispatched_item_paths"], ["Media/怪物 (2026)"])
+
+    def test_inbox_dispatch_file_move_maps_to_its_media_folder(self):
+        cfg = self._cfg()
+        inbox_run = monitor_runs.create_run(run_kind="inbox", task_name="最近接收", source="manual")
+        with patch.object(monitor_changes, "list_remote_dir", AsyncMock(return_value=("", []))):
+            _, _, result = self._run_confirmed(
+                cfg,
+                "move",
+                [
+                    {
+                        "id": "ep-file",
+                        "name": "Episode.mkv",
+                        "path": "最近接收/Episode.mkv",
+                        "new_path": "Media/怪物 (2026)/Episode.mkv",
+                        "new_cid": "movie-cid",
+                        "is_dir": False,
+                        "size": 1024,
+                    }
+                ],
+                dedupe_key="inbox-dispatch-file-move",
+                monitor_run_id=inbox_run,
+            )
+
+        self.assertEqual(result["dispatched_item_paths"], ["Media/怪物 (2026)"])
 
     def test_unknown_folder_copy_requires_manual_monitor_without_remote_listing(self):
         cfg = self._cfg()
@@ -1271,7 +1327,7 @@ class ScraperMonitorSyncTest(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row[0], "manual_required")
         self.assertEqual(json.loads(row[1])["new_cid"], "")
-        self.assertEqual(row[2], "需手动监控")
+        self.assertEqual(row[2], "等待系统补扫")
 
     def test_zero_destination_cid_requires_manual_monitor_without_listing_root(self):
         cfg = self._cfg()
@@ -2090,7 +2146,6 @@ class ScraperMonitorSyncTest(unittest.TestCase):
                         "manual_required": 0,
                         "errors": [],
                         "change_details": [],
-                        "new_media_items": [],
                         "manual_required_paths": [],
                     }
                 ),
@@ -2101,6 +2156,86 @@ class ScraperMonitorSyncTest(unittest.TestCase):
         log_texts = [str(call.args[0]) for call in logs.await_args_list]
         self.assertIn("无待处理变更，本轮跳过", log_texts)
         self.assertFalse(any("变更同步汇总" in text for text in log_texts))
+
+    def test_process_monitor_change_events_accepts_nested_event_ids(self):
+        result = asyncio.run(
+            monitor_changes.process_monitor_change_events(
+                cfg=self._cfg(),
+                event_ids=[[1, "2"], (3, None), "invalid"],
+            )
+        )
+
+        self.assertEqual(result["completed"], 0)
+        self.assertEqual(result["failed"], 0)
+
+    def test_monitor_change_task_finishes_failed_when_error_logging_also_fails(self):
+        cfg = self._cfg()
+        run_id = monitor_runs.create_run(
+            run_kind="change",
+            task_name="影视监控",
+            source="change",
+        )
+        with (
+            patch.object(monitor, "_claim_monitor_job", return_value=True),
+            patch.object(monitor, "get_config", return_value=cfg),
+            patch.object(monitor, "write_monitor_task_header", AsyncMock(side_effect=RuntimeError("header failed"))),
+            patch.object(monitor, "write_monitor_log", AsyncMock(side_effect=RuntimeError("log failed"))),
+            patch.object(monitor, "write_monitor_task_footer", AsyncMock(side_effect=RuntimeError("footer failed"))),
+            patch.object(monitor, "update_monitor_summary"),
+            patch.object(monitor, "schedule_ui_state_push"),
+            patch.object(monitor, "_finish_monitor_job", AsyncMock()),
+            patch.object(monitor.logging, "exception"),
+        ):
+            asyncio.run(monitor.run_monitor_change_task("影视监控", run_id=run_id))
+
+        detail = monitor_runs.get_run_detail(run_id)["run"]
+        self.assertEqual(detail["status"], "failed")
+        self.assertTrue(detail["finished_at"])
+
+    def test_monitor_change_task_keeps_success_when_success_footer_fails(self):
+        cfg = self._cfg()
+        run_id = monitor_runs.create_run(
+            run_kind="change",
+            task_name="影视监控",
+            source="change",
+        )
+        with (
+            patch.object(monitor, "_claim_monitor_job", return_value=True),
+            patch.object(monitor, "get_config", return_value=cfg),
+            patch.object(monitor, "write_monitor_task_header", AsyncMock()),
+            patch.object(monitor, "write_monitor_section", AsyncMock()),
+            patch.object(monitor, "write_monitor_log", AsyncMock()),
+            patch.object(monitor, "write_monitor_task_footer", AsyncMock(side_effect=RuntimeError("footer failed"))),
+            patch.object(monitor, "update_monitor_summary"),
+            patch.object(monitor, "schedule_ui_state_push"),
+            patch.object(monitor, "_finish_monitor_job", AsyncMock()),
+            patch.object(monitor.logging, "exception"),
+            patch.object(
+                monitor_changes,
+                "process_monitor_change_events",
+                AsyncMock(
+                    return_value={
+                        "completed": 1,
+                        "failed": 0,
+                        "discarded": 0,
+                        "generated": 1,
+                        "deleted": 0,
+                        "directory_count": 0,
+                        "file_count": 1,
+                        "manual_required": 0,
+                        "errors": [],
+                        "change_details": [],
+                        "manual_required_paths": [],
+                        "monitor_run_ids": [],
+                    }
+                ),
+            ),
+        ):
+            asyncio.run(monitor.run_monitor_change_task("影视监控", run_id=run_id))
+
+        detail = monitor_runs.get_run_detail(run_id)["run"]
+        self.assertEqual(detail["status"], "completed")
+        self.assertEqual(detail["result"]["generated"], 1)
 
     def test_monitor_change_task_logs_one_shot_failure_without_retry_claim(self):
         cfg = self._cfg()
@@ -2263,10 +2398,12 @@ class ScraperMonitorSyncTest(unittest.TestCase):
                         {
                             "action": "delete",
                             "path": f"媒体库/一级/二级/{action['old_name']}.strm",
+                            "remote_path": action["old_path"],
                         },
                         {
                             "action": "generate",
                             "path": f"媒体库/一级/二级/{action['new_name']}.strm",
+                            "remote_path": action["new_path"],
                         },
                     ],
                 }
@@ -3260,8 +3397,25 @@ class ScraperMonitorSyncTest(unittest.TestCase):
                     "operation": "rename",
                     "old_path": "媒体库/Media/OldFolder",
                     "new_path": "媒体库/Media/NewFolder",
+                    "old_remote_path": "Media/OldFolder",
+                    "new_remote_path": "Media/NewFolder",
                     "deleted": 1,
                     "generated": 1,
+                    # 逐文件明细同时带网盘路径与本地 STRM 路径，供运行记录的「本地文件」页签展示。
+                    "deleted_files": [
+                        {
+                            "local": "媒体库/Media/OldFolder/Episode.mkv.strm",
+                            "remote": "Media/OldFolder/Episode.mkv",
+                            "name": "Episode.mkv",
+                        }
+                    ],
+                    "generated_files": [
+                        {
+                            "local": "媒体库/Media/NewFolder/Episode.mkv.strm",
+                            "remote": "Media/NewFolder/Episode.mkv",
+                            "name": "Episode.mkv",
+                        }
+                    ],
                 }
             ],
         )
@@ -4387,6 +4541,165 @@ class ScraperMonitorSyncTest(unittest.TestCase):
                 (prepared["event_ids"][0],),
             ).fetchone()[0]
         self.assertEqual(status, "manual_required")
+
+    def test_processed_change_events_are_claimed_by_the_change_run(self):
+        """变更同步运行要认领自己处理的事件，运行详情才能列出网盘重命名/移动。"""
+        cfg = self._cfg()
+        prepared = monitor_changes.prepare_monitor_change_events(
+            provider="115",
+            operation="rename",
+            entries=[
+                {
+                    "id": "claim-1",
+                    "name": "Old.mkv",
+                    "path": "Media/Old.mkv",
+                    "new_path": "Media/New.mkv",
+                    "is_dir": False,
+                    "size": 1024,
+                    "modified_at": "2026-08-09 10:00:00",
+                }
+            ],
+            source_action="scraper",
+            dedupe_key="claim-1",
+            cfg=cfg,
+        )
+        monitor_changes.confirm_monitor_change_events(prepared, succeeded=True, enqueue=False)
+
+        with patch.object(monitor_changes, "STRM_ROOT", self.strm_root):
+            asyncio.run(
+                monitor_changes.process_monitor_change_events(
+                    cfg=cfg,
+                    event_ids=prepared["event_ids"],
+                    monitor_run_id="run-claim",
+                )
+            )
+
+        with sqlite3.connect(self.db_path) as conn:
+            owner, status = conn.execute(
+                "SELECT monitor_run_id, status FROM monitor_change_events WHERE id = ?",
+                (prepared["event_ids"][0],),
+            ).fetchone()
+        self.assertEqual((owner, status), ("run-claim", "completed"))
+
+    def test_change_run_does_not_steal_events_already_owned_by_inbox_run(self):
+        """接收夹分发已经写好的父运行归属不能被下游变更同步覆盖。"""
+        cfg = self._cfg()
+        prepared = monitor_changes.prepare_monitor_change_events(
+            provider="115",
+            operation="rename",
+            entries=[
+                {
+                    "id": "keep-owner",
+                    "name": "Old.mkv",
+                    "path": "Media/Old.mkv",
+                    "new_path": "Media/New.mkv",
+                    "is_dir": False,
+                    "size": 1024,
+                    "modified_at": "2026-08-09 10:00:00",
+                }
+            ],
+            source_action="scraper-job:1:quick-import",
+            dedupe_key="keep-owner",
+            monitor_run_id="inbox-run",
+            cfg=cfg,
+        )
+        monitor_changes.confirm_monitor_change_events(prepared, succeeded=True, enqueue=False)
+
+        with patch.object(monitor_changes, "STRM_ROOT", self.strm_root):
+            asyncio.run(
+                monitor_changes.process_monitor_change_events(
+                    cfg=cfg,
+                    event_ids=prepared["event_ids"],
+                    monitor_run_id="change-run",
+                )
+            )
+
+        with sqlite3.connect(self.db_path) as conn:
+            owner = conn.execute(
+                "SELECT monitor_run_id FROM monitor_change_events WHERE id = ?",
+                (prepared["event_ids"][0],),
+            ).fetchone()[0]
+        self.assertEqual(owner, "inbox-run")
+
+
+class ScraperMoveLandingTest(unittest.TestCase):
+    """115 移动只是"受理"：只有回验到真的落地，监控同步事件才按成功收尾。
+
+    回归场景：接收夹整理多部影视时连发移动，115 还在排队；旧实现把"受理"当"完成"，
+    先排了目录同步，扫描自然找不到刚搬的内容，整条整理随后报「搬运失败」。
+    """
+
+    def _fake_provider(self, name, response):
+        class _FakeProvider:
+            supports_folder_browse = True
+
+            def __init__(self):
+                self.name = name
+
+            def move_entries(self, cookie, entry_ids, target_id, source_id=""):
+                return {**response, "ids": list(entry_ids), "target_cid": target_id}
+
+        return _FakeProvider()
+
+    def _move(self, provider_name, response, landing):
+        syncs = []
+        with patch.object(scraper, "_require_provider_cookie", return_value="cookie-value"), \
+                patch.object(scraper, "_require_scraper_operation"), \
+                patch.object(
+                    scraper,
+                    "get_provider_or_none",
+                    return_value=self._fake_provider(provider_name, response),
+                ), \
+                patch.object(scraper, "wait_115_writes_landed", return_value=dict(landing)) as landing_wait, \
+                patch.object(scraper, "_prepare_scraper_monitor_sync", return_value={}), \
+                patch.object(
+                    scraper,
+                    "_finish_scraper_monitor_sync",
+                    side_effect=lambda prepared, **kwargs: syncs.append(kwargs),
+                ), \
+                patch.object(scraper, "_build_transfer_monitor_snapshots", return_value=[]), \
+                patch.object(scraper, "_invalidate_provider_parent"):
+            result = scraper.move_scraper_entries(
+                provider_name,
+                ["e1"],
+                "target-cid",
+                source_cid="source-cid",
+                target_parent_path="Media/片名 (2026)",
+            )
+        return result, syncs, landing_wait
+
+    def test_pending_landing_keeps_sync_event_unconfirmed(self):
+        result, syncs, _ = self._move(
+            "115",
+            {"move_proid": "42"},
+            {
+                "status": "pending",
+                "pending_ids": ["e1"],
+                "waited_seconds": 30.0,
+                "progress_status": "timeout",
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["landing"]["pending_ids"], ["e1"])
+        self.assertEqual(len(syncs), 1)
+        self.assertFalse(syncs[0]["succeeded"])
+        self.assertIn("未确认落地", syncs[0]["error"])
+
+    def test_landed_landing_confirms_sync_event(self):
+        result, syncs, _ = self._move("115", {"move_proid": "42"}, {"status": "landed", "pending_ids": []})
+
+        self.assertEqual(result["landing"]["status"], "landed")
+        self.assertEqual(len(syncs), 1)
+        self.assertTrue(syncs[0]["succeeded"])
+        self.assertEqual(syncs[0].get("error", ""), "")
+
+    def test_other_providers_do_not_wait_for_115_landing(self):
+        result, syncs, landing_wait = self._move("quark", {}, {"status": "pending", "pending_ids": ["e1"]})
+
+        landing_wait.assert_not_called()
+        self.assertEqual(result["landing"]["status"], "landed")
+        self.assertTrue(syncs[0]["succeeded"])
 
 
 if __name__ == "__main__":

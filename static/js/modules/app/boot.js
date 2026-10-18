@@ -122,8 +122,12 @@
                 }
                 // 复用带 asset_version 的 tab 模块加载器，避免浏览器命中旧 settings.js 缓存后覆盖新 UI。
                 try {
-                    await loadSettingsTabModule();
+                    const settingsMod = await loadSettingsTabModule();
+                    await settingsMod?.loadAiMatchUsage?.();
                 } catch (_) { /* settings module may load via other path */ }
+                try {
+                    await window.refreshInboxTaskStatus?.();
+                } catch (_) { /* 接收夹任务状态读取失败不影响页面 */ }
                 const sensitiveMeta = normalizeSensitiveConfigMeta(cfg.sensitive_configured || {});
                 if (typeof renderProviderAuthBlocks === 'function') {
                     renderProviderAuthBlocks(cfg, sensitiveMeta);
@@ -145,6 +149,7 @@
                     const el = document.getElementById(k);
                     if (el && k !== 'trees' && k !== 'sensitive_configured') {
                         if (el.type === 'checkbox') el.checked = cfg[k];
+                        else if (Array.isArray(cfg[k])) el.value = cfg[k].join('\n');
                         else el.value = cfg[k];
                     }
                 });
@@ -207,13 +212,13 @@
                 resetSubscriptionForm();
                 resetResourceSourceForm();
                 syncResourceSourceSelect();
-                refreshWebhookHint();
+                renderMonitorWebhookUrl();
                 void renderVersionInfoPanel();
                 await refreshSign115Status(true);
             } catch (e) {}
         }
 
-        document.getElementById('monitor_name')?.addEventListener('input', refreshWebhookHint);
+        document.getElementById('monitor_name')?.addEventListener('input', renderMonitorWebhookUrl);
         ['subscription_title'].forEach(id => {
             document.getElementById(id)?.addEventListener('keydown', async (e) => {
                 if (e.key !== 'Enter' || e.isComposing) return;
@@ -596,7 +601,7 @@
         document.getElementById('subscription-log-box')?.addEventListener('scroll', () => {
             if (typeof handleSubscriptionLogScroll === 'function') handleSubscriptionLogScroll();
         });
-        document.getElementById('monitor-task-list')?.addEventListener('click', async (e) => {
+        const handleMonitorTaskListClick = async (e) => {
             const introBtn = e.target.closest('[data-monitor-toggle-intro]');
             if (introBtn) {
                 const name = decodeURIComponent(introBtn.dataset.monitorToggleIntro || '');
@@ -618,9 +623,36 @@
             if (action === 'stop') await stopMonitorTask(name);
             if (action === 'edit') editMonitorTask(name);
             if (action === 'delete') await deleteMonitorTask(name);
-        });
+        };
+        // 接收夹卡片渲染在独立容器里（页面上半区），点击委托要两个列表都挂上，
+        // 否则接收夹卡片的「编辑 / 立即整理 / 展开」会点不动。
+        document.getElementById('monitor-task-list')?.addEventListener('click', handleMonitorTaskListClick);
+        document.getElementById('monitor-inbox-task-list')?.addEventListener('click', handleMonitorTaskListClick);
         document.getElementById('monitor-modal')?.addEventListener('click', (e) => {
             if (e.target.id === 'monitor-modal') closeMonitorModal();
+        });
+        document.getElementById('monitor-run-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'monitor-run-modal') closeMonitorRunModal();
+        });
+        for (const id of ['monitor-run-list', 'monitor-run-modal-body']) {
+            document.getElementById(id)?.addEventListener('click', (event) => {
+                const row = event.target.closest('[data-run-id]');
+                if (row) openMonitorRun(row.dataset.runId);
+            });
+        }
+        document.getElementById('monitor-run-modal')?.addEventListener('keydown', (event) => {
+            if (event.key !== 'Tab') return;
+            const focusable = [...event.currentTarget.querySelectorAll('button:not([disabled]), [tabindex="0"], summary')]
+                .filter(element => element.getClientRects().length && element.tabIndex >= 0);
+            const first = focusable[0], last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+            else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        });
+        document.getElementById('monitor-run-retention-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'monitor-run-retention-modal') closeMonitorRunRetention();
+        });
+        document.getElementById('monitor-legacy-log-modal')?.addEventListener('click', (e) => {
+            if (e.target.id === 'monitor-legacy-log-modal') closeLegacyMonitorLogs();
         });
         document.getElementById('subscription-modal')?.addEventListener('click', (e) => {
             if (e.target.id === 'subscription-modal') closeSubscriptionModal();
@@ -683,6 +715,11 @@
             if (e.key !== 'Enter') return;
             e.preventDefault();
             createResourceFolderInCurrent();
+        });
+        document.getElementById('monitor-folder-create-name')?.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            createMonitorFolderInCurrent();
         });
         document.getElementById('resource-favorite-dir-list')?.addEventListener('click', async (e) => {
             const btn = e.target.closest('[data-resource-favorite-dir-index]');
@@ -817,6 +854,21 @@
                 closeResourceJobClearMenu();
                 return;
             }
+            const monitorRunModal = document.getElementById('monitor-run-modal');
+            if (e.key === 'Escape' && monitorRunModal && !monitorRunModal.classList.contains('hidden')) {
+                closeMonitorRunModal();
+                return;
+            }
+            const monitorRunRetentionModal = document.getElementById('monitor-run-retention-modal');
+            if (e.key === 'Escape' && monitorRunRetentionModal && !monitorRunRetentionModal.classList.contains('hidden')) {
+                closeMonitorRunRetention();
+                return;
+            }
+            const legacyMonitorLogModal = document.getElementById('monitor-legacy-log-modal');
+            if (e.key === 'Escape' && legacyMonitorLogModal && !legacyMonitorLogModal.classList.contains('hidden')) {
+                closeLegacyMonitorLogs();
+                return;
+            }
             const subscriptionEpisodeModal = document.getElementById('subscription-episode-modal');
             if (e.key === 'Escape' && subscriptionEpisodeModal && !subscriptionEpisodeModal.classList.contains('hidden')) {
                 closeSubscriptionEpisodeModal();
@@ -924,12 +976,10 @@
         });
         window.addEventListener('scroll', () => {
             syncResourceBackTopButton();
-            syncSettingsSaveDock();
             window.syncScraperBackTopButton?.();
         }, { passive: true });
         window.addEventListener('resize', () => {
             syncResourceBackTopButton();
-            syncSettingsSaveDock();
             window.syncScraperBackTopButton?.();
             requestViewportMetricsSync();
         });
@@ -1007,7 +1057,6 @@
         void loadResourceTabModule();
         const initPromise = init();
         syncResourceBackTopButton();
-        syncSettingsSaveDock();
         syncMainTabRowState();
         refreshResourceState();
         if (typeof fetchScraperJobsState === 'function') {

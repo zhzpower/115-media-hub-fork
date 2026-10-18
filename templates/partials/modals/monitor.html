@@ -7,28 +7,49 @@
                 <div class="monitor-modal-body space-y-4">
                     <label class="block">
                         <span class="text-xs text-slate-500 inline-flex items-center gap-2">
-                            任务名 (用于 webhook 路径)
-                            <button type="button" class="info-dot" onclick="showHelp('任务名会用于 webhook 地址：/webhook/任务名。建议用中文短名，且保持唯一。')">i</button>
+                            <span id="monitor-name-label-text">任务名 (用于 webhook 路径)</span>
+                            <button type="button" class="info-dot" onclick="showMonitorNameHelp()">i</button>
                         </span>
                         <input id="monitor_name" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="例如：自存影视">
                     </label>
-                    <label class="flex items-center gap-3 cursor-pointer text-sm">
-                        <input type="checkbox" id="monitor_webhook_enabled" class="ui-checkbox" onchange="refreshWebhookHint()">
-                        开启 webhook
-                        <button type="button" class="info-dot" onclick="showHelp('Webhook 参数说明：\\n1) 接口地址：/webhook/任务名，任务名用于匹配这个文件夹监控任务\\n2) 请求方式：POST + JSON\\n3) 磁力导入必填：magnet 或 link_url + savepath\\n4) savepath 是磁力保存目录；落在本任务扫描路径内时，导入成功后才会自动刷新并生成 strm\\n5) delayTime 可选，表示本次导入成功后延迟几秒刷新；不传则使用任务默认延迟\\n6) title / sharetitle 只用于日志或局部刷新提示\\n7) 签名校验可选：X-Webhook-Ts / X-Webhook-Nonce / X-Webhook-Sign，或 X-Webhook-Token。')">i</button>
-                    </label>
-                    <div id="webhook-hint" class="text-xs text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3 leading-5">
-                        webhook 地址：IP:容器端口/webhook/任务名（任务名用于绑定这个监控任务）
-                        <br>磁力导入必填：magnet 或 link_url + savepath
-                        <br>savepath 是 115 保存目录；必须落在本任务扫描路径内，导入后才会自动刷新 strm
-                        <br>delayTime 可选：本次导入成功后延迟几秒刷新；不传则使用任务默认延迟
-                        <br>title / sharetitle 可选：仅用于日志或局部刷新提示
-                        <br>签名校验（可选）：X-Webhook-Ts / X-Webhook-Nonce / X-Webhook-Sign 或 X-Webhook-Token
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <label class="flex items-center gap-3 cursor-pointer text-sm">
+                            <input type="checkbox" id="monitor_enabled" class="ui-checkbox">
+                            <span>启用本任务</span>
+                            <button type="button" class="info-dot" onclick="showHelp('启用：按「定时执行」自动跑，也会被 webhook / 导入完成 / 刮削变更自动触发，仍可手动运行。\\n停用：定时和所有自动触发都停，只保留手动运行，用于排查或临时冻结。')">i</button>
+                        </label>
+                        <label class="flex items-center gap-3 cursor-pointer text-sm">
+                            <input type="checkbox" id="monitor_webhook_enabled" class="ui-checkbox">
+                            <span>开启 webhook</span>
+                            <button type="button" class="info-dot" onclick="showHelp('Webhook 参数说明：\\n1) 接口地址：/webhook/任务名，任务名用于匹配这条任务（扫描任务或 115 的接收夹任务）；修改任务名会改变 webhook 地址，记得同步油猴脚本里的“请求地址”\\n2) 请求方式：POST + JSON\\n3) 磁力导入必填：magnet 或 link_url + savepath\\n4) 扫描任务的 savepath 填 115 根目录下的相对路径（例如 电影/新片），且必须落在本任务扫描路径内，导入成功后才会自动刷新并生成 strm；115 接收夹任务的 savepath 填接收夹或它的子目录（按 115 根目录解析的相对路径），留空即接收夹，下载完成后自动识别整理再按类型分发\\n5) delayTime 可选，表示本次导入成功后延迟几秒再刷新 / 整理；不传则使用任务默认延迟\\n6) title / sharetitle 只用于日志或局部刷新提示\\n7) 签名校验可选：X-Webhook-Ts / X-Webhook-Nonce / X-Webhook-Sign，或 X-Webhook-Token；这是全站唯一密钥，扫描任务和接收夹任务共用，不用分开配；Webhook 只对 115 的接收夹开放，别的网盘用「立即整理并分发」或定时执行。')">i</button>
+                        </label>
+                    </div>
+                    <div id="webhook-secret-hint" class="hidden text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 leading-5">
+                        还没有设置 Webhook 签名密钥：先去「参数配置 → 后台安全管理」设置密钥，才能开启 webhook。
+                    </div>
+                    <div id="webhook-provider-hint" class="hidden text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 leading-5">
+                        Webhook 只支持 115 网盘的接收夹（油猴脚本上报的保存路径按 115 根目录解析，其他网盘配了也落不到本盘）。这个接收夹请用「立即整理并分发」或「定时执行」。
+                    </div>
+                    <div id="monitor-inbox-provider-row" class="hidden space-y-1">
+                        <label class="block">
+                            <span class="text-xs text-slate-500 inline-flex items-center gap-2">
+                                接收夹所在网盘
+                                <button type="button" class="info-dot" onclick="showHelp('接收夹可以挂在任意已配置且支持目录浏览的网盘上；分发目标只能选同一网盘的文件夹，v1 不做跨盘分发，也不为其他网盘生成 STRM。每个网盘只能有一个接收夹。')">i</button>
+                            </span>
+                            <select id="monitor_inbox_provider" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none" onchange="syncMonitorInboxProviderUI()">
+                                <option value="115">115</option>
+                            </select>
+                            <div id="monitor-inbox-provider-hint" class="text-[11px] text-slate-500 leading-5 mt-1"></div>
+                        </label>
                     </div>
                     <label class="block">
-                        <span class="text-xs text-slate-500 inline-flex items-center gap-2">
+                        <span id="monitor-scan-path-label" class="text-xs text-slate-500 inline-flex items-center gap-2">
                             扫描路径 (115 网盘内监控的源路径)
                             <button type="button" class="info-dot" onclick="showHelp('手动运行会从该路径开始递归。Webhook 触发时会根据 savepath/path 自动定位这个路径下的变动子目录，优先局部刷新。')">i</button>
+                        </span>
+                        <span id="monitor-inbox-path-label" class="hidden text-xs text-slate-500 inline-flex items-center gap-2">
+                            接收夹路径 (所选网盘内接收磁力 / 分享导入的目录)
+                            <button type="button" class="info-dot" onclick="showHelp('接收夹是分类前的中转文件夹，也是新增的便捷入口（可选，不是强制流程）：磁力 / 分享可以先统一落到这里，不用每次保存前先挑电影还是电视剧，服务端会识别类型后按接收夹自己的整理选项重命名，再搬进同盘的电影 / 电视剧目标文件夹，避免手工选错分类目录；不想用它时，照旧把保存路径填到分类监控任务的目录即可。')">i</button>
                         </span>
                         <div class="resource-save-path-grid mt-1">
                             <input id="monitor_scan_path" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm" placeholder="/115/自存影视/115自存电视剧" readonly>
@@ -38,6 +59,7 @@
                             保存的是 115 路径字符串；即使 Cookie 暂时失效，路径也会保留，恢复后可继续使用。
                         </div>
                     </label>
+                    <div id="monitor-scan-fields" class="space-y-4">
                     <label class="block">
                         <span class="text-xs text-slate-500 inline-flex items-center gap-2">
                             目标路径 (追加到 /strm 下的父路径)
@@ -62,83 +84,6 @@
                         <input type="checkbox" id="monitor_sync_clean" class="ui-checkbox">
                         清理过期 STRM（不删除字幕、海报、NFO 等刮削元数据）
                     </label>
-                    <label class="flex items-center gap-3 cursor-pointer text-sm">
-                        <input type="checkbox" id="monitor_auto_scrape_on_new" class="ui-checkbox" onchange="syncMonitorAutoScrapeOptions()">
-                        <span>新增资源自动刮削整理（仅整理高置信度自动匹配的条目，失败仅记录日志）</span>
-                    </label>
-                    <div id="monitor-auto-scrape-options" class="hidden space-y-3 rounded-xl border border-slate-700 bg-slate-900/60 p-3">
-                        <div class="text-xs font-bold text-slate-300">自动整理选项</div>
-                        <div class="space-y-2">
-                            <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wide">文件夹</div>
-                            <label class="flex items-center gap-3 cursor-pointer text-sm">
-                                <input type="checkbox" id="monitor_asc_rename_folders" class="ui-checkbox" checked>
-                                <span>重命名文件夹（按识别结果标准化）</span>
-                            </label>
-                            <label class="flex items-center gap-3 cursor-pointer text-sm">
-                                <input type="checkbox" id="monitor_asc_season_subfolder" class="ui-checkbox" checked>
-                                <span>电视剧目录中创建 Season 子文件夹</span>
-                            </label>
-                            <label class="flex items-center gap-3 cursor-pointer text-sm">
-                                <input type="checkbox" id="monitor_asc_include_tmdb_id" class="ui-checkbox">
-                                <span>在媒体文件夹名中写入 TMDB ID</span>
-                            </label>
-                        </div>
-                        <div class="space-y-2">
-                            <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wide">文件命名</div>
-                            <label class="block">
-                                <span class="text-xs text-slate-500">文件命名方式</span>
-                                <select id="monitor_asc_file_name_mode" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none" onchange="syncMonitorAutoScrapeOptions()">
-                                    <option value="standard">按识别结果重命名</option>
-                                    <option value="clean">仅清理广告信息（保留原始命名）</option>
-                                    <option value="keep">保持原名（不重命名）</option>
-                                </select>
-                            </label>
-                            <div id="monitor-asc-standard-wrap" class="space-y-2">
-                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <label class="block">
-                                        <span class="text-xs text-slate-500">标题语言</span>
-                                        <select id="monitor_asc_title_language" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
-                                            <option value="auto">跟随 TMDB 配置</option>
-                                            <option value="zh">中文名</option>
-                                            <option value="en">英文名</option>
-                                        </select>
-                                    </label>
-                                    <label class="block">
-                                        <span class="text-xs text-slate-500">未识别时默认季号</span>
-                                        <input id="monitor_asc_season" type="number" min="1" max="99" value="1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
-                                    </label>
-                                </div>
-                                <label class="block">
-                                    <span class="text-xs text-slate-500">季集识别方式</span>
-                                    <select id="monitor_asc_episode_mode" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
-                                        <option value="auto">自动跟随 TMDB</option>
-                                        <option value="seasonal">单季：按季号识别</option>
-                                        <option value="absolute">多季：按 TMDB 连续编号</option>
-                                    </select>
-                                </label>
-                                <label class="flex items-center gap-3 cursor-pointer text-sm">
-                                    <input type="checkbox" id="monitor_asc_preserve_file_info" class="ui-checkbox" onchange="syncMonitorAutoScrapeOptions()">
-                                    <span>保留原文件名中的清晰度 / 片源 / 编码信息</span>
-                                </label>
-                                <div class="grid grid-cols-2 gap-2 text-xs text-slate-400">
-                                    <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-asc-tag="resolution" checked disabled> 清晰度</label>
-                                    <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-asc-tag="source" checked disabled> 片源</label>
-                                    <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-asc-tag="dynamic_range" checked disabled> HDR/DV</label>
-                                    <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-asc-tag="video" checked disabled> 视频编码</label>
-                                    <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-asc-tag="audio" checked disabled> 音频规格</label>
-                                    <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-asc-tag="language" checked disabled> 语言</label>
-                                    <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-asc-tag="subtitle" checked disabled> 字幕</label>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="space-y-2">
-                            <div class="text-[11px] font-bold text-slate-500 uppercase tracking-wide">文件清理</div>
-                            <label class="flex items-center gap-3 cursor-pointer text-sm">
-                                <input type="checkbox" id="monitor_asc_delete_ad_files" class="ui-checkbox">
-                                <span>整理时删除广告文件（图片/网页/文本，删除进入网盘回收站）</span>
-                            </label>
-                        </div>
-                    </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <label class="block">
                             <span class="text-xs text-slate-500">读取失败尝试次数</span>
@@ -149,20 +94,153 @@
                             <input id="monitor_list_delay_ms" type="number" min="0" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="250">
                         </label>
                     </div>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <label class="block">
-                            <span class="text-xs text-slate-500">文件大小过滤 (MB)</span>
-                            <input id="monitor_min_file_size_mb" type="number" min="0" step="0.1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="0">
-                        </label>
-                        <label class="block">
-                            <span class="text-xs text-slate-500">任务执行延时 (秒)</span>
-                            <input id="monitor_delay_seconds" type="number" min="0" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="0">
-                        </label>
+                    <label class="block">
+                        <span class="text-xs text-slate-500">文件大小过滤 (MB)</span>
+                        <input id="monitor_min_file_size_mb" type="number" min="0" step="0.1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="0">
+                    </label>
+                    </div>
+                    <div id="monitor-inbox-fields" class="hidden space-y-4">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <label class="block">
+                                <span class="text-xs text-slate-500">电影分发到（同盘文件夹，留空=不分发）</span>
+                                <div class="resource-save-path-grid mt-1">
+                                    <input id="monitor_inbox_target_movie" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm" placeholder="点右侧选择同盘文件夹">
+                                    <button type="button" onclick="openMonitorInboxTargetFolder('movie')" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold whitespace-nowrap">选择文件夹</button>
+                                </div>
+                            </label>
+                            <label class="block">
+                                <span class="text-xs text-slate-500">电视剧分发到（同盘文件夹，留空=不分发）</span>
+                                <div class="resource-save-path-grid mt-1">
+                                    <input id="monitor_inbox_target_tv" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm" placeholder="点右侧选择同盘文件夹">
+                                    <button type="button" onclick="openMonitorInboxTargetFolder('tv')" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold whitespace-nowrap">选择文件夹</button>
+                                </div>
+                            </label>
+                        </div>
+                        <div class="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-3">
+                            <div class="text-xs font-bold text-slate-300">接收夹整理选项</div>
+                            <div class="organize-option-group">
+                                <div class="organize-option-group-title">文件夹</div>
+                                <label class="flex items-center gap-3 cursor-pointer text-sm">
+                                    <input type="checkbox" id="monitor_inbox_asc_rename_folders" class="ui-checkbox" checked>
+                                    <span>重命名文件夹（按识别结果标准化）</span>
+                                </label>
+                                <label class="flex items-center gap-3 cursor-pointer text-sm">
+                                    <input type="checkbox" id="monitor_inbox_asc_season_subfolder" class="ui-checkbox" checked>
+                                    <span>电视剧目录中创建 Season 子文件夹</span>
+                                </label>
+                                <label class="flex items-center gap-3 cursor-pointer text-sm">
+                                    <input type="checkbox" id="monitor_inbox_asc_include_tmdb_id" class="ui-checkbox">
+                                    <span>在媒体文件夹名中写入 TMDB ID</span>
+                                </label>
+                            </div>
+                            <div class="organize-option-group">
+                                <div class="organize-option-group-title">文件命名</div>
+                                <label class="block">
+                                    <span class="text-xs text-slate-500">文件命名方式</span>
+                                    <select id="monitor_inbox_asc_file_name_mode" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none" onchange="syncMonitorInboxOrganizeUI()">
+                                        <option value="standard">按识别结果重命名</option>
+                                        <option value="clean">仅清理广告信息（保留原始命名）</option>
+                                        <option value="keep">保持原名（不重命名）</option>
+                                    </select>
+                                </label>
+                                <div id="monitor-inbox-asc-standard-wrap" class="space-y-2">
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <label class="block">
+                                            <span class="text-xs text-slate-500">标题语言</span>
+                                            <select id="monitor_inbox_asc_title_language" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
+                                                <option value="auto">跟随 TMDB 配置</option>
+                                                <option value="zh">中文名</option>
+                                                <option value="en">英文名</option>
+                                            </select>
+                                        </label>
+                                        <label class="block">
+                                            <span class="text-xs text-slate-500">未识别时默认季号</span>
+                                            <input id="monitor_inbox_asc_season" type="number" min="1" max="99" value="1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
+                                        </label>
+                                    </div>
+                                    <label class="block">
+                                        <span class="text-xs text-slate-500">季集识别方式</span>
+                                        <select id="monitor_inbox_asc_episode_mode" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none">
+                                            <option value="auto">自动跟随 TMDB</option>
+                                            <option value="seasonal">单季：按季号识别</option>
+                                            <option value="absolute">多季：按 TMDB 连续编号</option>
+                                        </select>
+                                    </label>
+                                    <label class="flex items-center gap-3 cursor-pointer text-sm">
+                                        <input type="checkbox" id="monitor_inbox_asc_preserve_file_info" class="ui-checkbox" onchange="syncMonitorInboxOrganizeUI()">
+                                        <span>保留原文件名中的清晰度 / 片源 / 编码信息</span>
+                                    </label>
+                                    <div class="grid grid-cols-2 gap-2 text-xs text-slate-400">
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="resolution" checked disabled> 清晰度</label>
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="source" checked disabled> 片源</label>
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="group" checked disabled> 字幕组/压制组</label>
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="dynamic_range" checked disabled> HDR/DV</label>
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="video" checked disabled> 视频编码</label>
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="audio" checked disabled> 音频规格</label>
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="language" checked disabled> 语言</label>
+                                        <label class="flex items-center gap-2"><input type="checkbox" class="ui-checkbox" data-monitor-inbox-asc-tag="subtitle" checked disabled> 字幕</label>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="organize-option-group">
+                                <div class="organize-option-group-title">文件清理</div>
+                                <label class="flex items-center gap-3 cursor-pointer text-sm">
+                                    <input type="checkbox" id="monitor_inbox_asc_delete_ad_files" class="ui-checkbox">
+                                    <span>整理时删除广告文件（图片/网页/文本，删除进入网盘回收站）</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-3">
+                            <div class="text-xs font-bold text-slate-300">接收夹整理节流</div>
+                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                <label class="block">
+                                    <span class="text-xs text-slate-500">无新文件等待时间 (秒)</span>
+                                    <input id="monitor_inbox_idle_seconds" type="number" min="0" max="3600" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="120">
+                                </label>
+                                <label class="block">
+                                    <span class="text-xs text-slate-500">单批最多整理条目数</span>
+                                    <input id="monitor_inbox_max_items_per_run" type="number" min="1" max="500" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="100">
+                                </label>
+                                <label class="block">
+                                    <span class="text-xs text-slate-500">轮间暂停 (秒)</span>
+                                    <input id="monitor_inbox_batch_pause_seconds" type="number" min="0" max="300" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="5">
+                                </label>
+                            </div>
+                            <div class="text-[11px] text-slate-500 leading-5">“无新文件等待时间”会在有新保存时重新计时，连续 2 分钟没有新文件才统一整理；“单批最多整理条目数”只控制同一轮内的执行批次，不会重新扫描接收夹；“轮间暂停”控制批次之间的额外缓冲。手动点“立即整理”不受等待时间限制。</div>
+                        </div>
+                        <div class="text-[11px] text-slate-500 leading-5">接收夹只是分类前的中转：识别为电影 / 电视剧的条目会按上面的接收夹整理选项重命名，再搬进同盘的目标文件夹；只有 115 上、且目标落在某个目录同步任务的扫描范围内时才会刷新 STRM；识别不准的留在接收夹并写明原因。</div>
+                        <div class="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-3">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <div class="text-xs font-bold text-slate-300">手动整理</div>
+                                <button id="inbox-task-run-btn" type="button" onclick="toggleInboxTaskRun()" class="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold">立即整理并分发</button>
+                            </div>
+                        </div>
+                        <div id="inbox-webhook-block" class="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-3">
+                            <div class="text-xs font-bold text-slate-300">推送地址</div>
+                            <div class="resource-save-path-grid">
+                                <input id="monitor_inbox_webhook_url" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-xs font-mono" readonly value="保存任务后生成">
+                                <button type="button" onclick="copyMonitorWebhookUrl()" class="px-3 py-3 rounded-xl bg-slate-700 hover:bg-slate-600 text-white text-xs font-bold whitespace-nowrap">复制地址</button>
+                            </div>
+                            <div class="text-[11px] text-slate-500 leading-5">
+                                油猴脚本“请求地址”填这个地址，“保存路径”填 115 根目录下的相对路径（例如 <span class="font-mono">接收</span>，不要带 <span class="font-mono">/115</span> 前缀），留空则默认落到接收夹。签名密钥与普通监控任务共用同一个（全站唯一，不用单独配）。
+                            </div>
+                        </div>
+                        <div id="inbox-task-status" class="tg-proxy-status quick-import-result">
+                            <div class="tg-proxy-status-title">最近动态</div>
+                            <div class="tg-proxy-status-meta">打开任务后会自动读取最近的接收与整理记录。</div>
+                        </div>
                     </div>
                     <label class="block">
                         <span class="text-xs text-slate-500 inline-flex items-center gap-2">
+                            任务执行延时 (秒)
+                            <button type="button" class="info-dot" onclick="showHelp('导入完成后延迟几秒再自动刷新 / 整理。0 表示立即执行；脚本在 webhook 里单独传 delayTime 时优先用它。')">i</button>
+                        </span>
+                        <input id="monitor_delay_seconds" type="number" min="0" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="0">
+                    </label>
+                    <label class="block">
+                        <span class="text-xs text-slate-500 inline-flex items-center gap-2">
                             定时执行 (分钟，0 为关闭)
-                            <button type="button" class="info-dot" onclick="showHelp('按分钟周期自动运行文件夹监控任务。0 表示不自动执行，仅手动或 webhook 触发。')">i</button>
+                            <button type="button" class="info-dot" onclick="showHelp('按分钟周期自动执行本任务：扫描任务会重新扫描生成 / 刷新 STRM，接收夹任务会识别并分发一次。0 表示关闭，仅手动或 webhook 触发。')">i</button>
                         </span>
                         <input id="monitor_cron_minutes" type="number" min="0" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" value="0">
                     </label>
@@ -177,22 +255,27 @@
         <div id="monitor-folder-modal" class="hidden fixed inset-0 bg-black/60 z-[56] p-4">
             <div class="w-full max-w-2xl mx-auto mt-[8vh] max-h-[88vh] overflow-y-auto group-card modal-card">
                 <div class="flex items-center justify-between">
-                    <h3 class="group-title mb-0">选择 115 监控文件夹</h3>
+                    <h3 id="monitor-folder-modal-title" class="group-title mb-0">选择文件夹</h3>
                     <button onclick="closeMonitorFolderModal()" class="px-3 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm">关闭</button>
                 </div>
                 <div class="space-y-4 mt-4">
                     <div class="resource-folder-pathbar">
-                        <div class="resource-folder-path-label">当前监控路径</div>
+                        <div id="monitor-folder-path-label" class="resource-folder-path-label">当前监控路径</div>
                         <div id="monitor-folder-breadcrumbs" class="resource-folder-path-track">根目录</div>
                     </div>
                     <div id="monitor-folder-summary" class="text-xs text-slate-500">
-                        这里只展示 115 当前目录下的子文件夹，选择后会直接保存成完整监控路径。
+                        这里只展示当前目录下的子文件夹，选择后会直接保存成完整路径。
                     </div>
                     <div class="flex flex-wrap gap-2">
                         <button type="button" onclick="selectCurrentMonitorFolder()" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold">选择当前目录</button>
                         <button type="button" onclick="goMonitorFolderBack()" class="monitor-folder-secondary-btn">返回上一级</button>
                         <button id="monitor-folder-refresh-btn" type="button" onclick="refreshCurrentMonitorFolder()" class="monitor-folder-refresh-btn">刷新当前目录</button>
                     </div>
+                    <div class="flex flex-col sm:flex-row gap-2">
+                        <input id="monitor-folder-create-name" class="w-full sm:flex-1 bg-slate-900 border border-slate-700 rounded-xl p-3 text-sm" placeholder="在当前目录新建文件夹（例如：自存影视、电影）">
+                        <button id="monitor-folder-create-btn" type="button" onclick="createMonitorFolderInCurrent()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold whitespace-nowrap">新建文件夹</button>
+                    </div>
+                    <div class="text-[11px] text-slate-500 leading-5">新建后会自动进入该文件夹，再点「选择当前目录」即可保存；也可以继续建下一层。</div>
                     <div id="monitor-folder-list" class="space-y-3"></div>
                 </div>
             </div>
@@ -201,14 +284,14 @@
         <div id="monitor-manual-required-modal" class="hidden fixed inset-0 bg-black/60 z-[90] p-4">
             <div class="w-full max-w-lg mx-auto mt-[8vh] max-h-[86vh] overflow-y-auto group-card modal-card">
                 <div class="flex items-center justify-between">
-                    <h3 class="group-title mb-0">需手动监控路径</h3>
+                    <h3 class="group-title mb-0">待自动补扫目录</h3>
                     <button onclick="closeMonitorManualRequired()" class="px-3 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm">关闭</button>
                 </div>
-                <p class="text-xs text-slate-500 mt-2">这些文件夹变更事件未确认内容清单完整；重新扫描该任务后会自动清除。</p>
+                <p class="text-xs text-slate-500 mt-2">这些目录的内容清单未确认（例如文件夹新增、或从接收夹搬入）：系统会按目录逐个排队补扫，补齐本地播放文件后自动清除这里的提示，不需要手动操作。补扫只自动尝试一次；失败（目录读不到）会标红保留，需要点下方「立即扫描该任务」重试，或先修复网盘目录。</p>
                 <div id="monitor-manual-required-list" class="mt-3 rounded-xl border border-slate-700 bg-slate-950/50 p-2 text-sm text-slate-300"></div>
                 <div class="flex justify-end gap-2 mt-4">
                     <button onclick="closeMonitorManualRequired()" class="task-modal-cancel-btn monitor-modal-cancel-btn">关闭</button>
-                    <button onclick="rescanMonitorManualRequired()" class="task-modal-save-btn monitor-modal-save-btn">重新扫描</button>
+                    <button onclick="rescanMonitorManualRequired()" class="task-modal-save-btn monitor-modal-save-btn" title="立即完整扫描该任务（可选，正常情况会等待自动补扫）">立即扫描该任务</button>
                 </div>
             </div>
         </div>

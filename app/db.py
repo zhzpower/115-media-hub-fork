@@ -155,6 +155,7 @@ def ensure_db() -> None:
                     entry_snapshot_json TEXT NOT NULL DEFAULT '{}',
                     task_name TEXT NOT NULL DEFAULT '',
                     source_action TEXT NOT NULL DEFAULT '',
+                    monitor_run_id TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'prepared',
                     needs_reconcile INTEGER NOT NULL DEFAULT 0,
                     retry_count INTEGER NOT NULL DEFAULT 0,
@@ -216,7 +217,8 @@ def ensure_db() -> None:
                     finished_at TEXT NOT NULL DEFAULT '',
                     last_triggered_at TEXT NOT NULL DEFAULT '',
                     response_json TEXT NOT NULL DEFAULT '{}',
-                    extra_json TEXT NOT NULL DEFAULT '{}'
+                    extra_json TEXT NOT NULL DEFAULT '{}',
+                    inbox_task_name TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -444,6 +446,71 @@ def ensure_db() -> None:
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS quick_import_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trigger TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    inbox_path TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    moved_count INTEGER NOT NULL DEFAULT 0,
+                    left_count INTEGER NOT NULL DEFAULT 0,
+                    summary TEXT NOT NULL DEFAULT '',
+                    detail_json TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            # Structured folder-monitor history.  The legacy line log remains
+            # useful for diagnostics, but cannot safely model concurrent runs.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitor_runs (
+                    id TEXT PRIMARY KEY,
+                    parent_run_id TEXT NOT NULL DEFAULT '',
+                    run_kind TEXT NOT NULL DEFAULT 'scan',
+                    task_name TEXT NOT NULL DEFAULT '',
+                    task_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    source TEXT NOT NULL DEFAULT '',
+                    sources_json TEXT NOT NULL DEFAULT '[]',
+                    scope_json TEXT NOT NULL DEFAULT '{}',
+                    subject TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    summary TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    queued_at TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitor_run_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'process',
+                    operation TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS monitor_run_links (
+                    run_id TEXT NOT NULL,
+                    related_run_id TEXT NOT NULL,
+                    relation TEXT NOT NULL DEFAULT 'related',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (run_id, related_run_id, relation)
+                )
+                """
+            )
             cursor.execute("PRAGMA table_info(local_files)")
             local_file_columns = {str(row[1]) for row in cursor.fetchall()}
             if "scan_token" not in local_file_columns:
@@ -462,6 +529,10 @@ def ensure_db() -> None:
                 cursor.execute(
                     "ALTER TABLE monitor_change_events ADD COLUMN processor_revision INTEGER NOT NULL DEFAULT 0"
                 )
+            if "monitor_run_id" not in monitor_change_columns:
+                cursor.execute(
+                    "ALTER TABLE monitor_change_events ADD COLUMN monitor_run_id TEXT NOT NULL DEFAULT ''"
+                )
             cursor.execute("PRAGMA table_info(scraper_job_actions)")
             scraper_action_columns = {str(row[1]) for row in cursor.fetchall()}
             if "file_size" not in scraper_action_columns:
@@ -472,6 +543,8 @@ def ensure_db() -> None:
             job_columns = {str(row[1]) for row in cursor.fetchall()}
             if "extra_json" not in job_columns:
                 cursor.execute("ALTER TABLE resource_jobs ADD COLUMN extra_json TEXT NOT NULL DEFAULT '{}'")
+            if "inbox_task_name" not in job_columns:
+                cursor.execute("ALTER TABLE resource_jobs ADD COLUMN inbox_task_name TEXT NOT NULL DEFAULT ''")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_local_files_scan_token ON local_files(scan_token)")
             cursor.execute(
                 """
@@ -490,6 +563,20 @@ def ensure_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_monitor_change_events_cleanup
                 ON monitor_change_events(status, completed_at)
                 """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_monitor_change_events_run
+                ON monitor_change_events(monitor_run_id, task_name, status, id)
+                """
+            )
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_monitor_runs_list ON monitor_runs(parent_run_id, updated_at DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_monitor_runs_task_status ON monitor_runs(task_name, status, updated_at DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_monitor_run_events_run_category ON monitor_run_events(run_id, category, id)")
+            # `related_run_id` 不是 monitor_run_links 主键前缀，缺了它时列表查询会对每条
+            # 运行记录整表扫描一遍子运行关联（实测 1.7 万条记录从 0.9ms 变成 137ms）。
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_monitor_run_links_related ON monitor_run_links(related_run_id, relation)"
             )
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_resource_items_link ON resource_items(link_url) WHERE link_url <> ''"

@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from ..core import normalize_relative_path, parse_int
+from ..services import quick_import
 from ..services.scraper import (
     build_scraper_batch_plan,
     build_scraper_providers_payload,
@@ -27,6 +28,7 @@ from ..services.scraper import (
     submit_scraper_job,
     submit_scraper_rollback,
     resolve_scraper_dest_folder_id,
+    resolve_scraper_folder_path,
     resolve_scraper_path_entry,
 )
 
@@ -54,6 +56,15 @@ async def get_scraper_entries_endpoint(provider: str, request: Request) -> Dict[
     limit = max(20, min(parse_int(request.query_params.get("limit", 0), default=0), 1000))
     try:
         return await asyncio.to_thread(list_scraper_entries, provider, cid, force_refresh, keyword, offset, limit)
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@router.get("/scraper/{provider}/folder-path")
+async def get_scraper_folder_path_endpoint(provider: str, request: Request) -> Dict[str, Any]:
+    cid = str(request.query_params.get("cid", "0") or "0").strip() or "0"
+    try:
+        return await asyncio.to_thread(resolve_scraper_folder_path, provider, cid)
     except Exception as exc:
         return _error_response(exc)
 
@@ -364,5 +375,39 @@ async def rollback_scraper_job_endpoint(job_id: int) -> Dict[str, Any]:
     try:
         submit_scraper_rollback(normalized_job_id)
         return {"ok": True, "job_id": normalized_job_id}
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@router.get("/scraper/quick-import/status")
+async def get_quick_import_status_endpoint() -> Dict[str, Any]:
+    try:
+        status = await asyncio.to_thread(quick_import.get_quick_import_status)
+        return {"ok": True, **status}
+    except Exception as exc:
+        return _error_response(exc)
+
+
+@router.post("/scraper/quick-import/run")
+async def run_quick_import_endpoint(request: Request) -> Dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    payload = data if isinstance(data, dict) else {}
+    trigger = str(payload.get("trigger", "manual") or "manual").strip() or "manual"
+    sub_path = str(payload.get("sub_path", "") or "").strip()
+    task_name = str(payload.get("task_name", "") or "").strip()
+    task_names = {task_name} if task_name else None
+    try:
+        # 显式调用是同步语义：等当前整理结束再跑这一轮，请求不会被丢弃或跳过。
+        result = await asyncio.to_thread(
+            quick_import.run_quick_import,
+            trigger,
+            sub_path=sub_path,
+            task_names=task_names,
+            wait_for_lock=True,
+        )
+        return {"ok": True, **result}
     except Exception as exc:
         return _error_response(exc)

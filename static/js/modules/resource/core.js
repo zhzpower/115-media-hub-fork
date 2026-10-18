@@ -318,14 +318,16 @@
 
         function getResourceImportCandidates(item) {
             const candidates = [];
-            let hasEd2kCandidate = false;
+            const seenEd2kImportModes = new Set();
             getResourceLinkRecords(item).forEach(record => {
                 const candidate = createResourceLinkActionItem(item, record);
                 const linkType = getEffectiveResourceLinkType(candidate);
                 if (!canOpenResourceImportLink(candidate) || !isLinkTypeCookieConfigured(linkType)) return;
                 if (linkType === 'ed2k') {
-                    if (hasEd2kCandidate) return;
-                    hasEd2kCandidate = true;
+                    const importMode = getResourceImportMode(candidate);
+                    const key = `${String(importMode || 'none').trim().toLowerCase()}:${String(linkType || '').trim().toLowerCase()}`;
+                    if (seenEd2kImportModes.has(key)) return;
+                    seenEd2kImportModes.add(key);
                 }
                 candidates.push(candidate);
             });
@@ -1887,11 +1889,18 @@
             const fullPath = normalizeRemotePathInput(joinRelativePathInput(mountPath, normalizedSavepath));
             let matchedTask = null;
             let bestDepth = -1;
+            let matchedInbox = null;
             tasks.forEach(task => {
                 const scanPath = normalizeRemotePathInput(task.scan_path || '');
                 if (!task?.name || !scanPath || scanPath === '/') return;
                 const matches = fullPath === scanPath || fullPath.startsWith(`${scanPath}/`);
                 if (!matches) return;
+                if (String(task.task_type || 'scan') === 'inbox') {
+                    // 接收夹不是监控任务：落到这里的资源由接收夹整理流程接管，不生成 STRM。
+                    // 同盘有多个接收夹时保留路径最深的那个（子目录接收夹优先）。
+                    if (!matchedInbox) matchedInbox = task;
+                    return;
+                }
                 const depth = scanPath.split('/').filter(Boolean).length;
                 if (depth > bestDepth) {
                     bestDepth = depth;
@@ -1904,6 +1913,11 @@
                 task: matchedTask,
                 taskName: matchedTask?.name || '',
                 scanPath: normalizeRemotePathInput(matchedTask?.scan_path || ''),
+                inboxTask: matchedInbox,
+                inboxTaskName: matchedInbox?.name || '',
+                // 停用的接收夹后端不会触发整理，提示也要如实说，不能继续宣传「自动整理」。
+                inboxEnabled: matchedInbox ? matchedInbox.enabled !== false : false,
+                isInbox: !matchedTask && !!matchedInbox,
             };
         }
 
@@ -1920,10 +1934,24 @@
                 || resourceEd2kState.folderName
                 || ''
             ).trim();
+            const createsSubfolder = shouldCreateResourceEd2kSubfolder(parentSavepath, folderName, createFolder);
             if (window.ResourceEd2kImport?.buildTargetSavepath) {
-                return window.ResourceEd2kImport.buildTargetSavepath(parentSavepath, folderName, createFolder);
+                return window.ResourceEd2kImport.buildTargetSavepath(parentSavepath, folderName, createsSubfolder);
             }
-            return createFolder ? joinRelativePathInput(parentSavepath, folderName) : parentSavepath;
+            return createsSubfolder ? joinRelativePathInput(parentSavepath, folderName) : parentSavepath;
+        }
+
+        function getResourceEd2kSavepathLastSegment(savepath = '') {
+            return normalizeRelativePathInput(savepath).split('/').filter(Boolean).pop() || '';
+        }
+
+        function shouldCreateResourceEd2kSubfolder(savepath = '', folderName = '', createFolder = true) {
+            if (createFolder === false) return false;
+            const childName = String(window.ResourceEd2kImport?.normalizeFolderName(folderName) || '').trim();
+            if (!childName) return false;
+            const lastSegment = getResourceEd2kSavepathLastSegment(savepath);
+            if (!lastSegment) return true;
+            return childName !== lastSegment;
         }
 
         function syncResourceSavepathPreview(savepath = '') {
@@ -1990,8 +2018,12 @@
                 return;
             }
             const monitorHint = match.taskName
-                ? `当前保存路径会映射到 ${providerLabel} 路径 ${match.fullPath}，命中文件夹监控任务“${match.taskName}”，保存完成后会自动触发生成 strm。`
-                : `当前保存路径会映射到 ${providerLabel} 路径 ${match.fullPath}，未命中文件夹监控任务，保存后不会自动生成 strm。`;
+                ? `映射到 ${providerLabel} 路径 ${match.fullPath}，命中监控任务“${match.taskName}”，保存完成后自动生成 STRM。`
+                : (match.isInbox
+                    ? (match.inboxEnabled
+                        ? `映射到 ${providerLabel} 路径 ${match.fullPath}，命中接收夹“${match.inboxTaskName || '接收夹'}”，保存完成后自动整理分发，再由监控任务生成 STRM。`
+                        : `映射到 ${providerLabel} 路径 ${match.fullPath}，接收夹“${match.inboxTaskName || '接收夹'}”已停用，保存后不会自动整理；请到「文件夹监控」页启用该接收夹。`)
+                    : `映射到 ${providerLabel} 路径 ${match.fullPath}，未纳入文件夹监控，不会自动生成 STRM。`);
             hintEl.innerText = `${selectionHint} ${monitorHint}`.trim();
         }
 
@@ -2041,6 +2073,10 @@
 
             if (match.taskName) {
                 displayInput.textContent = match.taskName;
+            } else if (match.isInbox) {
+                displayInput.textContent = match.inboxEnabled
+                    ? `${match.inboxTaskName || '接收夹'}（导入后自动整理分发）`
+                    : `${match.inboxTaskName || '接收夹'}（已停用，不会自动整理）`;
             } else {
                 displayInput.textContent = '当前目录不自动触发';
             }
@@ -3741,6 +3777,8 @@
             getResourceDisplayLinkTypeBadgeClass,
             getResourceDisplayLinkTypeLabel,
             getResourceImportMode,
+            getResourceEd2kSavepathLastSegment,
+            shouldCreateResourceEd2kSubfolder,
             isLinkTypeCookieConfigured,
             isProviderCookieConfigured,
             normalizeReceiveCodeInput,

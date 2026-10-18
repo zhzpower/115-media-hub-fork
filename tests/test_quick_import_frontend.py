@@ -1,0 +1,401 @@
+"""接收夹任务（inbox）的前端与路由接线：它和扫描任务共用一套任务/路径/webhook 口径。"""
+
+import re
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MONITOR_PAGE_PATH = ROOT / "templates/partials/pages/monitor_about.html"
+MONITOR_MODAL_PATH = ROOT / "templates/partials/modals/monitor.html"
+QUICK_IMPORT_MODAL_PATH = ROOT / "templates/partials/modals/quick_import.html"
+INDEX_PAGE_PATH = ROOT / "templates/index.html"
+INDEX_SCRIPT_PATH = ROOT / "static/js/index.js"
+SETTINGS_PAGE_PATH = ROOT / "templates/partials/pages/settings.html"
+SETTINGS_MODULE_PATH = ROOT / "static/js/modules/tabs/settings.js"
+BOOT_MODULE_PATH = ROOT / "static/js/modules/app/boot.js"
+SCRAPER_ROUTES_PATH = ROOT / "app/routes/scraper.py"
+MONITOR_ROUTES_PATH = ROOT / "app/routes/monitor.py"
+RESOURCE_ROUTES_PATH = ROOT / "app/routes/resource.py"
+RESOURCE_SERVICE_PATH = ROOT / "app/services/resource.py"
+CLI_PATH = ROOT / "cli.py"
+README_PATH = ROOT / "README.md"
+USERSCRIPT_PATH = ROOT / "115-magnet-helper-webhook.user.js"
+
+
+class InboxTaskFrontendTest(unittest.TestCase):
+    def test_inbox_is_a_task_type_not_a_global_card(self):
+        """接收夹不再是页面上的全局卡片：它是任务列表里的一个 inbox 任务。"""
+        page = MONITOR_PAGE_PATH.read_text(encoding="utf-8")
+        self.assertIn("文件夹监控任务列表", page)
+        self.assertNotIn("接收夹快捷导入", page)
+        self.assertNotIn('id="quick_import_enabled"', page)
+
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        # 新增不再让用户选任务类型：从哪个列表的新增按钮进来就是哪种任务。
+        self.assertNotIn('id="monitor_task_type"', modal)
+        self.assertNotIn("monitor-task-type-hint", modal)
+        self.assertIn('id="monitor_enabled"', modal)
+        self.assertIn('id="monitor_inbox_target_movie"', modal)
+        self.assertIn('id="monitor_inbox_target_tv"', modal)
+        self.assertIn('id="monitor_inbox_webhook_url"', modal)
+        self.assertIn('onclick="copyMonitorWebhookUrl()"', modal)
+        self.assertIn('onclick="toggleInboxTaskRun()"', modal)
+        self.assertIn('id="inbox-task-status"', modal)
+
+        # 旧的二级弹窗整块删掉，配置回到任务编辑弹窗里。
+        self.assertFalse(QUICK_IMPORT_MODAL_PATH.exists())
+        self.assertNotIn("partials/modals/quick_import.html", INDEX_PAGE_PATH.read_text(encoding="utf-8"))
+
+    def test_index_script_wires_inbox_task(self):
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "function applyMonitorTaskTypeUI",
+            "function syncWebhookToggleState",
+            "function buildInboxActivityHtml",
+            "function populateMonitorInboxTargetFields",
+            "function populateMonitorInboxProviderSelect",
+            "function syncMonitorInboxOrganizeUI",
+            "function collectMonitorInboxOrganizeOptions",
+            "function monitorTaskWebhookUrl",
+            "async function refreshInboxTaskStatus",
+            "function maybeRefreshInboxTaskStatus",
+            "async function copyMonitorWebhookUrl",
+            "async function runInboxTaskNow",
+            "inboxTaskStatusCache",
+            "window.refreshInboxTaskStatus = refreshInboxTaskStatus",
+            "window.copyMonitorWebhookUrl = copyMonitorWebhookUrl",
+            "window.runInboxTaskNow = runInboxTaskNow",
+        ):
+            self.assertIn(marker, script)
+        self.assertIn("'/scraper/quick-import/status'", script)
+        self.assertIn("'/monitor/start'", script)
+        # 旧接口地址、旧全局配置字段都不该再出现在前端。
+        self.assertNotIn("/webhook/quick-import", script)
+        self.assertNotIn("quick_import_enabled", script)
+        self.assertNotIn("quick_import_inbox_path", script)
+
+    def test_monitor_modal_reuses_one_path_field_for_both_types(self):
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="monitor-scan-fields"', modal)
+        self.assertIn('id="monitor-inbox-fields"', modal)
+        self.assertIn('id="monitor-scan-path-label"', modal)
+        self.assertIn('id="monitor-inbox-path-label"', modal)
+        self.assertIn('id="monitor_scan_path"', modal)
+        self.assertIn('onclick="openMonitorFolderModal()"', modal)
+        # 同一个路径输入框同时服务扫描任务和接收夹任务。
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("function applyMonitorTaskTypeUI", script)
+        self.assertIn("'monitor-scan-fields'", script)
+        self.assertIn("'monitor-inbox-fields'", script)
+
+    def test_inbox_throttle_fields_are_present_and_wired(self):
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        for marker in (
+            'id="monitor_inbox_idle_seconds"',
+            'id="monitor_inbox_max_items_per_run"',
+            'id="monitor_inbox_batch_pause_seconds"',
+        ):
+            self.assertIn(marker, modal)
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "inbox_idle_seconds",
+            "inbox_max_items_per_run",
+            "inbox_batch_pause_seconds",
+        ):
+            self.assertIn(marker, script)
+
+    def test_inbox_task_type_is_locked_and_add_per_provider_is_wired(self):
+        """接收夹按网盘各一个：类型由入口决定、保存后不可改，界面能给别的网盘新增、也能编辑。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("const deleteButton = isInboxTask ? '' : buildMonitorTaskIconButton({", script)
+        # 弹窗里没有类型下拉：类型跟着入口走（两个列表各自的新增按钮），编辑时沿用任务原类型。
+        self.assertNotIn("monitor_task_type", script)
+        self.assertIn("let monitorFormType = 'scan';", script)
+        self.assertIn("monitorFormType = 'inbox';", script)
+        self.assertIn("monitorFormType = String(task.task_type || 'scan') === 'inbox' ? 'inbox' : 'scan';", script)
+        page = MONITOR_PAGE_PATH.read_text(encoding="utf-8")
+        self.assertIn("function openNewInboxTask()", script)
+        self.assertIn("function openNewMonitorTask()", script)
+        self.assertIn('onclick="openNewInboxTask()"', page)
+        self.assertIn('onclick="openNewMonitorTask()"', page)
+        # 只有「新增接收夹」这一条按钮的标题行，不要被拉成整条宽度。
+        self.assertIn("monitor-head-actions--solo", page)
+        self.assertIn(".monitor-head-actions--solo", (ROOT / "static/css/index.css").read_text(encoding="utf-8"))
+        self.assertIn(
+            "每个网盘只能有一个接收夹：「${getProviderLabel(providerKey)}」已经有接收夹「${otherInbox.name}」，请直接编辑它",
+            script,
+        )
+        self.assertNotIn('id="monitor-task-type-hint"', MONITOR_MODAL_PATH.read_text(encoding="utf-8"))
+        monitor_routes = MONITOR_ROUTES_PATH.read_text(encoding="utf-8")
+        self.assertIn("接收夹任务是内置的，不能删除", monitor_routes)
+
+    def test_webhook_gated_on_signing_secret(self):
+        """webhook 只在设置了签名密钥后才能开启，避免全新安装暴露免鉴权入口。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("'webhook_secret'", script)
+        self.assertIn("sensitiveConfigMeta.webhook_secret", script)
+        self.assertIn("checkbox.disabled = !hasSecret || !providerOk;", script)
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="webhook-secret-hint"', modal)
+        self.assertIn("Webhook 签名密钥", modal)
+
+    def test_webhook_only_supported_on_115_inbox(self):
+        """webhook 只给 115 的接收夹：别的网盘开关禁选，并说明原因与替代做法。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("function monitorWebhookProviderSupported()", script)
+        self.assertIn("return provider === '115';", script)
+        self.assertIn("const providerOk = monitorWebhookProviderSupported();", script)
+        # 落库前再兜一次，避免旧配置/手工改配置把 webhook 带到非 115 接收夹上。
+        self.assertIn(
+            "webhook_enabled: webhookSupported && document.getElementById('monitor_webhook_enabled').checked,",
+            script,
+        )
+        # 换网盘会决定这条任务能不能开 webhook，所以要跟着刷新开关。
+        self.assertIn("// 换网盘会决定这条任务能不能开 webhook，所以一起刷新开关状态。", script)
+        # 不只是禁用开关：非 115 时连「推送地址」整块（地址 + 复制 + 油猴脚本说明）一起收起，只留「立即整理并分发」。
+        self.assertIn("webhookBlock.classList.toggle('hidden', !providerOk);", script)
+        self.assertIn("非 115 网盘不支持 Webhook", script)
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="inbox-webhook-block"', modal)
+        self.assertIn('id="inbox-task-run-btn"', modal)
+        self.assertLess(modal.index('id="inbox-task-run-btn"'), modal.index('id="inbox-webhook-block"'))
+        self.assertIn('id="monitor_inbox_webhook_url"', modal)
+        self.assertIn('id="webhook-provider-hint"', modal)
+        self.assertIn("Webhook 只支持 115 网盘的接收夹", modal)
+
+    def test_monitor_name_hint_follows_task_type(self):
+        """任务名示例跟着入口走：接收夹提示「接收」（非 115 带网盘名），扫描任务仍是「自存影视」。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("function syncMonitorNameHint()", script)
+        self.assertIn("'例如：自存影视'", script)
+        self.assertIn("'例如：接收'", script)
+        self.assertIn("例如：${getProviderLabel(provider)}接收", script)
+        # 非 115 的接收夹没有 webhook，标签里那段说明也要摘掉。
+        self.assertIn("textContent = isInbox && provider !== '115'", script)
+        # 两个入口 + 换网盘都要刷新这行文案。
+        self.assertGreaterEqual(script.count("syncMonitorNameHint();"), 2)
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="monitor-name-label-text"', modal)
+        self.assertIn('placeholder="例如：自存影视"', modal)
+
+    def test_new_inbox_disables_providers_already_taken(self):
+        """新增接收夹先选网盘：已被别的接收夹占用的网盘禁选，并提示「每个网盘只能有一个」。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("function inboxProvidersTaken()", script)
+        self.assertIn("${takenBy ? ' disabled' : ''}", script)
+        self.assertIn("（已有接收夹「${takenBy}」，每个网盘只能有一个）", script)
+        self.assertIn("请改选其它网盘；要调整已有那条，直接点它的编辑。", script)
+        self.assertIn("都已经有了，不能再新增；要调整请直接编辑已有接收夹。", script)
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="monitor-inbox-provider-hint"', modal)
+        # 先选网盘、再选文件夹：网盘选择排在共用的「接收夹路径」输入框前面。
+        self.assertLess(modal.index('id="monitor-inbox-provider-row"'), modal.index('id="monitor_scan_path"'))
+        self.assertIn("monitor-inbox-provider-row", script)
+
+    def test_new_inbox_form_does_not_show_existing_run_status(self):
+        """新建任务时表单里不该出现已有接收夹的运行状态，只留占位说明。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("if (isInbox) void refreshInboxTaskStatus();", script)
+        self.assertIn(
+            "renderInboxTaskStatus(editingMonitorName ? inboxStatusForTask(editingMonitorName) : {});",
+            script,
+        )
+        self.assertIn("保存任务后，这里会显示这个接收夹最近的接收与整理记录。", script)
+
+    def test_scan_only_fields_are_hidden_for_inbox(self):
+        """重试次数/列出延时/大小过滤只对扫描任务有意义，应当收进扫描字段组。"""
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        scan_fields_start = modal.index('id="monitor-scan-fields"')
+        inbox_fields_start = modal.index('id="monitor-inbox-fields"')
+        scan_section = modal[scan_fields_start:inbox_fields_start]
+        self.assertIn("monitor_retries", scan_section)
+        self.assertIn("monitor_list_delay_ms", scan_section)
+        self.assertIn("monitor_min_file_size_mb", scan_section)
+        self.assertNotIn("monitor_delay_seconds", scan_section)
+        # 定时执行对接收夹也生效（周期整理），所以不在扫描字段组里。
+        self.assertNotIn("monitor_cron_minutes", scan_section)
+
+    def test_rename_and_disable_are_explained_in_modal(self):
+        # webhook 说明只收在开关旁的「i」提示里，不再单列一大块重复文字。
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn("修改任务名会改变 webhook 地址", modal)
+        self.assertIn("定时和所有自动触发都停", modal)
+        self.assertIn("接收夹任务会识别并分发一次", modal)
+
+    def test_inbox_card_auto_refreshes_with_monitor_polling(self):
+        """卡片上的最近接收 / 最近整理跟着既有状态轮询按 30s 节流刷新。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("INBOX_STATUS_REFRESH_INTERVAL_MS = 30000", script)
+        self.assertIn("maybeRefreshInboxTaskStatus()", script)
+        # 两条 monitor 状态落地路径（tab 模块的 afterApply + 兜底分支）都要触发。
+        self.assertGreaterEqual(script.count("maybeRefreshInboxTaskStatus();"), 2)
+
+    def test_resource_import_understands_inbox_task(self):
+        """接收夹不是监控任务：资源导入弹窗要说明会交给接收夹整理，而不是生成 STRM。"""
+        resource_core = (ROOT / "static/js/modules/resource/core.js").read_text(encoding="utf-8")
+        self.assertIn("matchedInbox", resource_core)
+        self.assertIn("命中接收夹", resource_core)
+        self.assertIn("导入后自动整理分发", resource_core)
+        import_modal = (ROOT / "static/js/modules/resource/import-modal.js").read_text(encoding="utf-8")
+        self.assertIn("data.quick_import_inbox", import_modal)
+        self.assertIn("保存后由接收夹整理分发", import_modal)
+        self.assertIn("String(task?.task_type || 'scan') !== 'inbox'", import_modal)
+
+    def test_import_hint_marks_disabled_inbox(self):
+        """停用的接收夹后端不会触发整理，导入提示不能继续写「自动整理」。"""
+        core_js = (ROOT / "static/js/modules/resource/core.js").read_text(encoding="utf-8")
+        self.assertIn("inboxEnabled", core_js)
+        self.assertIn("已停用，保存后不会自动整理", core_js)
+        self.assertIn("已停用，不会自动整理", core_js)
+
+    def test_inbox_run_button_can_be_interrupted(self):
+        """接收夹整理运行中，卡片按钮要变成黄色的「中断」，弹窗按钮同一个开关。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        # 运行状态来自 /scraper/quick-import/status，而不是监控扫描状态。
+        self.assertIn("!!inboxStatus.running", script)
+        self.assertIn("INBOX_STATUS_RUNNING_REFRESH_INTERVAL_MS = 5000", script)
+        self.assertIn("async function toggleInboxTaskRun", script)
+        self.assertIn("window.toggleInboxTaskRun = toggleInboxTaskRun", script)
+        self.assertIn("已请求中断接收夹整理", script)
+        # 每个接收夹只显示自己那份状态：取不到匹配就给空快照，不透传全局值。
+        self.assertIn("recent_jobs: []", script)
+        self.assertIn("const running = !!inboxStatusForTask(name).running;", script)
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="inbox-task-run-btn"', modal)
+        self.assertIn('onclick="toggleInboxTaskRun()"', modal)
+        monitor_routes = MONITOR_ROUTES_PATH.read_text(encoding="utf-8")
+        self.assertIn("request_quick_import_cancel", monitor_routes)
+
+    def test_webhook_hint_teaches_root_relative_savepath(self):
+        """保存路径统一从网盘根目录开始填；说明只留在 webhook 的「i」提示里。"""
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        # 开关旁已经有提示按钮，不再单列一大块说明（避免重复与挤占弹窗空间）。
+        self.assertNotIn('id="webhook-hint"', modal)
+        self.assertIn("115 根目录下的相对路径", modal)
+        self.assertIn("不要带", modal)
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("refreshWebhookHint", script)
+
+    def test_nested_folder_picker_stacks_above_parent_modal(self):
+        """「选择文件夹」是二级弹窗：模板里的 z-[56] 低于任务弹窗，必须靠动态层级抬升。"""
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("function stackModalLayer", script)
+        self.assertIn("function readModalLayerBase", script)
+        self.assertIn("function isModalOpen", script)
+        self.assertIn("stackModalLayer(modal);", script)
+        self.assertIn("document.querySelectorAll('div[id$=\"-modal\"]')", script)
+        self.assertIn("z-[56]", MONITOR_MODAL_PATH.read_text(encoding="utf-8"))
+        # 抬升后的上限必须低于“需要盖住弹窗”的应用对话框层级。
+        ceiling_match = re.search(r"MODAL_LAYER_CEILING = (\d+)", script)
+        self.assertIsNotNone(ceiling_match)
+        app_dialog_match = re.search(
+            r"\.app-dialog-modal \{[^}]*z-index:\s*(\d+)",
+            (ROOT / "static/css/index.css").read_text(encoding="utf-8"),
+        )
+        self.assertIsNotNone(app_dialog_match)
+        self.assertLess(int(ceiling_match.group(1)), int(app_dialog_match.group(1)))
+
+    def test_settings_module_no_longer_collects_inbox_fields(self):
+        source = SETTINGS_MODULE_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("quick_import_inbox_path", source)
+        self.assertNotIn("quick_import_enabled", source)
+
+    def test_boot_loads_inbox_task_status(self):
+        source = BOOT_MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn("refreshInboxTaskStatus", source)
+        self.assertNotIn("refreshQuickImportStatus", source)
+
+    def test_settings_page_explains_inbox_task(self):
+        page = SETTINGS_PAGE_PATH.read_text(encoding="utf-8")
+        self.assertIn("接收夹", page)
+        self.assertIn("根目录下的相对路径", page)
+        self.assertNotIn("/webhook/quick-import", page)
+
+    def test_receive_folder_docs_state_staging_purpose_and_shared_secret(self):
+        """接收夹＝新增的可选便捷入口（不是强制流程）；签名密钥全站唯一，普通任务与接收夹共用。"""
+        readme = README_PATH.read_text(encoding="utf-8")
+        self.assertIn("分类前的中转文件夹", readme)
+        self.assertIn("便捷入口", readme)
+        # 旧用法必须仍然可用：直接按分类监控目录推送 / 保存。
+        self.assertIn("不是强制流程", readme)
+        self.assertIn("和普通监控任务共用同一个 Webhook 签名密钥", readme)
+
+        page = SETTINGS_PAGE_PATH.read_text(encoding="utf-8")
+        self.assertIn("分类前的中转文件夹", page)
+        self.assertIn("便捷入口", page)
+        self.assertIn("全站唯一的密钥", page)
+        # 旧说法（把接收夹当成「新增任务」里的一个类型）已经不对：接收夹按网盘各一个。
+        self.assertNotIn("新增任务 → 任务类型选“接收夹任务”", page)
+
+        modal = MONITOR_MODAL_PATH.read_text(encoding="utf-8")
+        self.assertIn("全站唯一", modal)
+        self.assertIn("便捷入口", modal)
+
+        # 密钥共用与「不是强制流程」的口径也收在同一个提示按钮里。
+        self.assertIn("扫描任务和接收夹任务共用", modal)
+        self.assertIn("不是强制流程", modal)
+
+        userscript = USERSCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("分类前的中转文件夹", userscript)
+        self.assertIn("便捷入口", userscript)
+        self.assertIn("全部任务共用同一把", userscript)
+
+
+class MonitorMobileLayoutTest(unittest.TestCase):
+    """手机端：新增按钮跟标题同行，软键盘弹出时弹窗钉在可视视口内。"""
+
+    def test_add_buttons_share_the_title_row_on_narrow_screens(self):
+        css = (ROOT / "static/css/index.css").read_text(encoding="utf-8")
+        # 窄屏头部保持两列（标题 + 按钮），胶囊落到第二行，按钮不再独占一行。
+        self.assertIn("#page-monitor .monitor-head-actions { display: contents; width: auto; }", css)
+        self.assertIn("#page-monitor .monitor-head-add-btn {", css)
+        self.assertIn("grid-area: 1 / 2 / 2 / 3;", css)
+        self.assertIn("#page-monitor .monitor-status-pill { grid-area: 2 / 1 / 3 / 3; }", css)
+        self.assertNotIn("#page-monitor .monitor-head-actions { grid-template-columns: 1fr; }", css)
+        self.assertNotIn("#page-monitor .monitor-head-add-btn { width: 100%; }", css)
+
+    def test_task_modal_pins_to_visual_viewport_when_keyboard_opens(self):
+        css = (ROOT / "static/css/index.css").read_text(encoding="utf-8")
+        self.assertIn("--app-vv-offset-top: 0px;", css)
+        self.assertIn("html.keyboard-open #monitor-modal,", css)
+        self.assertIn("html.keyboard-open #monitor-modal .monitor-modal-shell,", css)
+        self.assertIn("top: var(--app-vv-offset-top, 0px);", css)
+        self.assertIn("height: var(--app-vh, 100dvh);", css)
+
+        script = INDEX_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("classList.toggle('keyboard-open', keyboardOpen)", script)
+        self.assertIn("setProperty('--app-vv-offset-top'", script)
+        self.assertIn("document.body.classList.contains('body-scroll-lock')", script)
+
+
+class InboxTaskBackendWiringTest(unittest.TestCase):
+    def test_routes_expose_inbox_task_endpoints(self):
+        source = SCRAPER_ROUTES_PATH.read_text(encoding="utf-8")
+        self.assertIn('"/scraper/quick-import/run"', source)
+        self.assertIn('"/scraper/quick-import/status"', source)
+        monitor_routes = MONITOR_ROUTES_PATH.read_text(encoding="utf-8")
+        # 旧的独立 webhook 已经删掉，接收夹走统一的 /webhook/{任务名}。
+        self.assertNotIn('"/webhook/quick-import"', monitor_routes)
+        self.assertIn('"/webhook/{task_name}"', monitor_routes)
+        self.assertIn("_handle_inbox_webhook", monitor_routes)
+        self.assertIn("normalize_userscript_savepath", monitor_routes)
+
+    def test_import_hooks_flag_inbox_jobs(self):
+        routes = RESOURCE_ROUTES_PATH.read_text(encoding="utf-8")
+        # 落点判定要带 provider，否则 115 / 夸克都用「接收」时会互相串账。
+        self.assertIn("match_quick_import_inbox", routes)
+        self.assertIn("inbox_task_name", routes)
+        self.assertIn("quick_import_inbox", routes)
+        service = RESOURCE_SERVICE_PATH.read_text(encoding="utf-8")
+        self.assertIn("quick_import_inbox", service)
+        self.assertIn("run_quick_import", service)
+
+    def test_cli_exposes_quick_import_actions(self):
+        source = CLI_PATH.read_text(encoding="utf-8")
+        self.assertIn("quick-import-run", source)
+        self.assertIn("quick-import-status", source)
+
+
+if __name__ == "__main__":
+    unittest.main()

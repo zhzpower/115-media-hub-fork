@@ -17,9 +17,29 @@ from app.providers import pan115  # noqa: E402
 class _FakeRequest:
     def __init__(self, data):
         self._data = data
+        self.query_params = dict((data or {}).get("_query", {}) or {})
 
     async def json(self):
         return self._data
+
+
+class _FakeQuark:
+    """只实现 resolve_scraper_dest_folder_id 需要的部分。"""
+
+    name = "quark"
+    label = "夸克网盘"
+    supports_folder_browse = True
+
+    def __init__(self, resolved_id):
+        self._resolved_id = resolved_id
+        self.calls = []
+
+    def get_cookie(self, _cfg):
+        return "quark-ck"
+
+    def resolve_folder_id_by_path(self, cookie, relative_path):
+        self.calls.append((cookie, relative_path))
+        return self._resolved_id
 
 
 class ScraperPathEntryTest(unittest.TestCase):
@@ -67,11 +87,25 @@ class ScraperPathEntryTest(unittest.TestCase):
         ):
             self.assertEqual(scraper_service.resolve_scraper_dest_folder_id("115", "/电影/新目录"), "cid88")
 
-    def test_resolve_scraper_dest_folder_id_rejects_non_115(self):
-        with patch.object(scraper_service, "get_config", return_value={"cookie_115": "ck"}):
+    def test_resolve_scraper_dest_folder_id_uses_provider_for_non_115(self):
+        """非 115 网盘改用 provider 自己的按路径解析（接收夹挂在夸克时要能分发）。"""
+        fake = _FakeQuark("quark-cid-9")
+        with patch.object(scraper_service, "get_config", return_value={"cookie_quark": "quark-ck"}), patch.object(
+            scraper_service, "get_provider_or_none", return_value=fake
+        ):
+            self.assertEqual(
+                scraper_service.resolve_scraper_dest_folder_id("quark", "/电影/新目录"),
+                "quark-cid-9",
+            )
+        self.assertEqual(fake.calls, [("quark-ck", "电影/新目录")])
+
+    def test_resolve_scraper_dest_folder_id_raises_when_dest_missing(self):
+        with patch.object(scraper_service, "get_config", return_value={"cookie_quark": "quark-ck"}), patch.object(
+            scraper_service, "get_provider_or_none", return_value=_FakeQuark("")
+        ):
             with self.assertRaises(RuntimeError) as ctx:
-                scraper_service.resolve_scraper_dest_folder_id("quark", "/电影/新目录")
-            self.assertIn("仅支持 115", str(ctx.exception))
+                scraper_service.resolve_scraper_dest_folder_id("quark", "/电影/不存在")
+            self.assertIn("未找到目标目录：电影/不存在", str(ctx.exception))
 
     def test_resolve_selected_paths_propagates_errors(self):
         def _raise(_provider, _path):
@@ -123,6 +157,29 @@ class Pan115EntryResolveTest(unittest.TestCase):
 
 
 class ScraperPathOpsRouteTest(unittest.TestCase):
+    def test_folder_path_endpoint_returns_real_path(self):
+        resolved = {
+            "ok": True,
+            "provider": "115",
+            "cid": "c1",
+            "path": "115自存电视剧/狂飙 (2023) [tmdbid-210757]",
+            "ancestors": [
+                {"id": "p1", "name": "115自存电视剧", "parent_id": "0"},
+                {"id": "c1", "name": "狂飙 (2023) [tmdbid-210757]", "parent_id": "p1"},
+            ],
+        }
+        with patch.object(scraper_routes, "resolve_scraper_folder_path", return_value=resolved) as resolver:
+            result = asyncio.run(
+                scraper_routes.get_scraper_folder_path_endpoint(
+                    "115", _FakeRequest({"_query": {"cid": "c1"}})
+                )
+            )
+
+        self.assertTrue(result["ok"])
+        resolver.assert_called_once_with("115", "c1")
+        self.assertEqual(result["path"], resolved["path"])
+        self.assertEqual(result["ancestors"], resolved["ancestors"])
+
     def test_rename_path_resolves_and_preserves_request_id(self):
         resolved = {"id": "fid1", "parent_id": "cid0", "name": "x.mkv", "is_dir": False, "path": "/电影/x.mkv"}
         with patch.object(scraper_routes, "resolve_scraper_path_entry", return_value=resolved), patch.object(

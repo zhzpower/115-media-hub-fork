@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import time
 from datetime import datetime
@@ -6,7 +7,7 @@ from datetime import datetime
 from .core import *  # noqa: F401,F403
 from .background import start_background_runtime, stop_background_runtime, submit_background
 from .memory import release_process_memory
-from .services.monitor import queue_monitor_job
+from .services.monitor import queue_monitor_job, retry_pending_manual_rescans
 from .services.monitor_changes import (
     cleanup_completed_monitor_change_events,
     recover_monitor_change_events,
@@ -22,6 +23,13 @@ from .services.resource import (
 from .services.sign115 import refresh_sign115_status, run_sign115_job
 from .services.subscription import queue_subscription_job
 from .services.scraper import requeue_scraper_jobs_on_startup
+from .services.monitor_runs import (
+    cleanup_runs,
+    reconcile_waiting_runs,
+    recover_interrupted_runs,
+    repair_change_event_owners,
+    settle_deferred_runs,
+)
 from .services.subscription_offline_cleanup import (
     run_subscription_offline_staging_cleanup_once,
     subscription_offline_staging_cleanup_watcher,
@@ -40,6 +48,16 @@ def _run_prune_step(callback) -> Dict[str, Any]:
         return result if isinstance(result, dict) else {"removed": int(result or 0)}
     except Exception as exc:
         return {"error": str(exc)[:180]}
+
+
+async def _run_inbox_cron_import(task_name: str = "") -> None:
+    """接收夹定时整理：只登记请求，实际整理在工作线程里串行执行。"""
+    try:
+        from .services.quick_import import notify_quick_import
+
+        notify_quick_import("cron", task_name=task_name)
+    except Exception:
+        logging.exception("接收夹定时整理失败")
 
 
 def prune_runtime_memory_caches() -> Dict[str, Any]:
@@ -71,6 +89,7 @@ async def startup() -> None:
     bind_ui_event_loop()
     start_background_runtime()
     ensure_db()
+    recover_interrupted_runs()
     try:
         if cleanup_legacy_tree_config_file():
             await write_log("已清理 settings.json 中的旧目录树配置字段（trees/sync_mode/check_hash/cron_hour/last_hash）", "info")
@@ -79,6 +98,23 @@ async def startup() -> None:
     # Reconcile mutations left between the remote operation and local STRM
     # processing before normal schedulers start issuing scans.
     recover_monitor_change_events(cfg=get_config())
+    reconcile_waiting_runs()
+    try:
+        resettled = settle_deferred_runs()
+        if resettled.get("change") or resettled.get("inbox"):
+            logging.info(
+                "Resettled %s change runs and %s inbox runs whose follow-up sync finished later",
+                resettled.get("change", 0),
+                resettled.get("inbox", 0),
+            )
+    except Exception:
+        logging.exception("Failed to resettle runs whose follow-up sync finished later")
+    try:
+        repaired = repair_change_event_owners()
+        if repaired:
+            logging.info("Repaired %s monitor change events without a run owner", repaired)
+    except Exception:
+        logging.exception("Failed to repair monitor change event owners")
     try:
         requeue_scraper_jobs_on_startup()
     except Exception:
@@ -94,11 +130,22 @@ async def startup() -> None:
                 submit_background(schedule_resource_job_refresh, int(job["id"]), label="resource-refresh-recover")
     submit_background(refresh_sign115_status, force_remote=False, trigger="startup", label="sign115-startup-status")
 
+    last_monitor_run_cleanup_day = ""
+
     async def monitor_scheduler() -> None:
+        nonlocal last_monitor_run_cleanup_day
         await asyncio.sleep(5)
         while True:
             now = time.time()
             cfg = get_config()
+            retention = cfg.get("monitor_run_retention") if isinstance(cfg.get("monitor_run_retention"), dict) else {}
+            cleanup_day = datetime.now().date().isoformat()
+            if retention.get("mode") == "days" and cleanup_day != last_monitor_run_cleanup_day:
+                try:
+                    await asyncio.to_thread(cleanup_runs, scope="expired", days=max(1, int(retention.get("days", 30) or 30)))
+                except Exception:
+                    logging.exception("Failed to clean expired monitor runs")
+                last_monitor_run_cleanup_day = cleanup_day
             prev_next_runs = dict(monitor_next_run)
             tasks = cfg.get("monitor_tasks", [])
             active_names = {task.get("name", "") for task in tasks if task.get("name")}
@@ -119,16 +166,25 @@ async def startup() -> None:
                 cron_minutes = int(task.get("cron_minutes", 0) or 0)
                 if not name:
                     continue
+                if task.get("enabled") is False:
+                    # 任务被显式停用：不跑定时（手动运行仍然可用，方便排查）。
+                    monitor_next_run.pop(name, None)
+                    continue
                 if cron_minutes <= 0:
                     monitor_next_run.pop(name, None)
                     continue
+                is_inbox = normalize_task_type(task.get("task_type")) == MONITOR_TASK_TYPE_INBOX
 
                 if name not in monitor_last_run:
                     monitor_last_run[name] = now
                 next_ts = monitor_last_run[name] + (cron_minutes * 60)
                 monitor_next_run[name] = datetime.fromtimestamp(next_ts).strftime("%H:%M:%S")
                 if now >= next_ts:
-                    if pending_offline_counts.get(name, 0) > 0:
+                    if is_inbox:
+                        # 接收夹任务的“定时执行”= 周期整理并分发一次（手动拖进接收夹的文件也能被收拾）。
+                        monitor_last_run[name] = now
+                        asyncio.create_task(_run_inbox_cron_import(name))
+                    elif pending_offline_counts.get(name, 0) > 0:
                         monitor_last_run[name] = now
                         monitor_next_run[name] = datetime.fromtimestamp(
                             now + (cron_minutes * 60)
@@ -141,6 +197,12 @@ async def startup() -> None:
                     else:
                         queue_monitor_job(name, "cron")
             queue_ready_monitor_change_tasks(cfg=cfg)
+            try:
+                retried = retry_pending_manual_rescans(cfg)
+                if retried.get("queued"):
+                    logging.info("Queued %s pending auto-rescan directories", retried.get("queued"))
+            except Exception:
+                logging.exception("Failed to retry pending auto-rescan directories")
             if monitor_next_run != prev_next_runs:
                 schedule_ui_state_push(0)
             await asyncio.sleep(5)

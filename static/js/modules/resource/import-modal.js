@@ -31,8 +31,7 @@
         function isResourceEd2kReady() {
             if (!isResourceEd2kImportActive() || resourceEd2kState.loading || resourceEd2kState.error) return false;
             if (!Array.isArray(resourceEd2kState.selectedItemIds) || !resourceEd2kState.selectedItemIds.length) return false;
-            return resourceEd2kState.createFolder === false
-                || !!window.ResourceEd2kImport?.normalizeFolderName(resourceEd2kState.folderName);
+            return true;
         }
 
         function formatResourceEd2kSize(value) {
@@ -48,9 +47,14 @@
             return `${size.toFixed(digits)} ${units[unitIndex]}`;
         }
 
-        function applyResourceEd2kResolvedData(item, data) {
+        async function applyResourceEd2kResolvedData(item, data) {
             const items = Array.isArray(data?.items) ? data.items.filter(entry => entry && entry.link_url) : [];
-            const titleText = String(item?.title || data?.title || 'ED2K 资源').trim() || 'ED2K 资源';
+            const importMode = getResourceImportMode(item);
+            let titleText = String(item?.title || data?.title || 'ED2K 资源').trim() || 'ED2K 资源';
+            if (importMode === 'ed2k-direct') {
+                const directTitle = window.ResourceEd2kImport?.resolveFolderTitleSource(item, items);
+                if (directTitle) titleText = directTitle;
+            }
             resourceEd2kState.loading = false;
             resourceEd2kState.error = '';
             resourceEd2kState.pageTitle = String(data?.title || '').trim();
@@ -61,10 +65,11 @@
             resourceEd2kState.items = items;
             resourceEd2kState.selectedItemIds = items.map(entry => String(entry.id || entry.link_url));
             resourceEd2kState.createFolder = true;
-            resourceEd2kState.folderName = '';
+            const recommendedFolderName = await getRecommendedResourceEd2kFolderName();
+            resourceEd2kState.folderName = recommendedFolderName;
             const folderNameInput = document.getElementById('resource-ed2k-folder-name');
             const createFolderInput = document.getElementById('resource-ed2k-create-folder');
-            if (folderNameInput) folderNameInput.value = '';
+            if (folderNameInput) folderNameInput.value = recommendedFolderName;
             if (createFolderInput) createFolderInput.checked = true;
         }
 
@@ -96,7 +101,7 @@
                     });
                 }
                 if (requestToken !== resourceEd2kState.requestToken || selectedResourceItem !== item) return;
-                applyResourceEd2kResolvedData(item, data);
+                await applyResourceEd2kResolvedData(item, data);
             } catch (error) {
                 if (requestToken !== resourceEd2kState.requestToken || selectedResourceItem !== item) return;
                 resourceEd2kState.loading = false;
@@ -161,6 +166,29 @@
             const createFolderInput = document.getElementById('resource-ed2k-create-folder');
             const folderNameInput = document.getElementById('resource-ed2k-folder-name');
             const reselectBtn = document.querySelector('.resource-ed2k-reselect-btn');
+            const emptyNameHint = document.getElementById('resource-ed2k-empty-name-hint');
+            const savepath = String(document.getElementById('resource_job_savepath')?.value || '').trim();
+            const lastSegment = window.shouldCreateResourceEd2kSubfolder
+                ? window.getResourceEd2kSavepathLastSegment(savepath)
+                : '';
+            const currentFolderName = String(
+                document.getElementById('resource-ed2k-folder-name')?.value
+                || resourceEd2kState.folderName
+                || ''
+            ).trim();
+            const normalizedCurrentName = window.ResourceEd2kImport?.normalizeFolderName(currentFolderName) || '';
+            // 所选目录末段名 == 新建文件夹名时视为同名嵌套，清空第二个名称（设为空置），保存到第一层目录。
+            let duplicateCleared = false;
+            if (
+                resourceEd2kState.createFolder !== false
+                && lastSegment
+                && normalizedCurrentName
+                && normalizedCurrentName === lastSegment
+            ) {
+                resourceEd2kState.folderName = '';
+                if (folderNameInput) folderNameInput.value = '';
+                duplicateCleared = true;
+            }
             if (createFolderInput) createFolderInput.checked = resourceEd2kState.createFolder !== false;
             if (folderNameInput) {
                 if (document.activeElement !== folderNameInput && folderNameInput.value !== resourceEd2kState.folderName) {
@@ -169,6 +197,16 @@
                 folderNameInput.disabled = resourceEd2kState.createFolder === false;
             }
             if (reselectBtn) reselectBtn.disabled = resourceEd2kState.createFolder === false || !resourceEd2kState.titleTokens.length;
+            if (emptyNameHint) {
+                const createsSubfolder = window.shouldCreateResourceEd2kSubfolder
+                    ? window.shouldCreateResourceEd2kSubfolder(savepath, resourceEd2kState.folderName, resourceEd2kState.createFolder !== false)
+                    : (resourceEd2kState.createFolder !== false && !!window.ResourceEd2kImport?.normalizeFolderName(resourceEd2kState.folderName));
+                emptyNameHint.classList.toggle('hidden', resourceEd2kState.createFolder === false || !!createsSubfolder);
+            }
+            if (duplicateCleared) {
+                syncResourceMonitorTaskOptions(savepath);
+                syncResourceEd2kSubmitButton();
+            }
         }
 
         function renderResourceEd2kImport() {
@@ -297,6 +335,46 @@
             resourceEd2kState.folderName = String(value || '');
             syncResourceMonitorTaskOptions(document.getElementById('resource_job_savepath')?.value || '');
             syncResourceEd2kSubmitButton();
+            syncResourceEd2kFolderControls();
+        }
+
+        async function fetchRecommendedFolderName(title, year, rawText) {
+            if (!title) return '';
+            try {
+                const data = await window.MediaHubApi.postJson('/resource/items/recommend_folder_name', {
+                    title: String(title || ''),
+                    year: String(year || ''),
+                    raw_text: String(rawText || ''),
+                });
+                return String(data?.folder_name || '').trim();
+            } catch (error) {
+                return window.MediaHubTitleUtils?.recommendFolderName(
+                    String(title || ''),
+                    String(year || '')
+                ) || '';
+            }
+        }
+
+        async function getRecommendedResourceEd2kFolderName() {
+            const title = String(resourceEd2kState?.titleText || '').trim();
+            if (!title) return '';
+            const year = window.MediaHubTitleUtils?.extractShowYear(
+                `${title} ${String(selectedResourceItem?.raw_text || '')}`,
+                String(selectedResourceItem?.year || '')
+            ) || '';
+            return fetchRecommendedFolderName(title, year, String(selectedResourceItem?.raw_text || ''));
+        }
+
+        async function applyRecommendedResourceEd2kFolderName() {
+            const input = document.getElementById('resource-ed2k-folder-name');
+            if (!input) return;
+            const name = await getRecommendedResourceEd2kFolderName();
+            if (!input || !name) return;
+            input.value = name;
+            resourceEd2kState.folderName = name;
+            syncResourceMonitorTaskOptions(document.getElementById('resource_job_savepath')?.value || '');
+            syncResourceEd2kSubmitButton();
+            syncResourceEd2kFolderControls();
         }
 
         function setResourceEd2kCreateFolder(checked) {
@@ -446,11 +524,14 @@
                 if (!providerSupportsMonitor) {
                     hints.push(`${currentProviderLabel} 链路不会联动文件夹监控，也不会自动触发 strm 刷新。`);
                 } else {
-                    const taskCount = Array.isArray(resourceState.monitor_tasks) && resourceState.monitor_tasks.length
-                        ? resourceState.monitor_tasks.length
-                        : ((monitorState.tasks || []).length || 0);
+                    // 内置接收夹不算“文件夹监控任务”，否则全新安装会看不到这条提醒。
+                    const taskCount = (
+                        Array.isArray(resourceState.monitor_tasks) && resourceState.monitor_tasks.length
+                            ? resourceState.monitor_tasks
+                            : (monitorState.tasks || [])
+                    ).filter(task => String(task?.task_type || 'scan') !== 'inbox').length;
                     if (!taskCount) {
-                        hints.push(`当前还没有配置文件夹监控任务。保存到 ${currentProviderLabel} 仍然可用，但不会自动生成 strm。`);
+                        hints.push(`还没有配置文件夹监控任务：可以保存到 ${currentProviderLabel}，但不会自动生成 STRM。`);
                     }
                 }
             }
@@ -673,7 +754,7 @@
                     if (!isResourceEd2kReady()) {
                         const message = resourceEd2kState.error
                             ? '资源外链解析失败，请重试'
-                            : (!resourceEd2kState.selectedItemIds.length ? '请至少选择一个 ED2K 文件' : '请填写新建文件夹名称');
+                            : '请至少选择一个 ED2K 文件';
                         showToast(message, { tone: 'warn', duration: 2800, placement: 'top-center' });
                         return;
                     }
@@ -685,6 +766,9 @@
                     resourceEd2kState.folderName = folderName;
                     const folderNameInput = document.getElementById('resource-ed2k-folder-name');
                     if (folderNameInput) folderNameInput.value = folderName;
+                    const createsSubfolder = window.shouldCreateResourceEd2kSubfolder
+                        ? window.shouldCreateResourceEd2kSubfolder(savepath, folderName, resourceEd2kState.createFolder !== false)
+                        : (resourceEd2kState.createFolder !== false && !!folderName);
                     syncResourceMonitorTaskOptions(document.getElementById('resource_job_savepath')?.value || '');
                     let data = {};
                     try {
@@ -692,8 +776,8 @@
                             items: selectedItems.map(entry => ({ link_url: entry.link_url })),
                             parent_savepath: savepath,
                             parent_folder_id: folderId,
-                            create_folder: resourceEd2kState.createFolder !== false,
-                            folder_name: folderName,
+                            create_folder: createsSubfolder,
+                            folder_name: createsSubfolder ? folderName : '',
                             refresh_delay_seconds: refreshDelaySeconds,
                             auto_refresh: !!((window.providerMeta || []).find(meta => meta.name === '115')?.supports_monitor),
                             source_url: resourceEd2kState.sourceUrl || selectedResourceItem?.link_url || '',
@@ -716,7 +800,9 @@
                     const targetPath = String(data.savepath || '').trim();
                     const monitorTail = data.monitor_task_name
                         ? (data.auto_refresh ? `，保存后会自动触发“${data.monitor_task_name}”` : `，已匹配“${data.monitor_task_name}”`)
-                        : '，当前目录不会自动生成 strm';
+                        : (data.quick_import_inbox
+                            ? '，保存后由接收夹整理分发'
+                            : '，未纳入文件夹监控，不会自动生成 STRM');
                     showToast(`已创建 ${taskCount} 个保存任务${targetPath ? `，目标：${targetPath}` : ''}${monitorTail}`, {
                         tone: 'success',
                         duration: 3800,
@@ -798,7 +884,7 @@
                                     : `已匹配“${matchedTaskName}”，可稍后手动触发刷新`
                             );
                         } else {
-                            summaryParts.push('当前目录不会自动生成 strm');
+                            summaryParts.push('未纳入文件夹监控，不会自动生成 STRM');
                         }
                     }
                     const summaryText = summaryParts.join('，');
@@ -850,11 +936,13 @@
                 const matchedTaskName = String(data.monitor_task_name || '').trim();
                 const providerSupportsMonitor = !!((window.providerMeta || []).find(m => m.name === currentProvider)?.supports_monitor);
                 const tail = !providerSupportsMonitor
-                    ? `，${currentProviderLabel} 链路不联动文件夹监控`
+                    ? `，${currentProviderLabel} 不联动文件夹监控`
                     : (
                         matchedTaskName
                             ? (data.auto_refresh ? `，保存完成后会自动触发“${matchedTaskName}”` : `，已匹配“${matchedTaskName}”，可稍后手动触发刷新`)
-                            : '，当前目录不会自动生成 strm'
+                            : (data.quick_import_inbox
+                                ? '，保存后由接收夹整理分发'
+                                : '，未纳入文件夹监控，不会自动生成 STRM')
                     );
                 showToast(`已创建导入任务 #${data.job_id}${tail}`, { tone: 'success', duration: 3000, placement: 'top-center' });
             } finally {
@@ -1101,6 +1189,48 @@
             }
         }
 
+        function isResourceRecommendedFolderCandidate(item) {
+            const linkType = getEffectiveResourceLinkType(item);
+            return ['ed2k', 'magnet'].includes(linkType);
+        }
+
+        let resourceRecommendedFolderName = '';
+
+        async function getResourceRecommendedFolderName() {
+            const item = selectedResourceItem;
+            if (!item || !isResourceRecommendedFolderCandidate(item)) return '';
+            const importMode = getResourceImportMode(item);
+            if (importMode === 'ed2k-direct' || importMode === 'ed2k-page') {
+                const folderName = String(resourceEd2kState?.folderName || '').trim();
+                if (folderName) return folderName;
+                const rawTitle = String(resourceEd2kState?.titleText || item?.title || '').trim();
+                const year = window.MediaHubTitleUtils?.extractShowYear(
+                    `${rawTitle} ${String(item?.raw_text || '')}`,
+                    String(item?.year || '')
+                ) || '';
+                return fetchRecommendedFolderName(rawTitle, year, String(item?.raw_text || ''));
+            }
+            const rawTitle = String(item?.title || '').trim();
+            const year = window.MediaHubTitleUtils?.extractShowYear(
+                `${rawTitle} ${String(item?.raw_text || '')}`,
+                String(item?.year || '')
+            ) || '';
+            return fetchRecommendedFolderName(rawTitle, year, String(item?.raw_text || ''));
+        }
+
+        async function applyResourceRecommendedFolderName() {
+            const input = document.getElementById('resource-folder-create-name');
+            resourceRecommendedFolderName = await getResourceRecommendedFolderName();
+            if (input && resourceRecommendedFolderName) input.value = resourceRecommendedFolderName;
+            renderResourceRecommendedFolderButton();
+        }
+
+        function renderResourceRecommendedFolderButton() {
+            const btn = document.getElementById('resource-folder-recommend-btn');
+            if (!btn) return;
+            btn.classList.toggle('hidden', !resourceRecommendedFolderName);
+        }
+
         async function openResourceFolderModal() {
             syncResourceProviderUI();
             const provider = getCurrentResourceProvider();
@@ -1116,6 +1246,7 @@
             showLockedModal('resource-folder-modal');
             const createInput = document.getElementById('resource-folder-create-name');
             if (createInput) createInput.value = '';
+            await applyResourceRecommendedFolderName();
             setResourceFolderCreateBusy(false);
             renderResourceFolderBreadcrumbs();
             await loadResourceFolders(resourceFolderTrail[resourceFolderTrail.length - 1]?.id || '0');
@@ -1189,6 +1320,7 @@
             clearResourceEd2kTitleSelection,
             completeResourceEd2kTitleSelection,
             continueResourceEd2kTitleSelection,
+            applyRecommendedResourceEd2kFolderName,
             reopenResourceEd2kTitleSelector,
             retryResourceEd2kResolve,
             setAllResourceEd2kFilesChecked,

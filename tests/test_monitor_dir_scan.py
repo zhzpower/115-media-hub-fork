@@ -158,6 +158,7 @@ class MonitorDirScanTest(unittest.TestCase):
         task: dict,
         trigger: str = "manual",
         payload: Optional[dict] = None,
+        run_id: str = "",
     ) -> List[str]:
         call_log: List[str] = []
 
@@ -212,9 +213,31 @@ class MonitorDirScanTest(unittest.TestCase):
                     side_effect=lambda local_rel_path: strm_files.delete_managed_strm_file(local_rel_path, root=self.strm_root),
                 )
             )
-            asyncio.run(monitor.run_monitor_task(TASK_NAME, trigger=trigger, payload=payload))
+            asyncio.run(monitor.run_monitor_task(TASK_NAME, trigger=trigger, payload=payload, run_id=run_id))
 
         return call_log
+
+    def test_scan_records_directory_process_events_and_counts(self):
+        """运行详情概览要有目录级过程事件与扫描目录计数。"""
+        task = self._task(sync_clean=False, skip_by_dir_mtime=False)
+        path_results = {
+            "/115/Library": ("", [_dir_item("SeriesA", "t1")]),
+            "/115/Library/SeriesA": ("t1", [_file_item("E01.mkv", "t1")]),
+        }
+        run_id = monitor.create_monitor_run(run_kind="scan", task_name=TASK_NAME, source="manual")
+
+        self._run_monitor(path_results, task=task, run_id=run_id)
+
+        detail = monitor.get_monitor_run_detail(run_id)
+        process_ops = [
+            str(event.get("operation", "") or "")
+            for event in detail["events"]
+            if str(event.get("category", "") or "") == "process"
+        ]
+        self.assertIn("read_dir", process_ops)
+        self.assertGreaterEqual(process_ops.count("read_dir"), 2)
+        self.assertEqual(detail["run"]["status"], "completed")
+        self.assertEqual(detail["run"]["result"]["scanned_dirs"], 2)
 
     def test_manual_savepaths_scans_only_selected_subtrees_and_forces_deep_dirs(self):
         task = self._task(skip_by_dir_mtime=True)
@@ -249,6 +272,56 @@ class MonitorDirScanTest(unittest.TestCase):
                 strm_files.managed_strm_file_path("Library/SeriesB/B01.mkv", root=self.strm_root)
             )
         )
+
+    def test_monitor_scan_never_auto_organizes(self):
+        """监控回归纯扫描：指定目录扫描和整任务扫描都只刷新 STRM，不再自动整理。"""
+        # 旧的自动刮削入口整段删除（含 dir_scan_only 相关跳过逻辑）。
+        self.assertFalse(hasattr(monitor, "_auto_scrape_new_media_items"))
+        task = self._task(sync_clean=False, skip_by_dir_mtime=False)
+        path_results = {
+            "/115/Library": ("t1", [_dir_item("SeriesA", "t1")]),
+            "/115/Library/SeriesA": ("t1", [_file_item("E01.mkv", "t1")]),
+        }
+
+        # 指定目录扫描（原「扫描监控」按钮）与整任务扫描都不应产生整理结果。
+        self._run_monitor(
+            path_results,
+            task=task,
+            trigger="manual",
+            payload={"provider": "115", "savepaths": ["Library/SeriesA"]},
+        )
+        self._run_monitor(path_results, task=task, trigger="manual")
+
+        self.assertTrue(
+            os.path.exists(
+                strm_files.managed_strm_file_path("Library/SeriesA/E01.mkv", root=self.strm_root)
+            )
+        )
+        # 运行结论不再包含“自动整理”结果。
+        self.assertNotIn("已自动整理", monitor.build_monitor_run_summary({"generated": 1}))
+
+    def test_scan_skips_ad_named_fake_video_and_cleans_generated_strm(self):
+        """整段名字只有推广话术的假 .mkv 不生成 STRM；老口径生成的本地 STRM 会被过期清理删掉。"""
+        ad_name = "【更多无水印高品质资源请访问】【更多无水印高品质资源请访问】.mkv"
+        ad_local_rel = f"Library/SeriesA/{ad_name}"
+        self._insert_monitor_file(ad_local_rel, remote_rel_path=f"SeriesA/{ad_name}", remote_modified="t1")
+        stale_strm = self._create_strm(ad_local_rel)
+        task = self._task(sync_clean=True, skip_by_dir_mtime=False)
+        path_results = {
+            "/115/Library": ("t1", [_dir_item("SeriesA", "t1")]),
+            "/115/Library/SeriesA": (
+                "t1",
+                [_file_item(ad_name, "t1", 300 * 1024), _file_item("E01.mkv", "t1")],
+            ),
+        }
+
+        self._run_monitor(path_results, task=task, trigger="manual")
+
+        self.assertFalse(os.path.exists(stale_strm))
+        self.assertTrue(
+            os.path.exists(strm_files.managed_strm_file_path("Library/SeriesA/E01.mkv", root=self.strm_root))
+        )
+        self.assertNotIn(ad_local_rel, self._list_monitor_files())
 
     def test_savepaths_cleanup_and_index_bounded_to_union(self):
         task = self._task(sync_clean=True, skip_by_dir_mtime=True)
@@ -363,7 +436,7 @@ class MonitorDirScanTest(unittest.TestCase):
         )
         self.assertEqual(queued[0]["payload"]["provider"], "115")
 
-    def test_queue_merge_savepaths_over_cap_falls_back_full_scan(self):
+    def test_queue_merge_savepaths_over_cap_keeps_all_requested_scopes(self):
         with ExitStack() as stack:
             queued = []
             stack.enter_context(patch.object(monitor, "monitor_queue", queued))
@@ -388,7 +461,10 @@ class MonitorDirScanTest(unittest.TestCase):
             )
 
         self.assertEqual(len(queued), 1)
-        self.assertEqual(queued[0]["payload"], {})
+        self.assertEqual(
+            queued[0]["payload"]["savepaths"],
+            [*[f"Library/A{i}" for i in range(40)], *[f"Library/B{i}" for i in range(20)]],
+        )
 
     def test_webhook_single_savepath_merge_regression(self):
         with ExitStack() as stack:
@@ -415,7 +491,7 @@ class MonitorDirScanTest(unittest.TestCase):
             )
 
         self.assertEqual(len(queued), 1)
-        self.assertEqual(queued[0]["payload"], {})
+        self.assertEqual(queued[0]["payload"]["savepaths"], ["Library/SeriesA", "Library/SeriesB"])
 
 
 if __name__ == "__main__":

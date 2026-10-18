@@ -913,6 +913,17 @@ _SETTINGS_CONFIG_KEY_ORDER_AFTER_AUTH: Tuple[str, ...] = (
     "tmdb_cache_ttl_hours",
     "tmdb_language",
     "tmdb_region",
+    # 8b. AI 刮削辅助（OpenAI 兼容接口）
+    "ai_match_enabled",
+    "ai_match_base_url",
+    "ai_match_api_key",
+    "ai_match_model",
+    "ai_match_timeout_seconds",
+    "ai_match_temperature",
+    "ai_match_max_concurrency",
+    "ai_match_thinking_mode",
+    "ai_match_min_confidence",
+    "ai_match_cache_ttl_hours",
     # 9. 通知推送
     "notify_push_enabled",
     "notify_monitor_enabled",
@@ -929,6 +940,7 @@ _SETTINGS_CONFIG_KEY_ORDER_AFTER_AUTH: Tuple[str, ...] = (
     # 其他页面维护的数据
     "mount_points",
     "monitor_tasks",
+    "monitor_run_retention",
     "subscription_tasks",
 )
 
@@ -992,6 +1004,8 @@ def default_config() -> Dict[str, Any]:
         "123pan_username": "",
         "123pan_password": "",
         "aliyun_refresh_token": "",
+        "aliyun_token_is_access": False,
+        "aliyun_access_expires_at": 0,
         "provider_enabled": _build_provider_enabled_defaults(),
         "default_magnet_provider": "115",
         "sign115_enabled": False,
@@ -1018,6 +1032,16 @@ def default_config() -> Dict[str, Any]:
         "tmdb_language": "zh-CN",
         "tmdb_region": "CN",
         "tmdb_cache_ttl_hours": 24,
+        "ai_match_enabled": False,
+        "ai_match_base_url": "",
+        "ai_match_api_key": "",
+        "ai_match_model": "",
+        "ai_match_timeout_seconds": 20,
+        "ai_match_temperature": 0,
+        "ai_match_max_concurrency": 3,
+        "ai_match_thinking_mode": "auto",
+        "ai_match_min_confidence": 60,
+        "ai_match_cache_ttl_hours": 24,
         "pansou_enabled": False,
         "pansou_base_url": "",
         "pansou_username": "",
@@ -1031,10 +1055,13 @@ def default_config() -> Dict[str, Any]:
         "sha1_skip": True,
         "sync_clean": True,
         "monitor_tasks": [],
+        "monitor_run_retention": {"mode": "longterm", "days": 30},
         "subscription_tasks": [],
         "resource_sources": [],
         "resource_quick_links": [],
         "resource_favorite_dirs": {"115": [], "quark": []},
+        "scraper_noise_phrases": [],
+        "scraper_standalone_noise_words": [],
     }
 
 
@@ -1107,8 +1134,41 @@ def is_resource_source_search_enabled(source: Dict[str, Any]) -> bool:
     }
 
 
+# 监控任务类型：scan = 扫描目录生成 strm；inbox = 接收夹，负责接收后识别分发。
+MONITOR_TASK_TYPE_SCAN = "scan"
+MONITOR_TASK_TYPE_INBOX = "inbox"
+MONITOR_TASK_TYPES = (MONITOR_TASK_TYPE_SCAN, MONITOR_TASK_TYPE_INBOX)
+MONITOR_INBOX_DEFAULT_NAME = "接收"
+MONITOR_INBOX_DEFAULT_PROVIDER = "115"
+
+
+def normalize_task_type(value: Any) -> str:
+    key = str(value or "").strip().lower()
+    return key if key in MONITOR_TASK_TYPES else MONITOR_TASK_TYPE_SCAN
+
+
+def normalize_distribute_targets(value: Any) -> Dict[str, str]:
+    """接收夹任务的分发目标：``{"movie": 远程文件夹路径, "tv": 远程文件夹路径}``。
+
+    值语义是「带网盘挂载前缀的远程路径」（例如 ``/115/自存影视``），不再是监控任务名；
+    旧配置里的任务名由 ``ensure_inbox_task`` 在能看到任务全表的地方迁移成该任务的
+    ``scan_path``，这里只做去空与去空白。
+    """
+    raw = value if isinstance(value, dict) else {}
+    targets: Dict[str, str] = {}
+    for key in ("movie", "tv"):
+        target = str(raw.get(key, "") or "").strip()
+        if target:
+            targets[key] = target
+    return targets
+
+
 def normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
     name = str(task.get("name", "")).strip()
+    task_type = normalize_task_type(task.get("task_type"))
+    # 老配置没有 enabled：扫描任务默认开启，接收夹任务默认关闭（要靠用户在编辑弹窗里显式打开）。
+    enabled_default = task_type == MONITOR_TASK_TYPE_SCAN
+    enabled = normalize_bool(task.get("enabled", enabled_default), default=enabled_default)
     retries = int(task.get("retries", 3) or 3)
     retries = max(1, min(MAX_MONITOR_RETRIES, retries))
     raw_list_delay_ms = task.get("list_delay_ms", 250)
@@ -1126,12 +1186,38 @@ def normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
     if strm_write_mode not in {"incremental", "full"}:
         strm_write_mode = "incremental"
     raw_auto_scrape_options = task.get("auto_scrape_options")
-    auto_scrape_options = raw_auto_scrape_options if isinstance(raw_auto_scrape_options, dict) else {}
+    # 接收夹的整理选项沿用接收夹任务自己的字段；扫描任务的「新增资源自动整理」已废弃，
+    # 旧配置里残留的开关与选项直接丢弃。
+    auto_scrape_options = (
+        raw_auto_scrape_options
+        if task_type == MONITOR_TASK_TYPE_INBOX and isinstance(raw_auto_scrape_options, dict)
+        else {}
+    )
+    provider = normalize_mount_provider(task.get("provider", ""))
+    if task_type == MONITOR_TASK_TYPE_INBOX and not provider:
+        provider = "115"
+    if task_type != MONITOR_TASK_TYPE_INBOX:
+        provider = ""
+    quick_import_target = str(task.get("quick_import_target", "") or "").strip().lower()
+    if quick_import_target not in ("movie", "tv"):
+        quick_import_target = ""
+    inbox_idle_seconds = int(task.get("inbox_idle_seconds", 120) or 120)
+    raw_inbox_max_items = task.get("inbox_max_items_per_run", 100)
+    inbox_max_items_per_run = (
+        int(raw_inbox_max_items)
+        if raw_inbox_max_items is not None and str(raw_inbox_max_items).strip() != ""
+        else 100
+    )
+    inbox_batch_pause_seconds = int(task.get("inbox_batch_pause_seconds", 5) or 5)
     return {
         "name": name,
+        "task_type": task_type,
+        "provider": provider,
+        "enabled": enabled,
+        "distribute_targets": normalize_distribute_targets(task.get("distribute_targets")),
         "webhook_enabled": normalize_bool(task.get("webhook_enabled", False), default=False),
-        "auto_scrape_on_new": normalize_bool(task.get("auto_scrape_on_new", False), default=False),
         "auto_scrape_options": auto_scrape_options,
+        "quick_import_target": quick_import_target,
         "scan_path": normalize_remote_path(task.get("scan_path", "")),
         "target_path": normalize_relative_path(task.get("target_path", "")),
         "skip_by_dir_mtime": normalize_bool(task.get("skip_by_dir_mtime", False), default=False),
@@ -1143,7 +1229,236 @@ def normalize_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "min_file_size_mb": max(0, min_file_size_mb),
         "delay_seconds": max(0, delay_seconds),
         "cron_minutes": max(0, cron_minutes),
+        "inbox_idle_seconds": max(0, min(3600, inbox_idle_seconds)),
+        "inbox_max_items_per_run": max(1, min(500, inbox_max_items_per_run)),
+        "inbox_batch_pause_seconds": max(0, min(300, inbox_batch_pause_seconds)),
     }
+
+
+def _is_remote_folder_target(cfg: Dict[str, Any], value: str) -> bool:
+    """分发目标是否已经是合法远程路径（带网盘挂载前缀）。"""
+    remote = normalize_remote_path(str(value or "").strip())
+    if not remote or remote == "/":
+        return False
+    try:
+        resolve_provider_relative_path(cfg, remote)
+    except Exception:
+        return False
+    return True
+
+
+def _migrate_inbox_distribute_targets(
+    cfg: Dict[str, Any],
+    raw_targets: Dict[str, str],
+    tasks: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """把接收夹分发目标从「监控任务名」迁移成「远程文件夹路径」。
+
+    幂等：值已经是合法远程路径就原样保留；能匹配到某个扫描任务名就换成该任务的
+    ``scan_path``；两者都不是（任务被删了 / 名字写错）就清空，让校验提示用户重选。
+    """
+    scan_task_paths = {
+        str(task.get("name", "") or "").strip(): normalize_remote_path(
+            str(task.get("scan_path", "") or "").strip()
+        )
+        for task in tasks
+        if isinstance(task, dict)
+        and normalize_task_type(task.get("task_type")) == MONITOR_TASK_TYPE_SCAN
+        and str(task.get("name", "") or "").strip()
+    }
+    migrated: Dict[str, str] = {}
+    for key, value in raw_targets.items():
+        target = str(value or "").strip()
+        if not target:
+            continue
+        if _is_remote_folder_target(cfg, target):
+            migrated[key] = normalize_remote_path(target)
+            continue
+        scan_path = scan_task_paths.get(target, "")
+        if scan_path and scan_path != "/":
+            migrated[key] = scan_path
+    return migrated
+
+
+def ensure_inbox_task(cfg: Dict[str, Any]) -> None:
+    """保证每个网盘最多一个接收夹任务，并在一个都没有时补一个默认的 115 接收夹。
+
+    接收夹是内置槽位（用户不需要自己新建），但接收夹只能整理**同盘**文件，所以每个网盘
+    可以各配一个。同一个网盘上重复的接收夹会互相抢同一个路径，这里按 provider 去重、
+    只保留第一个。顺带把旧版的 ``quick_import_enabled`` / ``quick_import_inbox_path`` 与
+    扫描任务上的 ``quick_import_target`` 迁移到默认（115）接收夹并删除旧字段。
+    """
+    tasks = cfg.get("monitor_tasks") if isinstance(cfg.get("monitor_tasks"), list) else []
+    legacy_keys_present = ("quick_import_enabled" in cfg) or ("quick_import_inbox_path" in cfg)
+
+    legacy_enabled = normalize_bool(cfg.get("quick_import_enabled", False), default=False)
+    legacy_inbox = normalize_remote_path(str(cfg.get("quick_import_inbox_path", "") or "").strip())
+    if legacy_inbox in ("", "/"):
+        legacy_inbox = ""
+    legacy_targets: Dict[str, str] = {}
+    for task in tasks:
+        if not isinstance(task, dict) or normalize_task_type(task.get("task_type")) != MONITOR_TASK_TYPE_SCAN:
+            continue
+        target = str(task.get("quick_import_target", "") or "").strip().lower()
+        if target in ("movie", "tv") and target not in legacy_targets:
+            legacy_targets[target] = str(task.get("name", "") or "").strip()
+
+    kept_inbox: List[Dict[str, Any]] = []
+    seen_providers: set = set()
+    for task in tasks:
+        if not isinstance(task, dict) or normalize_task_type(task.get("task_type")) != MONITOR_TASK_TYPE_INBOX:
+            continue
+        provider_key = normalize_mount_provider(task.get("provider", "")) or MONITOR_INBOX_DEFAULT_PROVIDER
+        if provider_key in seen_providers:
+            continue
+        seen_providers.add(provider_key)
+        kept_inbox.append(task)
+
+    if not kept_inbox:
+        name = MONITOR_INBOX_DEFAULT_NAME
+        used_names = {str(task.get("name", "") or "") for task in tasks if isinstance(task, dict)}
+        suffix = 2
+        while name in used_names:
+            name = f"{MONITOR_INBOX_DEFAULT_NAME}{suffix}"
+            suffix += 1
+        # 默认接收夹挂在 115 上、默认开启（配置不全时界面会直接提示缺什么），但 webhook 默认关闭：
+        # 只有用户在后台设置了签名密钥后才能手动打开，避免全新安装就暴露一个免鉴权写入口。
+        default_inbox = normalize_task(
+            {
+                "name": name,
+                "task_type": MONITOR_TASK_TYPE_INBOX,
+                "provider": MONITOR_INBOX_DEFAULT_PROVIDER,
+                "enabled": True,
+                "webhook_enabled": False,
+            }
+        )
+        tasks.append(default_inbox)
+        kept_inbox.append(default_inbox)
+
+    # 旧版全局配置只迁移到默认（115）接收夹；其他网盘的接收夹从默认值起步。
+    primary_inbox = next(
+        (
+            task
+            for task in kept_inbox
+            if (normalize_mount_provider(task.get("provider", "")) or MONITOR_INBOX_DEFAULT_PROVIDER)
+            == MONITOR_INBOX_DEFAULT_PROVIDER
+        ),
+        kept_inbox[0],
+    )
+    for inbox in kept_inbox:
+        if str(inbox.get("scan_path", "") or "").strip() == "/":
+            # 空路径保持为空，界面才会提示“请先选择接收文件夹”，而不是显示成根目录。
+            inbox["scan_path"] = ""
+        if (
+            normalize_mount_provider(inbox.get("provider", "")) or MONITOR_INBOX_DEFAULT_PROVIDER
+        ) != MONITOR_INBOX_DEFAULT_PROVIDER:
+            # Webhook 只对 115 的接收夹开放：脚本上报的保存路径按 115 根目录解析，别的网盘配了也落不到本盘。
+            # 界面上开关本来就禁选 + 落库前清掉，这里再兜一次，手工改配置文件也不会留下一个可用的 webhook。
+            inbox["webhook_enabled"] = False
+        if inbox is primary_inbox and legacy_inbox and not str(inbox.get("scan_path", "") or "").strip():
+            inbox["scan_path"] = legacy_inbox
+        if inbox is primary_inbox and legacy_enabled:
+            inbox["enabled"] = True
+        raw_targets = normalize_distribute_targets(inbox.get("distribute_targets"))
+        if inbox is primary_inbox:
+            for key, task_name in legacy_targets.items():
+                raw_targets.setdefault(key, task_name)
+        inbox["distribute_targets"] = _migrate_inbox_distribute_targets(cfg, raw_targets, tasks)
+        if inbox is primary_inbox and (legacy_keys_present or legacy_targets):
+            # 旧接收夹入口本身常开，但迁移时遵循“有签名密钥才开 webhook”的新口径；
+            # 没有密钥就保持关闭，让用户在编辑弹窗里看到提示后自行开启。
+            inbox["webhook_enabled"] = bool(str(cfg.get("webhook_secret", "") or "").strip())
+
+    # 只保留每个网盘第一个接收夹：同一网盘上历史误建的多余接收夹会互相抢同一个路径。
+    kept_ids = {id(task) for task in kept_inbox}
+    cfg["monitor_tasks"] = [
+        task
+        for task in tasks
+        if not isinstance(task, dict)
+        or normalize_task_type(task.get("task_type")) != MONITOR_TASK_TYPE_INBOX
+        or id(task) in kept_ids
+    ]
+
+    # 分发目标统一由接收夹任务声明，扫描任务上的旧标注清空，避免两处各说各话。
+    for task in cfg.get("monitor_tasks", []) or []:
+        if isinstance(task, dict):
+            task["quick_import_target"] = ""
+    cfg.pop("quick_import_enabled", None)
+    cfg.pop("quick_import_inbox_path", None)
+
+
+def get_inbox_tasks(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """取全部接收夹任务（``task_type='inbox'``），保持配置里的顺序。"""
+    active_cfg = cfg if isinstance(cfg, dict) else get_config()
+    return [
+        task
+        for task in (active_cfg.get("monitor_tasks", []) or [])
+        if isinstance(task, dict) and normalize_task_type(task.get("task_type")) == MONITOR_TASK_TYPE_INBOX
+    ]
+
+
+def get_inbox_task(cfg: Optional[Dict[str, Any]] = None, name: str = "") -> Dict[str, Any]:
+    """取一个接收夹任务：给了 ``name`` 就按名字取，否则取第一个；未配置时返回空字典。"""
+    wanted = str(name or "").strip()
+    for task in get_inbox_tasks(cfg):
+        if not wanted or str(task.get("name", "") or "").strip() == wanted:
+            return task
+    return {}
+
+
+def apply_task_type_constraints(
+    existing_tasks: List[Dict[str, Any]],
+    posted_tasks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """同名任务的类型不可更改；接收夹可以按网盘新增（每个网盘保留一个）。
+
+    - 与现有任务同名：类型沿用现有类型（扫描任务不能变成接收夹，接收夹也不能变成扫描任务）；
+    - 新任务：按提交的类型保留，接收夹 / 扫描都可以，保存后由 ``ensure_inbox_task``
+      按 provider 去重（同一个网盘只保留第一个接收夹）；
+    - 非接收夹任务上的 ``distribute_targets`` 一律清空（分发目标只属于接收夹）。
+    """
+    current_by_name = {
+        str(task.get("name", "") or "").strip(): task
+        for task in (existing_tasks or [])
+        if isinstance(task, dict) and str(task.get("name", "") or "").strip()
+    }
+    for task in posted_tasks or []:
+        name = str(task.get("name", "") or "").strip()
+        existing = current_by_name.get(name)
+        if existing is not None:
+            task["task_type"] = normalize_task_type(existing.get("task_type"))
+        else:
+            task["task_type"] = normalize_task_type(task.get("task_type"))
+        if normalize_task_type(task.get("task_type")) != MONITOR_TASK_TYPE_INBOX:
+            task["distribute_targets"] = {}
+    return posted_tasks
+
+
+def finalize_monitor_tasks_for_save(
+    existing_tasks: List[Dict[str, Any]],
+    posted_tasks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """保存监控任务前的统一收口：同名任务类型不可改；漏传的接收夹沿用当前配置。
+
+    ``/monitor/save`` 与 ``/save_settings`` 都走这里，避免两个入口的约束不一致
+    （否则可以绕过 ``/monitor/save`` 直接把接收夹改成扫描任务）。
+    """
+    tasks = apply_task_type_constraints(existing_tasks, posted_tasks)
+    posted_inbox_names = {
+        str(task.get("name", "") or "").strip()
+        for task in tasks
+        if normalize_task_type(task.get("task_type")) == MONITOR_TASK_TYPE_INBOX
+    }
+    for inbox in get_inbox_tasks({"monitor_tasks": existing_tasks}):
+        name = str(inbox.get("name", "") or "").strip()
+        if name and name not in posted_inbox_names:
+            tasks.append(inbox)
+            posted_inbox_names.add(name)
+    if not any(normalize_task_type(task.get("task_type")) == MONITOR_TASK_TYPE_INBOX for task in tasks):
+        current_inbox = get_inbox_task({"monitor_tasks": existing_tasks})
+        if current_inbox:
+            tasks.append(current_inbox)
+    return tasks
 
 
 def normalize_subscription_quality_priority(value: Any) -> str:
@@ -1829,6 +2144,27 @@ def normalize_subscription_scan_settings(task: Dict[str, Any], provider: Any = "
     }
 
 
+# 订阅「入库后整理」的默认选项：有意覆盖引擎默认（引擎默认 title_language=auto）。
+SUBSCRIPTION_ORGANIZE_OPTION_DEFAULTS: Dict[str, Any] = {
+    "title_language": "zh",
+    "file_name_mode": "standard",
+    "episode_mode": "auto",
+    "delete_ad_files": False,
+}
+
+
+def _normalize_subscription_organize_options(raw: Any) -> Dict[str, Any]:
+    """订阅「入库后整理」选项：复用刮削引擎的批量偏好归一化，只补默认值。
+
+    默认中文标题 / standard 命名是有意覆盖引擎默认 `auto` 的（见 plans 的订阅自理整理），
+    用户显式保存过的字段以用户值为准。
+    """
+    from .services.scraper import _normalize_scraper_batch_preferences
+
+    payload = raw if isinstance(raw, dict) else {}
+    return _normalize_scraper_batch_preferences({**SUBSCRIPTION_ORGANIZE_OPTION_DEFAULTS, **payload})
+
+
 def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
     media_type = str(task.get("media_type", "") or task.get("type", "movie")).strip().lower()
     if media_type not in ("movie", "tv"):
@@ -1989,10 +2325,15 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
     if not share_subdir:
         share_subdir_cid = ""
     scan_settings = normalize_subscription_scan_settings(task, provider)
+    organize_on_import = normalize_bool(task.get("organize_on_import", True), default=True)
+    raw_organize_options = task.get("organize_options")
+    organize_options = _normalize_subscription_organize_options(raw_organize_options)
     return {
         "name": name,
         "provider": provider,
         "media_type": media_type,
+        "organize_on_import": organize_on_import,
+        "organize_options": organize_options,
         "title": title,
         "aliases": aliases,
         "exclude_keywords": exclude_keywords,
@@ -2359,6 +2700,62 @@ def resolve_provider_relative_path(
     return provider, relative_path
 
 
+def normalize_userscript_savepath(cfg: Dict[str, Any], raw: Any) -> str:
+    """把油猴脚本里的「保存路径」统一成 115 根目录相对路径。
+
+    用户在脚本里既能填根目录相对路径（``接收``），也可能照抄面板上的挂载路径
+    （``/115/接收``）。这里统一剥掉挂载前缀，避免同一个目录在服务端被当成两个：
+    快捷导入会因为对不上接收夹而直接报错，扫描任务更糟——会静默去 115 根目录下
+    找/建一个叫 ``115`` 的文件夹。多带前缀做兼容，少带前缀才是唯一口径。
+    """
+    relative = normalize_relative_path(str(raw or "").strip())
+    if not relative:
+        return ""
+    try:
+        _provider, matched_rel = resolve_provider_relative_path(
+            cfg,
+            join_remote_path("/", relative),
+            expected_provider="115",
+        )
+    except Exception:
+        return relative
+    return normalize_relative_path(matched_rel)
+
+
+def is_relative_path_within(child: Any, parent: Any) -> bool:
+    """相对路径包含判断（``接收/子目录`` 落在 ``接收`` 内，但 ``接收2`` 不算）。"""
+    child_rel = normalize_relative_path(str(child or "").strip())
+    parent_rel = normalize_relative_path(str(parent or "").strip())
+    if not child_rel or not parent_rel:
+        return False
+    return child_rel == parent_rel or child_rel.startswith(parent_rel + "/")
+
+
+SCRAPER_NOISE_WORDS_MAX_ITEMS = 200
+SCRAPER_NOISE_WORD_MAX_LENGTH = 50
+
+
+def normalize_scraper_noise_words(value: Any) -> List[str]:
+    """把设置里的自定义过滤词归一化为去重保序的字符串列表。"""
+    if isinstance(value, str):
+        raw_items = re.split(r"[\r\n,]+", value)
+    elif isinstance(value, (list, tuple)):
+        raw_items = value
+    else:
+        raw_items = []
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for raw in raw_items:
+        item = str(raw or "").strip()
+        if not item or len(item) > SCRAPER_NOISE_WORD_MAX_LENGTH or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+        if len(normalized) >= SCRAPER_NOISE_WORDS_MAX_ITEMS:
+            break
+    return normalized
+
+
 def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     merged = default_config()
     merged.update(cfg or {})
@@ -2435,6 +2832,26 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         merged["tmdb_region"] = "CN"
     if "tmdb_cache_ttl_hours" not in merged:
         merged["tmdb_cache_ttl_hours"] = 24
+    if "ai_match_enabled" not in merged:
+        merged["ai_match_enabled"] = False
+    if "ai_match_base_url" not in merged:
+        merged["ai_match_base_url"] = ""
+    if "ai_match_api_key" not in merged:
+        merged["ai_match_api_key"] = ""
+    if "ai_match_model" not in merged:
+        merged["ai_match_model"] = ""
+    if "ai_match_timeout_seconds" not in merged:
+        merged["ai_match_timeout_seconds"] = 20
+    if "ai_match_temperature" not in merged:
+        merged["ai_match_temperature"] = 0
+    if "ai_match_max_concurrency" not in merged:
+        merged["ai_match_max_concurrency"] = 3
+    if "ai_match_thinking_mode" not in merged:
+        merged["ai_match_thinking_mode"] = "auto"
+    if "ai_match_min_confidence" not in merged:
+        merged["ai_match_min_confidence"] = 60
+    if "ai_match_cache_ttl_hours" not in merged:
+        merged["ai_match_cache_ttl_hours"] = 24
     if "pansou_enabled" not in merged:
         merged["pansou_enabled"] = False
     if "pansou_base_url" not in merged:
@@ -2453,6 +2870,15 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         merged["mount_points"] = [dict(item) for item in DEFAULT_MOUNT_POINTS]
     if "monitor_tasks" not in merged or not isinstance(merged["monitor_tasks"], list):
         merged["monitor_tasks"] = []
+    retention = merged.get("monitor_run_retention")
+    if not isinstance(retention, dict):
+        retention = {}
+    mode = str(retention.get("mode", "longterm") or "longterm").strip().lower()
+    try:
+        days = max(1, min(3650, int(retention.get("days", 30) or 30)))
+    except (TypeError, ValueError):
+        days = 30
+    merged["monitor_run_retention"] = {"mode": "days" if mode == "days" else "longterm", "days": days}
     if "subscription_tasks" not in merged or not isinstance(merged["subscription_tasks"], list):
         merged["subscription_tasks"] = []
     if "resource_sources" not in merged or not isinstance(merged["resource_sources"], list):
@@ -2587,6 +3013,49 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     except (TypeError, ValueError):
         tmdb_cache_ttl_hours = 24
     merged["tmdb_cache_ttl_hours"] = max(1, min(24 * 30, tmdb_cache_ttl_hours))
+    merged["ai_match_enabled"] = normalize_bool(merged.get("ai_match_enabled", False), default=False)
+    merged["ai_match_base_url"] = str(merged.get("ai_match_base_url", "") or "").strip().rstrip("/")
+    merged["ai_match_api_key"] = str(merged.get("ai_match_api_key", "") or "").strip()
+    merged["ai_match_model"] = str(merged.get("ai_match_model", "") or "").strip()
+    try:
+        ai_match_timeout_seconds = int(merged.get("ai_match_timeout_seconds", 20) or 20)
+    except (TypeError, ValueError):
+        ai_match_timeout_seconds = 20
+    merged["ai_match_timeout_seconds"] = max(3, min(120, ai_match_timeout_seconds))
+    try:
+        ai_match_temperature = float(merged.get("ai_match_temperature", 0) or 0)
+    except (TypeError, ValueError):
+        ai_match_temperature = 0.0
+    merged["ai_match_temperature"] = max(0.0, min(2.0, ai_match_temperature))
+    try:
+        ai_match_max_concurrency = int(merged.get("ai_match_max_concurrency", 3) or 3)
+    except (TypeError, ValueError):
+        ai_match_max_concurrency = 3
+    merged["ai_match_max_concurrency"] = max(1, min(8, ai_match_max_concurrency))
+    ai_thinking_mode = str(merged.get("ai_match_thinking_mode", "") or "").strip().lower()
+    raw_cfg = cfg if isinstance(cfg, dict) else {}
+    legacy_disable_thinking = raw_cfg.get("ai_match_disable_thinking")
+    if "ai_match_thinking_mode" not in raw_cfg and legacy_disable_thinking is not None:
+        # 兼容 0.11.1 的布尔配置：true=auto（仅 DeepSeek 关闭），false=enabled（不干预）。
+        ai_thinking_mode = "auto" if normalize_bool(legacy_disable_thinking, default=True) else "enabled"
+    elif ai_thinking_mode not in ("auto", "disabled", "enabled"):
+        ai_thinking_mode = "auto"
+    merged["ai_match_thinking_mode"] = ai_thinking_mode
+    merged.pop("ai_match_disable_thinking", None)
+    try:
+        ai_match_min_confidence = int(merged.get("ai_match_min_confidence", 60) or 0)
+    except (TypeError, ValueError):
+        ai_match_min_confidence = 60
+    # 旧默认 0 = 不过滤，如今默认 60；把未显式配置过的旧默认一并升级，避免低置信度 AI 结果仍被直接采用。
+    if ai_match_min_confidence <= 0:
+        ai_match_min_confidence = 60
+    merged["ai_match_min_confidence"] = max(0, min(100, ai_match_min_confidence))
+    try:
+        ai_match_cache_ttl_hours = int(merged.get("ai_match_cache_ttl_hours", 24) or 24)
+    except (TypeError, ValueError):
+        ai_match_cache_ttl_hours = 24
+    merged["ai_match_cache_ttl_hours"] = max(0, min(24 * 30, ai_match_cache_ttl_hours))
+    ensure_inbox_task(merged)
     try:
         tg_channel_threads = int(merged.get("tg_channel_threads", TG_CHANNEL_THREADS_DEFAULT) or TG_CHANNEL_THREADS_DEFAULT)
     except (TypeError, ValueError):
@@ -2600,6 +3069,10 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     stored_pw = str(merged.get("password", "") or "")
     if stored_pw and not is_password_hashed(stored_pw):
         merged["password"] = hash_password(stored_pw)
+    merged["scraper_noise_phrases"] = normalize_scraper_noise_words(merged.get("scraper_noise_phrases", []))
+    merged["scraper_standalone_noise_words"] = normalize_scraper_noise_words(
+        merged.get("scraper_standalone_noise_words", [])
+    )
     return order_config_for_save(merged)
 
 
@@ -3713,6 +4186,9 @@ def match_monitor_task_for_savepath(cfg: Dict[str, Any], savepath: str, provider
     for raw_task in cfg.get("monitor_tasks", []) or []:
         task = normalize_task(raw_task or {})
         task_name = str(task.get("name", "") or "").strip()
+        if task.get("task_type") == MONITOR_TASK_TYPE_INBOX:
+            # 接收夹不是扫描目标：落点匹配到它时应当交给接收夹流程，而不是触发目录扫描。
+            continue
         scan_path = normalize_remote_path(task.get("scan_path", ""))
         if not task_name or not scan_path or scan_path == "/":
             continue
@@ -5542,6 +6018,13 @@ def build_monitor_status_payload(
     logs = monitor_status.get("logs", [])
     tail_limit = min(log_limit, UI_STATUS_STREAM_LOG_TAIL_LIMIT) if compact else log_limit
     segment_page = build_monitor_log_segment_page(limit=MONITOR_UI_RECENT_TASK_LOG_LIMIT)
+    try:
+        from .services.monitor_runs import list_runs
+        # 运行记录页面固定按 5 条分页（前端 `fetchMonitorRunPage` 的 limit 必须保持一致）；
+        # 状态推送也只携带第一页，避免把实时状态刷新误当成完整列表，或让首屏一次渲染出两页记录。
+        run_page = list_runs(limit=5)
+    except Exception:
+        run_page = {"runs": [], "has_more": False, "next_cursor": ""}
     payload = {
         "running": bool(monitor_status["running"]),
         "current_task": str(monitor_status.get("current_task", "")),
@@ -5553,6 +6036,10 @@ def build_monitor_status_payload(
         "log_segment_total": segment_page["total"],
         "log_segment_limit": segment_page["limit"],
         "log_segment_has_more": segment_page["has_more"],
+        "runs": run_page["runs"],
+        "run_has_more": run_page["has_more"],
+        "run_next_cursor": run_page["next_cursor"],
+        "run_retention": clone_jsonable(cfg.get("monitor_run_retention", {"mode": "longterm", "days": 30})),
         "summary": clone_jsonable(monitor_status.get("summary", {})),
         "change_counts": clone_jsonable(change_counts),
         "webhook_base": "/webhook/",
@@ -6468,14 +6955,23 @@ async def write_log(msg: str, level: Optional[str] = None) -> None:
     await asyncio.sleep(0)
 
 
-async def write_monitor_log(text: str, level: str = "info") -> None:
+_monitor_log_lock = threading.Lock()
+
+
+def write_monitor_log_sync(text: str, level: str = "info") -> None:
+    """同步写监控日志，给工作线程里的流程用（例如接收夹整理）。"""
     resolved_level = str(level or infer_log_level_from_text(text)).strip().lower() or "info"
     line = f"{format_log_time(True)} {text}"
     entry = {"text": line, "level": resolved_level}
-    _append_status_log_entry(monitor_status["logs"], entry)
-    _append_monitor_log_segment_entry(entry)
+    with _monitor_log_lock:
+        _append_status_log_entry(monitor_status["logs"], entry)
+        _append_monitor_log_segment_entry(entry)
     schedule_ui_state_push()
-    await asyncio.to_thread(append_log_file, MONITOR_LOG_PATH, line)
+    append_log_file(MONITOR_LOG_PATH, line)
+
+
+async def write_monitor_log(text: str, level: str = "info") -> None:
+    write_monitor_log_sync(text, level)
     await asyncio.sleep(0)
 
 
@@ -6703,10 +7199,16 @@ async def write_subscription_section(title: str) -> None:
     await write_subscription_log(f"·· {title} ··", "section-divider")
 
 
-async def write_monitor_task_header(task: Dict[str, Any], trigger: str, payload: Optional[Dict[str, Any]] = None) -> None:
+async def write_monitor_task_header(
+    task: Dict[str, Any],
+    trigger: str,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    source_label: str = "",
+) -> None:
     write_mode_label = "全量重写 STRM" if task.get("strm_write_mode") == "full" else "增量生成/更新 STRM"
     await write_monitor_log(
-        f"━━━━━━━━━━【任务开始 | {task['name']} | {format_monitor_trigger(trigger)}】━━━━━━━━━━",
+        f"━━━━━━━━━━【任务开始 | {task['name']} | {str(source_label or '').strip() or format_monitor_trigger(trigger)}】━━━━━━━━━━",
         "task-divider",
     )
     await write_monitor_log(
@@ -6758,7 +7260,7 @@ async def write_monitor_task_footer(task_name: str, status: str, level: str = "t
 
 async def write_monitor_task_summary(stats: Dict[str, int], cleanup_enabled: Optional[bool] = None) -> None:
     await write_monitor_log(
-        f"生成汇总: 新增/更新 {stats['generated']} | 跳过文件 {stats['skipped']} | 跳过目录 {stats['skipped_dirs']} | 失败目录 {stats['failed_dirs']}",
+        f"生成汇总: 新增/更新 {stats['generated']} | 跳过文件 {stats['skipped']}（含广告 {stats.get('skipped_ad_files', 0)}） | 跳过目录 {stats['skipped_dirs']} | 失败目录 {stats['failed_dirs']}",
         "info",
     )
     await write_monitor_log(

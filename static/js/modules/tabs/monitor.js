@@ -51,12 +51,23 @@ export function applyMonitorState(data, {
     buildMonitorRenderKey,
     getLastMonitorRenderKey,
     setLastMonitorRenderKey,
+    buildMonitorRunRenderKey,
+    getLastMonitorRunRenderKey,
+    setLastMonitorRunRenderKey,
     renderMonitorTasks,
     renderMonitorLogs,
     afterApply,
 } = {}) {
     if (!data) return;
     const currentMonitorState = typeof getMonitorState === 'function' ? (getMonitorState() || {}) : {};
+    if (currentMonitorState.run_filtered || currentMonitorState.run_loading || Number(currentMonitorState.run_page || 1) > 1) {
+        data = {
+            ...data,
+            runs: currentMonitorState.runs,
+            run_has_more: currentMonitorState.run_has_more,
+            run_next_cursor: currentMonitorState.run_next_cursor,
+        };
+    }
     const logSegments = mergeMonitorLogSegments(currentMonitorState, data);
     const logSegmentTotal = Number(data.log_segment_total || currentMonitorState.log_segment_total || logSegments.length) || logSegments.length;
     const nextState = {
@@ -67,6 +78,10 @@ export function applyMonitorState(data, {
         log_segments: logSegments,
         log_segment_total: logSegmentTotal,
         log_segment_has_more: logSegments.length < logSegmentTotal,
+        runs: Array.isArray(data.runs) ? data.runs : (currentMonitorState.runs || []),
+        run_has_more: data.run_has_more !== undefined ? !!data.run_has_more : !!currentMonitorState.run_has_more,
+        run_next_cursor: data.run_next_cursor ?? currentMonitorState.run_next_cursor ?? '',
+        run_retention: data.run_retention || currentMonitorState.run_retention || { mode: 'longterm', days: 30 },
         queued: Array.isArray(data.queued) ? data.queued : (currentMonitorState.queued || []),
         next_runs: data.next_runs || currentMonitorState.next_runs || {},
         summary: data.summary || currentMonitorState.summary || { step: '空闲', detail: '等待监控任务' }
@@ -86,7 +101,12 @@ export function applyMonitorState(data, {
         if (typeof renderMonitorTasks === 'function') renderMonitorTasks();
         if (typeof setLastMonitorRenderKey === 'function') setLastMonitorRenderKey(renderKey);
     }
-    if (typeof renderMonitorLogs === 'function') renderMonitorLogs();
+    // 运行记录列表只在内容真的变化时重绘，避免每次状态推送重建整块列表。
+    const runRenderKey = typeof buildMonitorRunRenderKey === 'function' ? buildMonitorRunRenderKey(nextState) : '';
+    const lastRunRenderKey = typeof getLastMonitorRunRenderKey === 'function' ? String(getLastMonitorRunRenderKey() || '') : '';
+    if (typeof renderMonitorLogs === 'function' && (forceRender || runRenderKey !== lastRunRenderKey)) {
+        renderMonitorLogs();
+    }
     if (typeof afterApply === 'function') afterApply(nextState);
 }
 

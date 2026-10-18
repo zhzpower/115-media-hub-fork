@@ -12,6 +12,7 @@ MODAL_MODULE_PATH = ROOT / "static/js/modules/resource/import-modal.js"
 BROWSER_MODULE_PATH = ROOT / "static/js/modules/resource/browser.js"
 FOLDER_API_MODULE_PATH = ROOT / "static/js/modules/resource/folder-api.js"
 TEMPLATE_PATH = ROOT / "templates/partials/modals/resource_import.html"
+CSS_PATH = ROOT / "static/css/index.css"
 
 
 class IdHierarchyParser(HTMLParser):
@@ -307,6 +308,50 @@ class ResourceEd2kFrontendLogicTest(unittest.TestCase):
             submit_body.index("postJson('/resource/ed2k/jobs/create-batch'"),
         )
 
+    def test_ed2k_ready_does_not_require_nonempty_folder_name(self):
+        body = self.modal_function_body("isResourceEd2kReady")
+
+        self.assertIn("isResourceEd2kImportActive() || resourceEd2kState.loading || resourceEd2kState.error", body)
+        self.assertIn("selectedItemIds", body)
+        self.assertNotIn("normalizeFolderName(resourceEd2kState.folderName)", body)
+
+    def test_submit_creates_subfolder_only_when_folder_name_present(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("                if (isResourceEd2kImportActive()) {")
+        end = source.index("rememberResourceRefreshDelaySeconds", start)
+        submit_body = source[start:end]
+
+        self.assertIn("window.shouldCreateResourceEd2kSubfolder", submit_body)
+        self.assertIn("create_folder: createsSubfolder", submit_body)
+        self.assertIn("folder_name: createsSubfolder ? folderName : ''", submit_body)
+
+    def test_folder_controls_clear_same_name_subfolder(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        body = self.modal_function_body("syncResourceEd2kFolderControls")
+
+        self.assertIn("window.getResourceEd2kSavepathLastSegment(savepath)", body)
+        self.assertIn("normalizedCurrentName === lastSegment", body)
+        self.assertIn("resourceEd2kState.folderName = '';", body)
+
+    def test_ed2k_empty_folder_name_hint_in_template(self):
+        html = TEMPLATE_PATH.read_text(encoding="utf-8")
+        css = CSS_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('id="resource-ed2k-empty-name-hint"', html)
+        self.assertIn("名称为空时将直接保存到所选目录", html)
+        self.assertIn(".resource-ed2k-empty-name-hint", css)
+
+    def test_stepper_sits_above_ed2k_files_and_share_browser(self):
+        html = TEMPLATE_PATH.read_text(encoding="utf-8")
+        stepper = html.index('id="resource-import-stepper"')
+        ed2k_card = html.index('id="resource-ed2k-card"')
+        raw_card = html.index('id="resource-import-raw-card"')
+        share_browser = html.index('id="resource-share-browser-card"')
+
+        self.assertLess(stepper, ed2k_card)
+        self.assertLess(stepper, raw_card)
+        self.assertLess(stepper, share_browser)
+
     def test_target_path_uses_optional_child_folder(self):
         result = run_ed2k_frontend(
             "({ withFolder: api.buildTargetSavepath('电视剧', '摇滚兄弟私生活 (2024) - S03', true), "
@@ -395,6 +440,82 @@ class ResourceEd2kFrontendLogicTest(unittest.TestCase):
         )
 
         self.assertEqual([item["link_url"] for item in result or []], [link])
+
+    def test_folder_title_source_prefers_ed2k_filename_for_generic_record_title(self):
+        result = run_ed2k_frontend("""
+        (() => {
+            const link = 'ed2k://|file|测试.片名.2026.1080p.mkv|12345|af33bd45b385b16a4bef434c760e0182|/';
+            const item = { title: 'ED2K任务', link_url: link, extra: {} };
+            const items = api.collectDirectEd2kItems(item);
+            return {
+                generic: api.isGenericResourceTitle('ED2K任务'),
+                named: api.isGenericResourceTitle('测试.片名.2026.1080p.mkv'),
+                titleSource: api.resolveFolderTitleSource(item, items),
+            };
+        })()
+        """)
+        self.assertTrue(result["generic"])
+        self.assertFalse(result["named"])
+        self.assertEqual(result["titleSource"], "测试.片名.2026.1080p.mkv")
+
+    def test_direct_modal_title_resolution_falls_back_to_filename(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn("resolveFolderTitleSource(item, items)", source)
+        self.assertIn("importMode === 'ed2k-direct'", source)
+
+    def test_resource_folder_recommendation_gated_to_link_type(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn("function isResourceRecommendedFolderCandidate(", source)
+        self.assertIn("return ['ed2k', 'magnet'].includes(linkType);", source)
+        self.assertIn("getEffectiveResourceLinkType(item)", source)
+        self.assertIn("applyResourceRecommendedFolderName();", source)
+
+    def test_resource_folder_recommendation_falls_back_to_recognized_title(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        folder_name = source[
+            source.index("function getResourceRecommendedFolderName("):
+            source.index("function applyResourceRecommendedFolderName(")
+        ]
+        self.assertIn("resourceEd2kState?.folderName", folder_name)
+        self.assertIn("resourceEd2kState?.titleText || item?.title", folder_name)
+        self.assertIn("fetchRecommendedFolderName(rawTitle, year, String(item?.raw_text || ''))", folder_name)
+
+    def test_resource_folder_recommendation_uses_scraper_endpoint(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn("async function fetchRecommendedFolderName(", source)
+        self.assertIn("/resource/items/recommend_folder_name", source)
+        self.assertIn("return fetchRecommendedFolderName(", source)
+        self.assertIn("await getRecommendedResourceEd2kFolderName()", source)
+        self.assertIn("await getResourceRecommendedFolderName()", source)
+
+    def test_ed2k_folder_name_auto_recommends_on_resolve(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        resolve_body = source[
+            source.index("function applyResourceEd2kResolvedData("):
+            source.index("async function initializeResourceEd2kImport(")
+        ]
+        self.assertIn("getRecommendedResourceEd2kFolderName()", resolve_body)
+        self.assertIn("resourceEd2kState.folderName = recommendedFolderName;", resolve_body)
+        self.assertIn("folderNameInput.value = recommendedFolderName;", resolve_body)
+
+    def test_ed2k_folder_recommend_button_in_template(self):
+        source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn("function applyRecommendedResourceEd2kFolderName(", source)
+        self.assertIn("function getRecommendedResourceEd2kFolderName(", source)
+        html = TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="resource-ed2k-recommend-btn"', html)
+        self.assertIn('onclick="applyRecommendedResourceEd2kFolderName()"', html)
+
+    def test_ed2k_folder_input_row_grid_has_three_columns(self):
+        css = CSS_PATH.read_text(encoding="utf-8")
+        row_css = css[css.index(".resource-ed2k-folder-input-row {"):]
+        self.assertIn("grid-template-columns: minmax(0, 1fr) auto 42px;", row_css)
+        self.assertNotIn("grid-template-columns: minmax(0, 1fr) 42px;", row_css)
+
+    def test_resource_folder_recommendation_button_in_template(self):
+        html = TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="resource-folder-recommend-btn"', html)
+        self.assertIn('onclick="applyResourceRecommendedFolderName()"', html)
 
     def test_direct_ed2k_modal_initialization_uses_collected_items(self):
         source = MODAL_MODULE_PATH.read_text(encoding="utf-8")
